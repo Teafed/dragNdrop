@@ -11,7 +11,7 @@ max_angle = 0.2095    # ~12 degrees in radians
 max_position = 2.4    # CartPole track limit
 i = 0
 
-while i < 1000:
+while not done:
     # Heuristic policy: account for both pole angle and cart position
     pole_angle = obs[2]
     cart_position = obs[0]
@@ -33,8 +33,6 @@ while i < 1000:
     total_reward += reward
     
     done = terminated or truncated
-    i += 1
-    time.sleep(0.02)
 
 print("Total custom reward:", total_reward)
 env.close()
