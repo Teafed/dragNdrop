@@ -18,16 +18,20 @@ import os
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList
+from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal
+from callbacks import ShapeTaskCallback
 
 
 def make_env(goal, render_mode=None):
-   """factory function that creates an env with a specific goal."""
+   """factory function that creates an env with a specific goal.
+   wrapped with Monitor so SB3 can track episode stats cleanly.
+   """
    def _init():
-      return ShapeEnv(n_shapes=4, goal=goal, render_mode=render_mode)
+      return Monitor(ShapeEnv(n_shapes=4, goal=goal, render_mode=render_mode))
    return _init
 
 
@@ -43,7 +47,7 @@ def train(prompt: str, timesteps: int, save_path: str):
    vec_env = make_vec_env(make_env(goal), n_envs=n_envs)
 
    # separate eval env (single, no parallelism needed)
-   eval_env = ShapeEnv(n_shapes=4, goal=goal, render_mode=None)
+   eval_env = Monitor(ShapeEnv(n_shapes=4, goal=goal, render_mode=None))
 
    # save the best model whenever eval improves
    eval_callback = EvalCallback(
@@ -73,8 +77,19 @@ def train(prompt: str, timesteps: int, save_path: str):
       tensorboard_log="./logs/tensorboard/",
    )
 
+   # task-specific metrics — logs under task/ in tensorboard
+   task_callback = ShapeTaskCallback(
+      eval_env=Monitor(ShapeEnv(n_shapes=4, goal=goal, render_mode=None)),
+      eval_freq=5000,
+      n_eval_episodes=10,
+      verbose=1,
+   )
+
    print(f"--- starting training for {timesteps} timesteps ---\n")
-   model.learn(total_timesteps=timesteps, callback=eval_callback)
+   model.learn(
+      total_timesteps=timesteps,
+      callback=CallbackList([eval_callback, task_callback]),
+   )
 
    final_path = os.path.join(save_path, "final_model")
    model.save(final_path)
@@ -87,6 +102,8 @@ def demo(model_path: str, prompt: str):
    load a saved model and run it in the pygame window so you can
    watch it interact with the environment.
    """
+   import pygame
+
    print(f"\n--- loading model from {model_path} ---")
    goal  = parse_goal(prompt)
    print(f"goal: {goal}\n")
@@ -98,11 +115,33 @@ def demo(model_path: str, prompt: str):
    total_reward = 0.0
    steps = 0
 
+   # render once before the loop so pygame's video system is
+   # initialized before we call pygame.event.get()
+   env.render()
+   pygame.display.flip()
+
    print("running demo — close the pygame window to stop.\n")
    try:
-      while True:
+      running = True
+      while running:
+         # event handling must live here in the main loop.
+         # pygame.event.pump() inside step() won't surface QUIT
+         # and won't flush the display buffer either.
+         for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+               running = False
+               break
+         if not running:
+            break
+
          action, _ = model.predict(obs, deterministic=True)
          obs, reward, terminated, truncated, info = env.step(action)
+
+         # flip and tick here, not inside _render_frame(),
+         # so this loop owns all display and timing control
+         pygame.display.flip()
+         env.clock.tick(env.metadata["render_fps"])
+
          total_reward += reward
          steps += 1
 
