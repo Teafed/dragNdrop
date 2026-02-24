@@ -98,12 +98,14 @@ class ShapeTaskCallback(BaseCallback):
             steps      += 1
             last_reward = info.get("score", reward)   # score = raw rank corr, not delta
 
-         # pull metrics directly from env state
-         score    = self.eval_env._compute_score()
-         dists    = self.eval_env._compute_dists()
-         shapes   = self.eval_env.shapes
-         goal     = self.eval_env.goal
-         axis     = goal.get("axis", "x")
+         # pull metrics directly from env state.
+         # .unwrapped pierces the Monitor wrapper to get to ShapeEnv,
+         # since Monitor doesn't proxy private methods like _compute_score.
+         inner  = self.eval_env.unwrapped
+         score  = inner._compute_score()
+         shapes = inner.shapes
+         goal   = inner.goal
+         axis   = goal.get("axis", "x")
 
          if axis == "x":
             spread = float(np.std([s.y for s in shapes]) / 600)
