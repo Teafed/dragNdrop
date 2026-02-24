@@ -12,15 +12,14 @@ action space:
 
 observation space:
    for each shape: [x_norm, y_norm, size_norm, color_idx_norm,
-                    dist_to_target_norm]
+                    dist_to_target_norm, dx_to_target, dy_to_target]
    plus goal encoding: [axis, direction]
+   plus history: [last_shape_idx_norm, steps_on_shape_norm, last_dx, last_dy]
 
 reward:
-   per step: sum of how much closer each shape got to its
-             ideal sorted position this step (can be negative
-             if the agent moves shapes away from their targets).
+   per step: directional progress + consistency bonus + switch bonus
+             + camp penalty + overshoot penalty + step penalty.
    on solve: completion bonus.
-   every step: small step penalty to discourage idling.
 """
 
 import numpy as np
@@ -35,15 +34,15 @@ MAX_SHAPES   = 5
 SHAPE_RADIUS = 20
 FPS          = 60
 MAX_STEPS    = 500
-MAX_NUDGE    = 30      # max pixels a shape can move per step
+MAX_NUDGE    = 25      # max pixels a shape can move per step
 MARGIN       = SHAPE_RADIUS * 2
 
 # how close each shape must be to its target to count as solved
 SOLVE_TOLERANCE = 40   # pixels
 
 # reward scaling
-STEP_PENALTY     = -0.005
-COMPLETION_BONUS = 10.0
+STEP_PENALTY     = -0.01
+COMPLETION_BONUS = 25.0
 
 COLORS = {
    "red":    (220,  60,  60),
@@ -76,19 +75,18 @@ class Shape:
       surface.blit(label, (int(self.x) - 10, int(self.y) - 8))
 
    def as_obs(self, target_x, target_y):
-      """
-      flat observation for this shape including normalized distance
-      to its target, so the agent can see how far off each shape is.
-      """
-      max_dist = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-      dist     = np.sqrt((self.x - target_x) ** 2 +
-                          (self.y - target_y) ** 2)
+      max_dist     = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
+      dx_to_target = (target_x - self.x) / WINDOW_W   # signed: + means "go right"
+      dy_to_target = (target_y - self.y) / WINDOW_H   # signed: + means "go down"
+      dist         = np.sqrt((self.x - target_x) ** 2 + (self.y - target_y) ** 2)
       return np.array([
          self.x / WINDOW_W,
          self.y / WINDOW_H,
          (self.size - 0.5) / 1.5,
          COLOR_NAMES.index(self.color_name) / max(len(COLOR_NAMES) - 1, 1),
          dist / max_dist,
+         dx_to_target,
+         dy_to_target,
       ], dtype=np.float32)
 
 
@@ -114,10 +112,10 @@ class ShapeEnv(gym.Env):
          "direction": "ascending",
       }
 
-      # 5 obs values per shape + 2 for goal encoding
-      obs_size = self.n_shapes * 5 + 2
+      # 7 obs values per shape + 2 for goal encoding + 4 for action history
+      obs_size = self.n_shapes * 7 + 2 + 4
       self.observation_space = spaces.Box(
-         low=-1.0, high=1.0,
+         low=-2.0, high=2.0,   # relaxed bounds to safely fit all normalized values
          shape=(obs_size,),
          dtype=np.float32,
       )
@@ -129,13 +127,17 @@ class ShapeEnv(gym.Env):
          dtype=np.float32,
       )
 
-      self.shapes     = []
-      self.target_pos = []   # list of (x, y) target per shape
-      self.steps      = 0
-      self.prev_dists = []   # distances to targets at previous step
-      self.window     = None
-      self.clock      = None
-      self.font       = None
+      self.shapes         = []
+      self.target_pos     = []
+      self.steps          = 0
+      self.prev_dists     = []
+      self.last_shape_idx = -1
+      self.steps_on_shape = 0
+      self.last_action_dx = 0.0
+      self.last_action_dy = 0.0
+      self.window         = None
+      self.clock          = None
+      self.font           = None
 
    # ------------------------------------------------------------------
    # gymnasium interface
@@ -143,16 +145,20 @@ class ShapeEnv(gym.Env):
 
    def reset(self, seed=None, options=None):
       super().reset(seed=seed)
-      self.steps      = 0
-      self.shapes     = self._spawn_shapes()
-      self.target_pos = self._compute_targets()
-      self.prev_dists = self._compute_dists()
+      self.steps          = 0
+      self.last_shape_idx = -1
+      self.steps_on_shape = 0
+      self.last_action_dx = 0.0
+      self.last_action_dy = 0.0
+      self.shapes         = self._spawn_shapes()
+      self.target_pos     = self._compute_targets()
+      self.prev_dists     = self._compute_dists()
       return self._get_obs(), {}
 
    def step(self, action):
       self.steps += 1
 
-      # map shape_selector from [-1,1] to an index
+      # map shape_selector from [-1, 1] to an index
       raw_idx   = float(action[0])
       shape_idx = int(np.clip(
          round((raw_idx + 1.0) / 2.0 * (self.n_shapes - 1)),
@@ -166,15 +172,48 @@ class ShapeEnv(gym.Env):
       s.x = float(np.clip(s.x + dx, MARGIN, WINDOW_W - MARGIN))
       s.y = float(np.clip(s.y + dy, MARGIN, WINDOW_H - MARGIN))
 
-      # reward: positive when shapes move closer to targets,
-      # negative when they move away
-      new_dists   = self._compute_dists()
-      max_dist    = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-      dist_reward = sum(
-         (self.prev_dists[i] - new_dists[i]) / max_dist
-         for i in range(self.n_shapes)
-      )
-      self.prev_dists = new_dists
+      new_dists = self._compute_dists()
+      max_dist  = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
+
+      # 1. directional: did the moved shape get closer to its target?
+      old_d       = self.prev_dists[shape_idx]
+      new_d       = new_dists[shape_idx]
+      directional = (old_d - new_d) / max_dist * 4.0
+
+      # 2. consistency bonus: reward staying on the same shape while it still needs moving.
+      #    produces the "hold and push" behavior.
+      if shape_idx == self.last_shape_idx and new_d > SOLVE_TOLERANCE:
+         consistency_bonus = 0.03
+      else:
+         consistency_bonus = 0.0
+
+      # 3. switching bonus: reward moving to a new shape once the previous one is done.
+      #    prevents camping on an already-solved shape.
+      switch_bonus = 0.0
+      if (self.last_shape_idx >= 0
+            and shape_idx != self.last_shape_idx
+            and self.prev_dists[self.last_shape_idx] <= SOLVE_TOLERANCE):
+         switch_bonus = 0.15
+
+      # 4. camp penalty: penalize staying on a shape that's already at its target.
+      if shape_idx == self.last_shape_idx and old_d <= SOLVE_TOLERANCE:
+         camp_penalty = -0.05
+      else:
+         camp_penalty = 0.0
+
+      # 5. overshoot penalty: penalize moving away from the target.
+      overshoot_penalty = min(0.0, (old_d - new_d) / max_dist) * 2.0
+
+      # update history before building obs
+      self.steps_on_shape = (self.steps_on_shape + 1
+                             if shape_idx == self.last_shape_idx else 1)
+      self.last_shape_idx = shape_idx
+      self.last_action_dx = float(action[1])
+      self.last_action_dy = float(action[2])
+      self.prev_dists     = new_dists
+
+      dist_reward = (directional + consistency_bonus + switch_bonus
+                     + camp_penalty + overshoot_penalty)
 
       terminated = self._is_solved()
       reward     = dist_reward + STEP_PENALTY
@@ -247,7 +286,6 @@ class ShapeEnv(gym.Env):
             xs = np.full(n, WINDOW_W / 2)
             ys = np.linspace(pad, WINDOW_H - pad, n)
 
-         # order[rank] = which shape gets position rank
          targets = [(0.0, 0.0)] * n
          for rank, shape_idx in enumerate(order):
             targets[shape_idx] = (float(xs[rank]), float(ys[rank]))
@@ -281,7 +319,13 @@ class ShapeEnv(gym.Env):
          self.shapes[i].as_obs(*self.target_pos[i])
          for i in range(self.n_shapes)
       ])
-      return np.concatenate([shape_obs, self._encode_goal()]).astype(np.float32)
+      history = np.array([
+         self.last_shape_idx / max(self.n_shapes - 1, 1),  # normalized to [0, 1]; -1 maps to negative
+         self.steps_on_shape / 10.0,                        # normalized; caps meaningfully at 10
+         self.last_action_dx,                               # already in [-1, 1]
+         self.last_action_dy,
+      ], dtype=np.float32)
+      return np.concatenate([shape_obs, self._encode_goal(), history]).astype(np.float32)
 
    def _encode_goal(self):
       axis_val = 0.0 if self.goal.get("axis", "x") == "x" else 1.0

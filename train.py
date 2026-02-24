@@ -65,14 +65,14 @@ def train(prompt: str, timesteps: int, save_path: str):
    model = PPO(
       "MlpPolicy",
       vec_env,
-      learning_rate=3e-4,
+      learning_rate=1e-4,
       n_steps=2048,
-      batch_size=64,
+      batch_size=128,
       n_epochs=10,
       gamma=0.99,
       gae_lambda=0.95,
       clip_range=0.2,
-      ent_coef=0.01,   # small entropy bonus encourages exploration
+      ent_coef=0.02,   # small entropy bonus encourages exploration
       verbose=1,
       tensorboard_log="./logs/tensorboard/",
    )
@@ -170,7 +170,7 @@ if __name__ == "__main__":
    parser.add_argument(
       "--timesteps",
       type=int,
-      default=100_000,
+      default=300_000,
       help="total training timesteps",
    )
    parser.add_argument(

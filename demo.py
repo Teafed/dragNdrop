@@ -101,8 +101,10 @@ def run_demo(model_path, prompt, use_random):
       draw_env(window, env, font)
 
       # highlight which shape was just moved
-      shape_idx = int(np.clip(round(action[0] * (env.n_shapes - 1)),
-                               0, env.n_shapes - 1))
+      shape_idx = int(np.clip(
+         round((action[0] + 1.0) / 2.0 * (env.n_shapes - 1)),
+         0, env.n_shapes - 1
+      ))
       s = env.shapes[shape_idx]
       pygame.draw.circle(window, (255, 255, 255),
                          (int(s.x), int(s.y)), s.radius + 4, 2)
