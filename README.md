@@ -1,55 +1,61 @@
-# shape manipulation agent — proof of concept
+# shape manipulation agent
 
-a gymnasium + stable-baselines3 proof of concept for an RL agent
-that manipulates 2d shapes in response to a natural language goal.
-the LLM layer is stubbed out — everything else is wired and runnable.
+A Gymnasium + Stable-Baselines3 proof of concept for an RL agent that
+manipulates 2D shapes in response to natural language goals.
+
+The LLM layer uses the Anthropic API (with stub fallback) — everything else
+is wired and runnable with or without an API key.
 
 ---
 
 ## install
 
-```
-pip install "setuptools<71" gymnasium stable-baselines3 pygame numpy matplotlib tensorboard
+```bash
+pip install "setuptools<71" gymnasium stable-baselines3 pygame numpy matplotlib tensorboard anthropic torch
 ```
 
 ---
 
-## run
+## quickstart
 
-**train from scratch:**
+**Recommended — oracle warm-start (fast, 5–10× less compute than PPO from scratch):**
+```bash
+python train.py --oracle
+python train.py --oracle --prompt "group shapes by color"
+python train.py --oracle --timesteps 100000
 ```
+
+**PPO from scratch (original approach):**
+```bash
 python train.py
-```
-
-**train with a custom prompt:**
-```
 python train.py --prompt "sort shapes right to left"
 python train.py --prompt "arrange top to bottom, biggest at top"
-```
-
-**train longer:**
-```
 python train.py --timesteps 500000
 ```
 
-**watch a trained agent:**
-```
+**Watch a trained agent:**
+```bash
 python demo.py --model models/shape_agent/best_model
+python demo.py --model models/shape_agent/best_model --prompt "sort right to left"
+python demo.py --random   # watch a random agent as a baseline
 ```
 
-**watch a random agent:**
-```
-python demo.py --random
+**Behavior cloning only (no PPO fine-tune):**
+```bash
+python bc_train.py --prompt "sort shapes left to right"
+python bc_train.py --prompt "group shapes by color" --episodes 800
+python bc_train.py --finetune --finetune-steps 100000   # BC then PPO
 ```
 
-**run diagnostics:**
-```
+**Run diagnostics:**
+```bash
 python debug.py
 python debug.py --model models/shape_agent/best_model
+python debug.py --skip-render   # headless / CI use
 ```
 
-**open tensorboard:**
-```
+**TensorBoard:**
+```bash
 tensorboard --logdir logs/tensorboard
 ```
 
@@ -58,12 +64,14 @@ tensorboard --logdir logs/tensorboard
 ## file overview
 
 ```
-shape_env.py       — gymnasium environment: shapes, obs/action spaces, reward
-llm_goal_parser.py — LLM goal parser stub (patterns now, real API call documented)
-train.py           — PPO training loop via stable-baselines3, saves checkpoints
-demo.py            — standalone pygame demo, loads a trained model or runs random
-callbacks.py       — custom tensorboard callback logging task-specific metrics
-debug.py           — diagnostic script to verify env, reward, and model behavior
+llm_goal_parser.py — LLM goal parser (Anthropic API with stub fallback)
+shape_env.py       — Gymnasium environment: shapes, obs/action spaces, rewards
+train.py           — Training entry point (PPO from scratch or oracle warm-start)
+callbacks.py       — TensorBoard callbacks logging task-specific metrics
+demo.py            — Standalone pygame demo, loads a trained model or runs random
+oracle.py          — Scripted expert policy + dataset collection for BC
+bc_train.py        — Behavior cloning trainer (BC → PPO warm-start)
+debug.py           — Diagnostic script to verify env, reward, and model behavior
 ```
 
 ---
@@ -72,103 +80,165 @@ debug.py           — diagnostic script to verify env, reward, and model behavi
 
 ```
 user prompt
-    |
-    v
-llm_goal_parser.parse_goal()      <-- real LLM call goes here
-    |
-    v
-goal dict: {task, axis, direction}
-    |
-    v
-ShapeEnv (gymnasium)              <-- environment owns the simulation
-    |  observation: [shape states] + [goal encoding]
-    |  action:      [shape_selector, target_x, target_y]
-    |  reward:      delta rank correlation + step penalty + completion bonus
-    v
-PPO agent (stable-baselines3)     <-- learns the manipulation policy
+    │
+    ▼
+llm_goal_parser.parse_goal()
+    │   tries Anthropic API → falls back to pattern-matching stub
+    │
+    ▼
+goal dict: {task, axis, direction, attribute}
+    │
+    ▼
+ShapeEnv (Gymnasium)
+    │  observation : [shape states] + [goal encoding (3 values)] + [action history]
+    │  action      : [shape_selector, dx, dy]  all in [-1, 1]
+    │  reward      : directional + rank/cohesion delta + penalties + completion bonus
+    │
+    ▼
+Policy (one of):
+    ├── PPO from scratch       — train.py (default)
+    ├── Oracle → BC → PPO      — train.py --oracle  (recommended)
+    └── Scripted oracle        — oracle.py (perfect, not learned)
+```
+
+---
+
+## supported tasks
+
+| Task | Description | Goal example |
+|---|---|---|
+| `sort_by_size` | Arrange shapes along x or y axis ordered by size | `"sort smallest to largest left to right"` |
+| `group_by_color` | Cluster same-color shapes into distinct canvas regions | `"group shapes by colour"` |
+| `cluster` | General spatial grouping by attribute | `"cluster shapes by size"` |
+
+---
+
+## training strategy: oracle warm-start
+
+Training PPO from scratch on manipulation tasks is slow because the agent
+must discover *what to do* and *how to do it* simultaneously.
+
+The oracle warm-start decouples these:
+
+1. **Oracle** — a scripted policy that solves the task analytically.
+   Generates 500 episodes (~50 000 transitions) in ~10 seconds.
+
+2. **Behavior Cloning** — supervised imitation of the oracle demos.
+   Gives the policy a strong prior: "move the furthest-from-target shape
+   toward its target."  Takes ~30 seconds.
+
+3. **PPO fine-tune** — refine the BC policy with RL to handle edge cases
+   the oracle navigates perfectly but a noisy real agent won't.
+
+Typical result: oracle warm-start + 100k PPO steps ≈ PPO from scratch at 300k steps.
+
+```bash
+# Full oracle pipeline:
+python train.py --oracle --timesteps 100000 --bc-episodes 500
 ```
 
 ---
 
 ## reward design
 
-the reward at each step has three components:
+Eight components per step:
 
-- **delta reward** — change in rank correlation since the last step.
-  the agent only gains from improving the arrangement, not from
-  sitting in a good state. prevents the agent parking one shape
-  in a decent position and looping forever.
-- **step penalty** (-0.01 per step) — constant pressure to finish
-  quickly. without this, an agent that reaches a local optimum
-  has no reason to keep trying.
-- **completion bonus** (+5.0) — awarded when the task is solved.
-  makes finishing clearly worth more than any amount of stalling.
+| Component | When it fires | Effect |
+|---|---|---|
+| Weighted directional | Always | +reward ∝ progress × urgency |
+| Rank/cohesion delta | Always | +/- reward for global ordering improvement |
+| Per-shape solved bonus | Each solved shape | Small persistent + per step |
+| Neglect penalty | Shape ignored >15 steps AND far from target | Small - |
+| Oscillation penalty | Reverses direction after progress | -0.06 |
+| Wall penalty | Large intended nudge, tiny actual move | -0.05 |
+| Inactivity penalty | Shape barely moved | -0.04 |
+| Camp penalty | Staying on already-solved shape | -0.08 |
+| Step penalty | Every step | -0.02 |
+| Completion bonus | All shapes solved | +25.0 |
+
+---
+
+## observation space
+
+```
+[shape_0_obs, shape_1_obs, ..., goal_encoding, action_history]
+
+per shape (7 values):
+    x_norm, y_norm              — normalised position
+    size_norm                   — normalised size
+    color_idx_norm              — colour identity
+    dist_to_target_norm         — how far from goal
+    dx_to_target, dy_to_target  — direction to goal
+
+goal encoding (3 values):  ← was 2 values; added task_idx
+    task_idx_norm   — which task (sort / group / cluster)
+    axis_norm       — x=0, none=0.5, y=1
+    direction_norm  — ascending=0, none=0.5, descending=1
+
+action history (4 values):
+    last_shape_idx_norm, steps_on_shape_norm, last_dx, last_dy
+```
 
 ---
 
 ## tensorboard metrics
 
-the `task/` group contains the most useful training signals:
+The `task/` group contains the most useful training signals:
 
-| metric | what it means |
+| Metric | What it means |
 |---|---|
-| `task/rank_correlation` | how well sorted shapes are. 1.0 = perfect, -1.0 = reversed |
-| `task/solve_rate` | fraction of eval episodes that hit the solve threshold |
-| `task/mean_y_spread` | std of y positions (normalized). lower = more in a line |
-| `task/mean_episode_steps` | avg steps to finish. decreasing = agent getting faster |
-| `task/mean_final_reward` | raw score at episode end, independent of delta shaping |
+| `task/mean_score` | 0–1 distance-based progress. 1.0 = all shapes at targets |
+| `task/rank_corr` | Spearman correlation (sort tasks) or group cohesion (group tasks) |
+| `task/solve_rate` | Fraction of eval episodes fully solved (terminated) |
+| `task/mean_ep_length` | Average steps to finish. Decreasing = agent getting faster |
 
----
-
-## wiring in a real LLM
-
-in `llm_goal_parser.py`, replace the body of `_stub_parse()` with:
-
-```python
-import json
-from openai import OpenAI
-
-client = OpenAI()  # reads OPENAI_API_KEY from environment
-
-def _stub_parse(prompt: str) -> dict:
-   response = client.chat.completions.create(
-      model="gpt-4o",
-      messages=[
-         {"role": "system", "content": SYSTEM_PROMPT},
-         {"role": "user",   "content": prompt},
-      ],
-      response_format={"type": "json_object"},
-   )
-   return json.loads(response.choices[0].message.content)
-```
-
-the rest of the system doesn't change.
+> **Note:** `rank_corr` and `mean_score` are different metrics.  `mean_score`
+> is distance-based (0–1).  `rank_corr` is order/cohesion-based (−1 to +1
+> for sort, 0 to 1 for group).  Watch both.
 
 ---
 
 ## adding new tasks
 
-1. add a reward function branch in `shape_env._compute_reward()`
-2. add the task name to `llm_goal_parser.SUPPORTED_TASKS`
-3. update `SYSTEM_PROMPT` in `llm_goal_parser.py` with examples
-4. add pattern matching to `_stub_parse()` if staying with the stub
+1. Add a `_targets_<task>()` method in `ShapeEnv` that returns target positions.
+2. Add a branch in `_compute_targets()` to call it.
+3. Add a branch in `_compute_rank_corr()` for the quality signal.
+4. Add the task name to `SUPPORTED_TASKS` in both `shape_env.py` and `llm_goal_parser.py`.
+5. Update `_SYSTEM_PROMPT` in `llm_goal_parser.py` with examples.
+6. Add pattern matching to `_stub_parse()` for the fallback.
+7. Add an oracle strategy in `oracle.py` if the greedy approach isn't sufficient.
 
 ---
 
-## expanding to real desktop / game input
+## wiring in a real LLM
 
-the trained agent outputs `[shape_selector, target_x, target_y]` actions.
-to route those to a real input driver instead of the pygame env:
+The Anthropic API is already wired in `llm_goal_parser.py`.  Set the environment
+variable and it activates automatically:
 
-```python
-# swap this:
-obs, reward, terminated, truncated, info = env.step(action)
-
-# for something like:
-target_x_pixels = int(action[1] * SCREEN_W)
-target_y_pixels = int(action[2] * SCREEN_H)
-pyautogui.moveTo(target_x_pixels, target_y_pixels)
-pyautogui.mouseDown(); pyautogui.mouseUp()
+```bash
+export ANTHROPIC_API_KEY=your_key_here
+python train.py --prompt "put the small shapes on the left"
 ```
 
-the policy doesn't change — only the actuator does.
+If the API call fails for any reason, the system falls back to pattern matching
+and continues running — you'll see a `[goal_parser] LLM parse failed` message.
+
+---
+
+## expanding to real robot input
+
+The trained agent outputs `[shape_selector, dx, dy]` actions in [−1, 1].
+To route those to a real actuator instead of the pygame env:
+
+```python
+# swap:
+obs, reward, terminated, truncated, info = env.step(action)
+
+# for:
+target_x = int((action[1] + 1) / 2 * SCREEN_W)
+target_y = int((action[2] + 1) / 2 * SCREEN_H)
+robot.move_to(target_x, target_y)
+robot.nudge()
+```
+
+The policy doesn't change — only the actuator does.
