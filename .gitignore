@@ -1,5 +1,4 @@
 .venv
 logs/
-models/
 __pycache__/
 .vscode/
