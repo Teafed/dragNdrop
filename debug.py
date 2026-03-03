@@ -41,6 +41,8 @@ def _default_goal(task: str) -> dict:
         base.update({"axis": "x", "direction": "ascending", "attribute": "size"})
     elif task in ("group_by_color", "cluster"):
         base.update({"attribute": "color"})
+    elif task == "group_by_shape_type":
+        base.update({"attribute": "shape_type"})
     elif task == "arrange_in_line":
         base.update({"axis": "x"})
     elif task == "push_to_region":
@@ -52,7 +54,12 @@ def _default_goal(task: str) -> dict:
 # test 1: basic step mechanics
 # ---------------------------------------------------------------------------
 
-def test_env_steps(n_shapes: int = 2) -> bool:
+def test_env_steps(n_shapes: int = 3) -> bool:
+    """
+    wave 2 note: sort_by_size rewards will appear flat (-0.02 each step)
+    under random actions because rank correlation barely changes. this is
+    expected — the reward is a score delta, not a distance improvement.
+    """
     print(f"=== test 1: do env steps actually move shapes? (n_shapes={n_shapes}) ===")
     goal   = _default_goal("sort_by_size")
     env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
@@ -92,34 +99,45 @@ def test_env_steps(n_shapes: int = 2) -> bool:
 # test 2: reward variance
 # ---------------------------------------------------------------------------
 
-def test_random_rewards(n_shapes: int = 2) -> bool:
+def test_random_rewards(n_shapes: int = 3) -> bool:
+    """
+    wave 2 note: sort_by_size produces near-constant rewards under random
+    actions (rank correlation barely moves). use group_by_color instead —
+    random moves do affect cohesion score, so rewards should vary.
+    also test arrange_in_line as a canonical task sanity check.
+    """
     print(f"=== test 2: do rewards vary across episodes? (n_shapes={n_shapes}) ===")
-    goal    = _default_goal("sort_by_size")
-    env     = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
-    rewards = []
+    all_ok = True
 
-    for episode in range(5):
-        obs, _    = env.reset()
-        ep_reward = 0.0
-        for _ in range(30):
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, _ = env.step(action)
-            ep_reward += reward
-            if terminated or truncated:
-                break
-        rewards.append(ep_reward)
-        print(f"  episode {episode+1}: total reward = {ep_reward:.4f}")
+    for task in ("group_by_color", "arrange_in_line"):
+        goal    = _default_goal(task)
+        env     = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
+        rewards = []
 
-    reward_range = max(rewards) - min(rewards)
-    print(f"  reward range across episodes: {reward_range:.4f}")
-    ok = reward_range > 0.01
-    if not ok:
-        print("  !! WARNING: rewards are not varying — reward function may be broken")
-    else:
+        for episode in range(5):
+            obs, _    = env.reset()
+            ep_reward = 0.0
+            for _ in range(30):
+                action = env.action_space.sample()
+                obs, reward, terminated, truncated, _ = env.step(action)
+                ep_reward += reward
+                if terminated or truncated:
+                    break
+            rewards.append(ep_reward)
+
+        reward_range = max(rewards) - min(rewards)
+        ok           = reward_range > 0.01
+        status       = "ok" if ok else "!! FLAT — reward function may be broken"
+        print(f"  {task:<20} reward range: {reward_range:.4f}  {status}")
+        if not ok:
+            all_ok = False
+
+    print(f"  note: sort_by_size rewards are intentionally flat under random "
+          f"actions (rank corr barely moves — this is expected)")
+    if all_ok:
         print("  reward function looks healthy")
     print()
-    env.close()
-    return ok
+    return all_ok
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +147,7 @@ def test_random_rewards(n_shapes: int = 2) -> bool:
 def test_all_tasks() -> bool:
     print("=== test 3: do all wave 1 tasks initialise and step correctly? ===")
     tasks  = [
-        "sort_by_size", "group_by_color", "cluster",
+        "sort_by_size", "group_by_color", "group_by_shape_type", "cluster",
         "arrange_in_line", "arrange_in_grid", "push_to_region",
     ]
     all_ok = True
@@ -337,12 +355,13 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
 
     # one representative prompt per task type
     task_prompts = {
-        "sort_by_size":   "sort shapes from smallest to largest left to right",
-        "group_by_color": "group shapes by color",
-        "arrange_in_line":"arrange shapes in a horizontal line evenly spaced",
-        "arrange_in_grid":"arrange shapes in a grid",
-        "push_to_region": "move all shapes to the left side",
-        "cluster":        "put shapes of the same color close together",
+        "sort_by_size":       "sort shapes from smallest to largest left to right",
+        "group_by_color":     "group shapes by color",
+        "group_by_shape_type":"group shapes by type",
+        "arrange_in_line":    "arrange shapes in a horizontal line evenly spaced",
+        "arrange_in_grid":    "arrange shapes in a grid",
+        "push_to_region":     "move all shapes to the left side",
+        "cluster":            "put shapes of the same color close together",
     }
 
     all_ok = True
@@ -472,11 +491,12 @@ def test_oracle_render(task: str = "sort_by_size", n_shapes: int = 3):
         from llm_goal_parser import get_embedding
 
         task_prompts = {
-            "sort_by_size":   "sort shapes from smallest to largest left to right",
-            "group_by_color": "group shapes by color",
-            "arrange_in_line":"arrange shapes in a horizontal line evenly spaced",
-            "arrange_in_grid":"arrange shapes in a grid",
-            "push_to_region": "move all shapes to the left side",
+            "sort_by_size":        "sort shapes from smallest to largest left to right",
+            "group_by_color":      "group shapes by color",
+            "group_by_shape_type": "group shapes by type",
+            "arrange_in_line":     "arrange shapes in a horizontal line evenly spaced",
+            "arrange_in_grid":     "arrange shapes in a grid",
+            "push_to_region":      "move all shapes to the left side",
         }
 
         goal_encoder = GoalEncoder()
@@ -565,8 +585,8 @@ if __name__ == "__main__":
         help="skip pygame render tests (tests 6 and 9)"
     )
     parser.add_argument(
-        "--n-shapes", type=int, default=2,
-        help="number of shapes for tests 1, 2, and 5 (default: 2)"
+        "--n-shapes", type=int, default=3,
+        help="number of shapes for tests 1, 2, and 5 (default: 3)"
     )
     parser.add_argument(
         "--oracle", action="store_true",

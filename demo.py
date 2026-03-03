@@ -63,17 +63,18 @@ def draw_env(surface, env, font):
     """draw current env state onto an existing pygame surface."""
     surface.fill(BG_COLOR)
 
-    # ghost circles at target positions
-    for i, (tx, ty) in enumerate(env.target_pos):
-        pygame.draw.circle(surface, (80, 80, 80),
-                           (int(tx), int(ty)),
-                           env.shapes[i].radius, 2)
+    # ghost circles only for canonical tasks — scoring tasks have no fixed targets
+    task           = env.goal.get("task", "sort_by_size")
+    canonical_task = task in ("arrange_in_line", "arrange_in_grid", "push_to_region")
+    if canonical_task and env.target_pos:
+        for i, (tx, ty) in enumerate(env.target_pos):
+            pygame.draw.circle(surface, (80, 80, 80),
+                               (int(tx), int(ty)),
+                               env.shapes[i].radius, 2)
 
     for shape in env.shapes:
         shape.draw(surface, font)
 
-    goal      = env.goal
-    task      = goal["task"]
     score     = env._compute_score()
     rank      = env._compute_rank_corr()
     goal_str  = (f"task: {task}   progress: {score:.2%}   "
@@ -81,7 +82,126 @@ def draw_env(surface, env, font):
     surface.blit(font.render(goal_str, True, (200, 200, 200)), (10, 10))
 
 
+def run_oracle_demo(sequential: bool):
+    """
+    watch the oracle solve episodes. useful for verifying oracle behavior
+    before blaming the trained policy.
+
+    --sequential: cycle through TASK_POOL prompts in order, repeating.
+    default: random task each episode (same as --multi-task for agent).
+    """
+    from oracle import OraclePolicy
+    import torch
+    from bc_train import GoalEncoder
+
+    pygame.init()
+    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    pygame.display.set_caption("shape manipulation — oracle demo")
+    clock  = pygame.time.Clock()
+    font   = pygame.font.SysFont("monospace", 12)
+
+    goal_encoder = GoalEncoder()
+    goal_encoder.eval()
+
+    task_pool   = list(TASK_POOL)
+    task_cursor = 0
+
+    def next_prompt():
+        nonlocal task_cursor
+        if sequential:
+            p           = task_pool[task_cursor % len(task_pool)]
+            task_cursor += 1
+        else:
+            p = random.choice(task_pool)
+        return p
+
+    cur_prompt = next_prompt()
+    goal       = parse_goal(cur_prompt)
+    raw_emb    = get_embedding(cur_prompt)
+    with torch.no_grad():
+        emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+        encoding = goal_encoder(emb_t).squeeze(0).numpy()
+
+    env    = ShapeEnv(goal=goal, render_mode=None)
+    env.set_goal_encoding(encoding)
+    oracle = OraclePolicy(env, noise_std=0.0)
+    obs, _ = env.reset()
+
+    episode      = 1
+    steps        = 0
+    total_reward = 0.0
+    print(f"episode {episode} — {cur_prompt}  (Q to quit, N to skip to next task)")
+
+    running = True
+    while running:
+        skip = False
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_q:
+                    running = False
+                if event.key == pygame.K_n:
+                    skip = True
+
+        if not running:
+            break
+
+        action                                       = oracle.act(obs)
+        obs, reward, terminated, truncated, info     = env.step(action)
+        total_reward += reward
+        steps        += 1
+
+        draw_env(window, env, font)
+
+        # highlight the shape the oracle just moved
+        shape_idx = int(np.clip(
+            round((action[0] + 1.0) / 2.0 * (env.n_shapes - 1)),
+            0, env.n_shapes - 1
+        ))
+        s = env.shapes[shape_idx]
+        pygame.draw.circle(window, (255, 255, 255),
+                           (int(s.x), int(s.y)), s.radius + 4, 2)
+
+        status_str = "SOLVED!" if terminated else ""
+        step_label = font.render(
+            f"ORACLE  ep {episode}  step {steps}  n_shapes {env.n_shapes}  "
+            f"{cur_prompt}  {status_str}",
+            True, (100, 220, 180)
+        )
+        window.blit(step_label, (10, WINDOW_H - 24))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+        if terminated or truncated or skip:
+            status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
+            print(f"episode {episode} {status} — "
+                  f"steps: {steps}  reward: {total_reward:.2f}  "
+                  f"score: {info['score']:.3f}  task: {cur_prompt}")
+
+            cur_prompt = next_prompt()
+            goal       = parse_goal(cur_prompt)
+            raw_emb    = get_embedding(cur_prompt)
+            with torch.no_grad():
+                emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+                encoding = goal_encoder(emb_t).squeeze(0).numpy()
+
+            env.goal = goal
+            env.set_goal_encoding(encoding)
+            oracle   = OraclePolicy(env, noise_std=0.0)
+            obs, _   = env.reset()
+
+            episode     += 1
+            steps        = 0
+            total_reward = 0.0
+            print(f"episode {episode} — {cur_prompt}")
+
+    pygame.quit()
+    print("oracle demo closed")
+
+
 def run_demo(model_path: str, prompt: str, use_random: bool, multi_task: bool):
+
     pygame.init()
     window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
     pygame.display.set_caption("shape manipulation — demo")
@@ -188,7 +308,7 @@ def run_demo(model_path: str, prompt: str, use_random: bool, multi_task: bool):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="run a trained agent demo")
+    parser = argparse.ArgumentParser(description="run a trained agent or oracle demo")
     parser.add_argument(
         "--model", type=str, default="models/shape_agent/best_model",
         help="path to saved SB3 model (without .zip extension)",
@@ -204,7 +324,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--multi-task", action="store_true",
-        help="sample a random task from TASK_POOL each episode instead of using --prompt",
+        help="sample a random task from TASK_POOL each episode",
+    )
+    parser.add_argument(
+        "--oracle", action="store_true",
+        help="watch the oracle instead of a trained model",
+    )
+    parser.add_argument(
+        "--sequential", action="store_true",
+        help="cycle through TASK_POOL in order (use with --oracle or --multi-task)",
     )
     args = parser.parse_args()
-    run_demo(args.model, args.prompt, args.random, args.multi_task)
+
+    if args.oracle:
+        run_oracle_demo(sequential=args.sequential)
+    else:
+        run_demo(args.model, args.prompt, args.random, args.multi_task)

@@ -194,85 +194,13 @@ def train(
 
 
 # ---------------------------------------------------------------------------
-# demo
-# ---------------------------------------------------------------------------
-
-def demo(model_path: str, prompt: str):
-    """load a saved model and run it live in the pygame window."""
-    import pygame
-    from bc_train import GoalEncoder
-
-    print(f"\n--- loading model from {model_path} ---")
-    goal     = parse_goal(prompt)
-    raw_emb  = get_embedding(prompt)
-
-    encoder_path = os.path.join(os.path.dirname(model_path), "goal_encoder.pt")
-    goal_encoder = GoalEncoder()
-    if os.path.exists(encoder_path):
-        goal_encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
-        print(f"  goal encoder loaded from {encoder_path}")
-    else:
-        print(f"  no goal encoder at {encoder_path}, using random init")
-
-    goal_encoder.eval()
-    with torch.no_grad():
-        emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-        encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
-    print(f"goal: {goal}\n")
-
-    env = ShapeEnv(goal=goal)
-    env.set_goal_encoding(encoding)
-    env.render_mode = "human"
-    model = PPO.load(model_path)
-
-    obs, _       = env.reset()
-    total_reward = 0.0
-    steps        = 0
-    episode      = 1
-
-    env.render()
-    pygame.display.flip()
-
-    print("running demo — close window to stop.\n")
-    try:
-        running = True
-        while running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                    break
-            if not running:
-                break
-
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            pygame.display.flip()
-            env.clock.tick(env.metadata["render_fps"])
-            total_reward += reward
-            steps        += 1
-
-            if terminated or truncated:
-                status = "SOLVED" if terminated else "timed out"
-                print(f"episode {episode} {status} — "
-                      f"steps: {steps}, total reward: {total_reward:.3f}")
-                obs, _       = env.reset()
-                total_reward = 0.0
-                steps        = 0
-                episode     += 1
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="train or demo the goal-conditioned shape manipulation agent"
+        description="train the goal-conditioned shape manipulation agent. "
+                    "for demos use demo.py instead."
     )
     parser.add_argument(
         "--timesteps", type=int, default=300_000,
@@ -281,19 +209,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save", type=str, default="./models/shape_agent",
         help="directory to save model checkpoints and goal encoder",
-    )
-    parser.add_argument(
-        "--load", type=str, default=None,
-        help="path to a saved model (for --demo mode)",
-    )
-    parser.add_argument(
-        "--demo", action="store_true",
-        help="run demo mode (requires --load)",
-    )
-    parser.add_argument(
-        "--prompt", type=str,
-        default="sort the shapes from smallest to largest left to right",
-        help="natural language goal prompt (used in --demo mode)",
     )
     parser.add_argument(
         "--no-oracle", action="store_true",
@@ -309,16 +224,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.demo:
-        if args.load is None:
-            print("error: --demo requires --load <model_path>")
-        else:
-            demo(args.load, args.prompt)
-    else:
-        train(
-            timesteps=args.timesteps,
-            save_path=args.save,
-            bc_episodes=args.bc_episodes,
-            bc_epochs=args.bc_epochs,
-            use_oracle=not args.no_oracle,
-        )
+    train(
+        timesteps=args.timesteps,
+        save_path=args.save,
+        bc_episodes=args.bc_episodes,
+        bc_epochs=args.bc_epochs,
+        use_oracle=not args.no_oracle,
+    )

@@ -40,6 +40,7 @@ import pygame
 from config import (
     MAX_SHAPES, OBS_VALUES_PER_SHAPE, ACTION_HISTORY_SIZE,
     GOAL_ENCODING_DIM, get_obs_size,
+    SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,8 +55,9 @@ MAX_STEPS    = 500
 MAX_NUDGE    = 25
 MARGIN       = SHAPE_RADIUS * 2
 
-SOLVE_TOLERANCE = 60    # pixels — shape is "solved" when closer than this
-GROUP_TOLERANCE = 80    # pixels — radius for same-color group clustering
+SOLVE_TOLERANCE      = 60    # pixels — canonical tasks: shape "at target" within this
+SCORE_SOLVE_THRESHOLD = 0.85 # scoring tasks: episode solved when score >= this
+GROUP_TOLERANCE      = 80    # pixels — radius for same-color group clustering
 
 STEP_PENALTY     = -0.02
 COMPLETION_BONUS = 25.0
@@ -79,6 +81,7 @@ TARGET_COLOR = (80, 80, 80)
 SUPPORTED_TASKS = [
     "sort_by_size",
     "group_by_color",
+    "group_by_shape_type",
     "cluster",
     "arrange_in_line",
     "arrange_in_grid",
@@ -92,9 +95,9 @@ TASK_IDX = {t: i for i, t in enumerate(SUPPORTED_TASKS)}
 # ---------------------------------------------------------------------------
 
 class Shape:
-    """A single movable circle in the environment."""
+    """a single movable shape in the environment. can be circle, square, or triangle."""
 
-    def __init__(self, shape_id, x, y, size, color_name):
+    def __init__(self, shape_id, x, y, size, color_name, shape_type="circle"):
         self.shape_id   = shape_id
         self.x          = float(x)
         self.y          = float(y)
@@ -102,26 +105,47 @@ class Shape:
         self.color_name = color_name
         self.color_rgb  = COLORS[color_name]
         self.radius     = int(SHAPE_RADIUS * size)
+        self.shape_type = shape_type   # "circle" | "square" | "triangle"
 
     def draw(self, surface, font):
-        pygame.draw.circle(surface, self.color_rgb,
-                           (int(self.x), int(self.y)), self.radius)
-        label = font.render(f"{self.size:.1f}", True, (255, 255, 255))
-        surface.blit(label, (int(self.x) - 10, int(self.y) - 8))
+        cx = int(self.x)
+        cy = int(self.y)
+        r  = self.radius
 
-    def as_obs(self, target_x, target_y) -> np.ndarray:
-        max_dist     = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-        dx_to_target = (target_x - self.x) / WINDOW_W
-        dy_to_target = (target_y - self.y) / WINDOW_H
-        dist         = np.sqrt((self.x - target_x) ** 2 + (self.y - target_y) ** 2)
+        if self.shape_type == "circle":
+            pygame.draw.circle(surface, self.color_rgb, (cx, cy), r)
+
+        elif self.shape_type == "square":
+            # axis-aligned square centered on (cx, cy)
+            rect = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+            pygame.draw.rect(surface, self.color_rgb, rect)
+
+        elif self.shape_type == "triangle":
+            # equilateral triangle pointing up, centered on (cx, cy)
+            # top vertex, bottom-left, bottom-right
+            pts = [
+                (cx,         cy - r),
+                (cx - r,     cy + r),
+                (cx + r,     cy + r),
+            ]
+            pygame.draw.polygon(surface, self.color_rgb, pts)
+
+        # size label centered on shape
+        label = font.render(f"{self.size:.1f}", True, (255, 255, 255))
+        surface.blit(label, (cx - 10, cy - 8))
+
+    def as_obs(self) -> np.ndarray:
+        """
+        wave 2 obs: x, y, size, color, shape_type — 5 values.
+        target-relative features (dist, dx, dy) removed since wave 2
+        uses scoring-based rewards with no fixed targets.
+        """
         return np.array([
             self.x / WINDOW_W,
             self.y / WINDOW_H,
             (self.size - 0.5) / 1.5,
             COLOR_NAMES.index(self.color_name) / max(len(COLOR_NAMES) - 1, 1),
-            dist / max_dist,
-            dx_to_target,
-            dy_to_target,
+            SHAPE_TYPE_IDX.get(self.shape_type, 0) / max(N_SHAPE_TYPES - 1, 1),
         ], dtype=np.float32)
 
 
@@ -224,6 +248,8 @@ class ShapeEnv(gym.Env):
         self.prev_dists        = self._compute_dists()
         self.dist_history      = [(d, d) for d in self.prev_dists]
         self.steps_since_moved = [0] * self.n_shapes
+        self.prev_score        = self._compute_task_score()
+        self.prev_score_delta  = 0.0
         self.prev_rank_corr    = self._compute_rank_corr()
         return self._get_obs(), {}
 
@@ -248,83 +274,87 @@ class ShapeEnv(gym.Env):
         actual_move   = np.sqrt((s.x - pre_x) ** 2 + (s.y - pre_y) ** 2)
         intended_move = np.sqrt(dx ** 2 + dy ** 2)
 
-        new_dists = self._compute_dists()
-        max_dist  = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-        old_d     = self.prev_dists[shape_idx]
-        new_d     = new_dists[shape_idx]
-        improvement = old_d - new_d
+        # ---------------------------------------------------------------
+        # wave 2 reward: score delta + shaped penalties
+        # ---------------------------------------------------------------
+        # the primary signal is improvement in the task score (0..1).
+        # no distance-to-target reward — the policy must learn what
+        # "progress" means for each task from the scoring function alone.
 
-        # 1. WEIGHTED DIRECTIONAL REWARD
-        urgency_weight = old_d / max(max_dist, 1.0)
-        directional    = improvement / max_dist * 5.0 * (1.0 + urgency_weight)
+        # 1. TASK SCORE DELTA
+        new_score       = self._compute_task_score()
+        score_delta     = new_score - self.prev_score
+        score_reward    = score_delta * 10.0
 
-        # 2. RANK / GROUP CORRELATION DELTA
+        # 2. RANK / COHESION DELTA (secondary signal, same as wave 1)
         new_rank_corr   = self._compute_rank_corr()
-        rank_corr_delta = new_rank_corr - self.prev_rank_corr
-        rank_reward     = rank_corr_delta * 2.0
+        rank_delta      = new_rank_corr - self.prev_rank_corr
+        rank_reward     = rank_delta * 2.0
 
-        # 3. PER-SHAPE SOLVED BONUS
-        solved_bonus = sum(0.015 for d in new_dists if d <= SOLVE_TOLERANCE)
-
-        # 4. NEGLECT PENALTY
-        neglect_penalty = 0.0
-        for i in range(self.n_shapes):
-            if (i != shape_idx
-                    and new_dists[i] > NEGLECT_THRESHOLD
-                    and self.steps_since_moved[i] > NEGLECT_PATIENCE):
-                neglect_penalty -= 0.003 * (new_dists[i] / max_dist)
-
-        # 5. OSCILLATION PENALTY
-        prev_improvement = (self.dist_history[shape_idx][0]
-                            - self.dist_history[shape_idx][1])
-        if prev_improvement > PROGRESS_THRESHOLD and improvement < -PROGRESS_THRESHOLD:
+        # 3. OSCILLATION PENALTY — penalise score going up then immediately down
+        if self.prev_score_delta > 0.01 and score_delta < -0.01:
             oscillation_penalty = -0.06
         else:
             oscillation_penalty = 0.0
 
-        # 6. WALL PENALTY
+        # 4. WALL PENALTY
         if intended_move > 5.0 and actual_move < intended_move * 0.25:
             wall_penalty = -0.05
         else:
             wall_penalty = 0.0
 
-        # 7. INACTIVITY PENALTY
+        # 5. INACTIVITY PENALTY
         inactivity_penalty = -0.04 if actual_move < MOVEMENT_THRESHOLD else 0.0
 
-        # 8. CAMP PENALTY
-        if shape_idx == self.last_shape_idx and old_d <= SOLVE_TOLERANCE:
-            camp_penalty = -0.08
+        # 6. CAMP PENALTY — discourage sitting on an already-solved shape
+        #    for canonical tasks we still track per-shape distances for this
+        if self.target_pos and shape_idx == self.last_shape_idx:
+            d = self._compute_dists()[shape_idx]
+            camp_penalty = -0.08 if d <= SOLVE_TOLERANCE else 0.0
         else:
             camp_penalty = 0.0
 
-        # bookkeeping
-        self.dist_history = [
-            (self.prev_dists[i], new_dists[i]) for i in range(self.n_shapes)
-        ]
+        # 7. NEGLECT PENALTY — discourage ignoring shapes that need moving
+        neglect_penalty = 0.0
+        max_dist        = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
         for i in range(self.n_shapes):
-            self.steps_since_moved[i] = 0 if i == shape_idx else self.steps_since_moved[i] + 1
+            if (i != shape_idx
+                    and self.steps_since_moved[i] > NEGLECT_PATIENCE):
+                neglect_penalty -= 0.003
 
-        self.steps_on_shape = (self.steps_on_shape + 1
-                               if shape_idx == self.last_shape_idx else 1)
-        self.last_shape_idx = shape_idx
-        self.last_action_dx = float(action[1])
-        self.last_action_dy = float(action[2])
-        self.prev_dists     = new_dists
-        self.prev_rank_corr = new_rank_corr
+        # bookkeeping
+        for i in range(self.n_shapes):
+            self.steps_since_moved[i] = (
+                0 if i == shape_idx else self.steps_since_moved[i] + 1
+            )
+        self.steps_on_shape    = (self.steps_on_shape + 1
+                                  if shape_idx == self.last_shape_idx else 1)
+        self.last_shape_idx    = shape_idx
+        self.last_action_dx    = float(action[1])
+        self.last_action_dy    = float(action[2])
+        self.prev_score_delta  = score_delta
+        self.prev_score        = new_score
+        self.prev_rank_corr    = new_rank_corr
 
-        dist_reward = (directional + rank_reward + solved_bonus
-                       + neglect_penalty + oscillation_penalty
-                       + wall_penalty + inactivity_penalty + camp_penalty)
+        # update target-based tracking for canonical tasks
+        if self.target_pos:
+            self.prev_dists   = self._compute_dists()
+            self.dist_history = [(self.prev_dists[i], self.prev_dists[i])
+                                 for i in range(self.n_shapes)]
+
+        reward = (score_reward + rank_reward + oscillation_penalty
+                  + wall_penalty + inactivity_penalty
+                  + camp_penalty + neglect_penalty
+                  + STEP_PENALTY)
 
         terminated = self._is_solved()
-        reward     = dist_reward + STEP_PENALTY
         if terminated:
             reward += COMPLETION_BONUS
 
         truncated = self.steps >= MAX_STEPS
         obs       = self._get_obs()
         info      = {
-            "score":     self._compute_score(),
+            "score":     new_score,
             "rank_corr": new_rank_corr,
             "steps":     self.steps,
             "task":      self.goal["task"],
@@ -350,13 +380,28 @@ class ShapeEnv(gym.Env):
     # -----------------------------------------------------------------------
 
     def _spawn_shapes(self) -> list:
-        rng   = self.np_random
-        task  = self.goal.get("task", "sort_by_size")
+        rng  = self.np_random
+        task = self.goal.get("task", "sort_by_size")
 
-        # sample colors freely — repeats are fine and expected for group tasks.
-        # the old used_colors logic tried to keep colors unique, which ran out
-        # at n_shapes > len(COLOR_NAMES) and produced unpredictable assignments.
+        # --- color assignment ---
+        # for group_by_color and cluster: ensure at least one repeated color
+        # so there's actually something to group. with n_shapes >= 2 we
+        # guarantee at least one pair shares a color.
         color_indices = rng.integers(0, len(COLOR_NAMES), size=self.n_shapes)
+        if task in ("group_by_color", "cluster") and self.n_shapes >= 2:
+            if len(set(color_indices)) == self.n_shapes:
+                # all unique — force one repeat
+                color_indices[1] = color_indices[0]
+
+        # --- shape type assignment ---
+        # for group_by_shape_type: ensure at least one repeated type.
+        # for all tasks: ensure at least 2 distinct types (visual variety).
+        type_indices = rng.integers(0, N_SHAPE_TYPES, size=self.n_shapes)
+        if task == "group_by_shape_type" and self.n_shapes >= 2:
+            if len(set(type_indices)) == self.n_shapes:
+                type_indices[1] = type_indices[0]
+        elif self.n_shapes >= 2 and len(set(type_indices)) < 2:
+            type_indices[1] = (type_indices[0] + 1) % N_SHAPE_TYPES
 
         shapes = []
         for i in range(self.n_shapes):
@@ -368,15 +413,43 @@ class ShapeEnv(gym.Env):
 
             size       = rng.uniform(0.5, 2.0)
             color_name = COLOR_NAMES[color_indices[i]]
-            shapes.append(Shape(i, x, y, size, color_name))
+            shape_type = SHAPE_TYPES[type_indices[i]]
+            shapes.append(Shape(i, x, y, size, color_name, shape_type))
+
+        # ensure the spawn isn't already solved — only needed for scoring tasks.
+        # canonical tasks (line, grid, push) can't accidentally spawn solved
+        # since shapes would have to land exactly on computed target positions,
+        # and they also need target_pos to be set before scoring works.
+        scoring_task = task in ("sort_by_size", "group_by_color",
+                                "group_by_shape_type", "cluster")
+        if scoring_task:
+            MAX_SPAWN_RETRIES = 10
+            for _ in range(MAX_SPAWN_RETRIES):
+                if not self._initial_score_solved(shapes):
+                    break
+                for s in shapes:
+                    s.x = float(rng.uniform(MARGIN, WINDOW_W - MARGIN))
+                    s.y = float(rng.uniform(MARGIN, WINDOW_H - MARGIN))
 
         return shapes
+
+    def _initial_score_solved(self, shapes) -> bool:
+        """
+        check whether a candidate spawn is already above the solve threshold.
+        temporarily swaps self.shapes to reuse the scoring functions without
+        resetting env state.
+        """
+        original   = self.shapes
+        self.shapes = shapes
+        solved      = self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+        self.shapes = original
+        return solved
 
     def _compute_targets(self) -> list:
         task = self.goal.get("task", "sort_by_size")
         if task == "sort_by_size":
             return self._targets_sort_by_size()
-        elif task in ("group_by_color", "cluster"):
+        elif task in ("group_by_color", "group_by_shape_type", "cluster"):
             return self._targets_group_by_color()
         elif task == "arrange_in_line":
             return self._targets_arrange_in_line()
@@ -552,27 +625,16 @@ class ShapeEnv(gym.Env):
 
     def _compute_rank_corr(self) -> float:
         """
-        global ordering/grouping quality signal, task-aware.
-
-        sort_by_size    → Spearman rank correlation ∈ [-1, 1].
-        group_by_color  → combined cohesion score ∈ [0, 1].
-        cluster         → same as group_by_color.
-        arrange_in_line → Spearman correlation of position vs slot order ∈ [-1, 1].
-        arrange_in_grid → fraction of shapes within SOLVE_TOLERANCE of their slot ∈ [0, 1].
-        push_to_region  → fraction of shapes inside the target region ∈ [0, 1].
+        secondary quality signal logged to tensorboard, task-aware.
+        for scoring tasks this mirrors _compute_task_score.
+        for canonical tasks it uses distance/position-based signals.
         """
         task = self.goal.get("task", "sort_by_size")
 
-        if task == "sort_by_size":
-            axis        = self.goal.get("axis", "x")
-            current_pos = [s.x if axis == "x" else s.y for s in self.shapes]
-            target_pos  = [self.target_pos[i][0] if axis == "x"
-                           else self.target_pos[i][1]
-                           for i in range(self.n_shapes)]
-            return _spearman_corr(current_pos, target_pos)
-
-        elif task in ("group_by_color", "cluster"):
-            return self._group_cohesion_score()
+        if task in ("sort_by_size", "group_by_color",
+                    "group_by_shape_type", "cluster"):
+            # for scoring tasks, rank_corr == task_score (no redundancy needed)
+            return self._compute_task_score()
 
         elif task == "arrange_in_line":
             axis        = self.goal.get("axis", "x")
@@ -650,19 +712,146 @@ class ShapeEnv(gym.Env):
             return 1.0   # single shape, trivially grouped
         return float(np.mean(components))
 
+    def _compute_task_score(self) -> float:
+        """
+        primary wave 2 reward signal. scores the current arrangement
+        against the task objective, returning a value in [0, 1].
+
+        scoring-based tasks (any valid solution accepted):
+            sort_by_size      — spearman correlation mapped to [0, 1]
+            group_by_color    — cohesion score
+            group_by_shape_type — cohesion score keyed on shape_type
+            cluster           — cohesion score keyed on color
+
+        canonical-target tasks (unique solution, score = 1 - avg_dist/max_dist):
+            arrange_in_line, arrange_in_grid, push_to_region
+        """
+        task = self.goal.get("task", "sort_by_size")
+
+        if task == "sort_by_size":
+            return self._score_sort_by_size()
+        elif task == "group_by_color":
+            return self._score_group_by_attribute("color")
+        elif task == "group_by_shape_type":
+            return self._score_group_by_attribute("shape_type")
+        elif task == "cluster":
+            return self._score_group_by_attribute("color")
+        else:
+            # canonical tasks: 1 - normalised avg distance to fixed targets
+            if not self.target_pos:
+                return 0.0
+            max_dist = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
+            avg_dist = float(np.mean(self._compute_dists()))
+            return 1.0 - avg_dist / max_dist
+
+    def _score_sort_by_size(self) -> float:
+        """
+        scores sort_by_size as a [0, 1] value.
+        uses spearman rank correlation between current positions and
+        ideal sorted positions, mapped from [-1, 1] to [0, 1].
+        1.0 = perfectly sorted. 0.5 = random. 0.0 = perfectly reversed.
+        """
+        axis      = self.goal.get("axis", "x")
+        direction = self.goal.get("direction", "ascending")
+        sizes     = [s.size for s in self.shapes]
+        positions = [s.x if axis == "x" else s.y for s in self.shapes]
+
+        # ideal position ranks for ascending order
+        size_ranks = np.argsort(np.argsort(sizes)).astype(float)
+        if direction == "descending":
+            size_ranks = (self.n_shapes - 1) - size_ranks
+
+        corr = _spearman_corr(positions, size_ranks.tolist())
+        return (corr + 1.0) / 2.0   # [-1, 1] -> [0, 1]
+
+    def _score_group_by_attribute(self, attribute: str) -> float:
+        """
+        scores grouping tasks by attribute ("color" or "shape_type").
+        returns a [0, 1] score. blends two components:
+
+        component 1 — nearest-neighbor relative score (weight 0.7):
+            for each shape, is its nearest same-attribute neighbor closer
+            than its nearest different-attribute neighbor? scale-invariant —
+            a correct grouping scores 1.0 regardless of how spread out the
+            groups are on the canvas. sharp at the solution boundary.
+
+        component 2 — intra/inter distance score (weight 0.3):
+            normalized by half-diagonal. provides smooth gradient signal
+            during training before the nn condition is fully satisfied.
+
+        threshold 0.85 correctly accepts well-grouped arrangements and
+        rejects interleaved/random ones regardless of canvas position.
+        """
+        n         = self.n_shapes
+        half_diag = np.sqrt((WINDOW_W / 2) ** 2 + (WINDOW_H / 2) ** 2)
+
+        def get_attr(s):
+            return s.color_name if attribute == "color" else s.shape_type
+
+        # --- component 1: nn relative score ---
+        nn_score = 0.0
+        for i in range(n):
+            same_d = [
+                np.sqrt((self.shapes[i].x - self.shapes[j].x) ** 2 +
+                        (self.shapes[i].y - self.shapes[j].y) ** 2)
+                for j in range(n)
+                if i != j and get_attr(self.shapes[i]) == get_attr(self.shapes[j])
+            ]
+            diff_d = [
+                np.sqrt((self.shapes[i].x - self.shapes[j].x) ** 2 +
+                        (self.shapes[i].y - self.shapes[j].y) ** 2)
+                for j in range(n)
+                if i != j and get_attr(self.shapes[i]) != get_attr(self.shapes[j])
+            ]
+            if not same_d or not diff_d:
+                nn_score += 1.0   # only one of this attr value — trivially ok
+            else:
+                nn_score += 1.0 if min(same_d) < min(diff_d) else 0.0
+        nn_score /= n
+
+        # --- component 2: intra/inter distance score ---
+        intra_scores = []
+        inter_scores = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d    = np.sqrt((self.shapes[i].x - self.shapes[j].x) ** 2 +
+                               (self.shapes[i].y - self.shapes[j].y) ** 2)
+                norm = d / half_diag
+                if get_attr(self.shapes[i]) == get_attr(self.shapes[j]):
+                    intra_scores.append(1.0 - min(norm, 1.0))
+                else:
+                    inter_scores.append(min(norm, 1.0))
+
+        parts = []
+        if intra_scores:
+            parts.append(float(np.mean(intra_scores)))
+        if inter_scores:
+            parts.append(float(np.mean(inter_scores)))
+        dist_score = float(np.mean(parts)) if parts else 0.0
+
+        return 0.7 * nn_score + 0.3 * dist_score
+
     def _compute_score(self) -> float:
-        """0–1 distance-based progress. 1.0 = all shapes exactly at targets."""
-        max_dist = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-        avg_dist = float(np.mean(self._compute_dists()))
-        return 1.0 - avg_dist / max_dist
+        """alias for _compute_task_score — used by callbacks and debug."""
+        return self._compute_task_score()
 
     def _is_solved(self) -> bool:
-        return all(d <= SOLVE_TOLERANCE for d in self._compute_dists())
+        """
+        episode termination condition. task-specific:
+        - scoring tasks: solved when score >= SCORE_SOLVE_THRESHOLD
+        - canonical tasks: solved when all shapes within SOLVE_TOLERANCE of targets
+        """
+        task = self.goal.get("task", "sort_by_size")
+        if task in ("sort_by_size", "group_by_color",
+                    "group_by_shape_type", "cluster"):
+            return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+        else:
+            return all(d <= SOLVE_TOLERANCE for d in self._compute_dists())
 
     def _get_obs(self) -> np.ndarray:
-        # active shape observations
+        # active shape observations — no target-relative features in wave 2
         active_obs = np.concatenate([
-            self.shapes[i].as_obs(*self.target_pos[i])
+            self.shapes[i].as_obs()
             for i in range(self.n_shapes)
         ])
 
@@ -707,10 +896,17 @@ class ShapeEnv(gym.Env):
 
         self.window.fill(BG_COLOR)
 
-        for i, (tx, ty) in enumerate(self.target_pos):
-            pygame.draw.circle(self.window, TARGET_COLOR,
-                               (int(tx), int(ty)),
-                               self.shapes[i].radius, 2)
+        # ghost markers at target positions — only for canonical tasks.
+        # scoring tasks (sort, group) have no fixed targets so ghosts
+        # would just show stale heuristic positions and be confusing.
+        task           = self.goal.get("task", "sort_by_size")
+        canonical_task = task in ("arrange_in_line", "arrange_in_grid",
+                                  "push_to_region")
+        if canonical_task and self.target_pos:
+            for i, (tx, ty) in enumerate(self.target_pos):
+                pygame.draw.circle(self.window, TARGET_COLOR,
+                                   (int(tx), int(ty)),
+                                   self.shapes[i].radius, 2)
 
         for shape in self.shapes:
             shape.draw(self.window, self.font)

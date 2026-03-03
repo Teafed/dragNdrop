@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from stable_baselines3.common.monitor import Monitor
 
-from shape_env import ShapeEnv, SOLVE_TOLERANCE, MAX_NUDGE, WINDOW_W, WINDOW_H
+from shape_env import ShapeEnv, SOLVE_TOLERANCE, MAX_NUDGE, WINDOW_W, WINDOW_H, MARGIN
 from llm_goal_parser import parse_goal, get_embedding
 from config import TASK_POOL, MAX_SHAPES, GOAL_ENCODING_DIM
 
@@ -40,21 +40,23 @@ from config import TASK_POOL, MAX_SHAPES, GOAL_ENCODING_DIM
 
 class OraclePolicy:
     """
-    Deterministic (+ optional noise) oracle that solves ShapeEnv analytically.
+    deterministic (+ optional noise) oracle that solves ShapeEnv analytically.
 
-    Strategy for all tasks:
-        - Find the unsolved shape that is furthest from its target (most urgent).
-        - Compute the unit vector toward that target.
-        - Return a nudge in that direction, scaled to MAX_NUDGE.
+    wave 2 strategy:
+        scoring tasks (sort, group_by_color, group_by_shape_type, cluster):
+            task-specific heuristics that compute where each shape *should* go
+            based on current state, rather than reading a fixed target_pos.
+            this is necessary because these tasks have no unique canonical solution.
 
-    This greedy nearest-target strategy works for both sort and group tasks
-    because _compute_targets() handles the task-specific goal geometry.
+        canonical tasks (arrange_in_line, arrange_in_grid, push_to_region):
+            greedy nearest-target strategy, reading target_pos directly.
+            these tasks have a unique solution so fixed targets are fine.
 
-    Args:
-        env:        A ShapeEnv instance (raw or Monitor-wrapped).
-        noise_std:  Std dev of Gaussian noise added to dx/dy.
-                    0 = perfect oracle.  0.05 = realistic noise for BC data.
-        seed:       RNG seed for reproducible datasets.
+    args:
+        env:        a ShapeEnv instance (raw or Monitor-wrapped).
+        noise_std:  std dev of gaussian noise on dx/dy.
+                    0 = perfect oracle. 0.05 = realistic noise for BC data.
+        seed:       rng seed for reproducible datasets.
     """
 
     def __init__(self, env, noise_std: float = 0.05, seed: int = 42):
@@ -64,33 +66,142 @@ class OraclePolicy:
 
     @property
     def env(self) -> ShapeEnv:
-        """Unwrap Monitor wrapper if present."""
+        """unwrap Monitor wrapper if present."""
         e = self._env
         return e.env if isinstance(e, Monitor) else e
 
     def act(self, obs=None) -> np.ndarray:
         """
-        Return an action [shape_selector, dx, dy] ∈ [-1, 1]³.
-
-        obs is accepted for API compatibility with SB3's model.predict()
-        signature but is not used — the oracle reads env state directly.
+        return an action [shape_selector, dx, dy] ∈ [-1, 1]³.
+        obs is accepted for api compatibility but not used — oracle reads env directly.
         """
         env  = self.env
         task = env.goal.get("task", "sort_by_size")
 
-        # the greedy nearest-target strategy works for all tasks because
-        # _compute_targets() encodes task-specific geometry into target positions.
-        # any task not listed here gets random actions as a safe fallback.
-        if task in ("sort_by_size", "group_by_color", "cluster",
-                    "arrange_in_line", "arrange_in_grid", "push_to_region"):
-            return self._act_greedy()
+        if task == "sort_by_size":
+            return self._act_sort_by_size()
+        elif task in ("group_by_color", "cluster"):
+            return self._act_group_by_attribute("color")
+        elif task == "group_by_shape_type":
+            return self._act_group_by_attribute("shape_type")
+        elif task in ("arrange_in_line", "arrange_in_grid", "push_to_region"):
+            return self._act_greedy_canonical()
         else:
             return env.action_space.sample()
 
-    def _act_greedy(self) -> np.ndarray:
+    # -----------------------------------------------------------------------
+    # scoring task heuristics
+    # -----------------------------------------------------------------------
+
+    def _act_sort_by_size(self) -> np.ndarray:
         """
-        Pick the unsolved shape furthest from its target and nudge it directly
-        toward the target.  Among solved shapes, idle (zero nudge).
+        compute the ideal sorted positions on the fly and move the shape
+        that is furthest from its ideal rank position.
+        """
+        env       = self.env
+        axis      = env.goal.get("axis", "x")
+        direction = env.goal.get("direction", "ascending")
+        n         = env.n_shapes
+        pad       = MARGIN * 2
+
+        # compute ideal positions for each rank
+        if axis == "x":
+            slots  = np.linspace(pad, WINDOW_W - pad, n)
+            center = WINDOW_H / 2
+        else:
+            slots  = np.linspace(pad, WINDOW_H - pad, n)
+            center = WINDOW_W / 2
+
+        # assign shapes to slots by size
+        sizes = [s.size for s in env.shapes]
+        order = np.argsort(sizes)   # order[0] = idx of smallest shape
+        if direction == "descending":
+            order = order[::-1]
+
+        # targets[i] = target position for shape i
+        targets = [None] * n
+        for rank, shape_idx in enumerate(order):
+            if axis == "x":
+                targets[shape_idx] = (float(slots[rank]), float(center))
+            else:
+                targets[shape_idx] = (float(center), float(slots[rank]))
+
+        # move the most displaced shape
+        dists     = [np.sqrt((env.shapes[i].x - targets[i][0]) ** 2 +
+                             (env.shapes[i].y - targets[i][1]) ** 2)
+                     for i in range(n)]
+        shape_idx = int(np.argmax(dists))
+
+        if dists[shape_idx] < SOLVE_TOLERANCE:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        return self._nudge_toward(shape_idx, targets[shape_idx])
+
+    def _act_group_by_attribute(self, attribute: str) -> np.ndarray:
+        """
+        group shapes by a discrete attribute ("color" or "shape_type").
+        strategy: assign each attribute value a canvas region, then move
+        the shape that is furthest from its group's centroid region.
+        """
+        env = self.env
+        n   = env.n_shapes
+
+        def get_attr(s):
+            return s.color_name if attribute == "color" else s.shape_type
+
+        # find unique attribute values and assign each a horizontal region
+        attrs   = [get_attr(s) for s in env.shapes]
+        unique  = list(dict.fromkeys(attrs))   # preserve order, deduplicate
+        n_groups = len(unique)
+        pad     = MARGIN * 2
+
+        # divide canvas into horizontal strips per group
+        group_centers_x = np.linspace(
+            WINDOW_W / (n_groups + 1),
+            WINDOW_W * n_groups / (n_groups + 1),
+            n_groups
+        )
+        group_center_y = WINDOW_H / 2
+
+        # within each group, stack shapes vertically around the center
+        group_members = {a: [] for a in unique}
+        for i, s in enumerate(env.shapes):
+            group_members[get_attr(s)].append(i)
+
+        targets = [None] * n
+        for attr_val, member_idxs in group_members.items():
+            group_idx = unique.index(attr_val)
+            cx        = float(group_centers_x[group_idx])
+            m         = len(member_idxs)
+            if m == 1:
+                ys = [group_center_y]
+            else:
+                ys = list(np.linspace(
+                    group_center_y - 30 * (m - 1) / 2,
+                    group_center_y + 30 * (m - 1) / 2,
+                    m
+                ))
+            for slot, shape_idx in enumerate(member_idxs):
+                targets[shape_idx] = (cx, float(np.clip(ys[slot], pad, WINDOW_H - pad)))
+
+        dists     = [np.sqrt((env.shapes[i].x - targets[i][0]) ** 2 +
+                             (env.shapes[i].y - targets[i][1]) ** 2)
+                     for i in range(n)]
+        shape_idx = int(np.argmax(dists))
+
+        if dists[shape_idx] < SOLVE_TOLERANCE:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        return self._nudge_toward(shape_idx, targets[shape_idx])
+
+    # -----------------------------------------------------------------------
+    # canonical task heuristic (reads target_pos directly)
+    # -----------------------------------------------------------------------
+
+    def _act_greedy_canonical(self) -> np.ndarray:
+        """
+        for canonical tasks: find the unsolved shape furthest from its
+        fixed target_pos and nudge it toward the target.
         """
         env   = self.env
         dists = [
@@ -101,44 +212,41 @@ class OraclePolicy:
             for i in range(env.n_shapes)
         ]
 
-        unsolved = [i for i, d in enumerate(dists) if d > SOLVE_TOLERANCE]
+        unsolved  = [i for i, d in enumerate(dists) if d > SOLVE_TOLERANCE]
         if not unsolved:
-            # All shapes solved — return a valid idle action
             return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        # Greedy: attend to the most displaced shape first
         shape_idx = max(unsolved, key=lambda i: dists[i])
-        return self._nudge_toward_target(shape_idx)
+        return self._nudge_toward(shape_idx, env.target_pos[shape_idx])
 
-    def _nudge_toward_target(self, shape_idx: int) -> np.ndarray:
+    # -----------------------------------------------------------------------
+    # shared nudge helper
+    # -----------------------------------------------------------------------
+
+    def _nudge_toward(self, shape_idx: int, target: tuple) -> np.ndarray:
         """
-        Build the action to move shape_idx toward its target.
-        Clips the nudge magnitude so we don't overshoot on the last step.
-        Adds Gaussian noise so BC demonstrations aren't pixel-perfect.
+        build an action to move shape_idx toward target (tx, ty).
+        clips nudge magnitude to avoid overshooting on the final approach.
+        adds gaussian noise for bc dataset diversity.
         """
         env    = self.env
         s      = env.shapes[shape_idx]
-        tx, ty = env.target_pos[shape_idx]
+        tx, ty = target
 
         delta_x = tx - s.x
         delta_y = ty - s.y
         dist    = np.sqrt(delta_x ** 2 + delta_y ** 2) + 1e-8
 
-        # Normalise to [-1, 1] — env scales by MAX_NUDGE internally.
-        # Clip scale to 1.0 so we don't overshoot on the final approach.
         scale = min(dist / MAX_NUDGE, 1.0)
         dx    = (delta_x / dist) * scale
         dy    = (delta_y / dist) * scale
 
-        # Add noise for dataset diversity
         if self.noise_std > 0:
             dx += self.rng.normal(0, self.noise_std)
             dy += self.rng.normal(0, self.noise_std)
 
-        dx = float(np.clip(dx, -1.0, 1.0))
-        dy = float(np.clip(dy, -1.0, 1.0))
-
-        # Map shape index → shape_selector ∈ [-1, 1]
+        dx       = float(np.clip(dx, -1.0, 1.0))
+        dy       = float(np.clip(dy, -1.0, 1.0))
         selector = (shape_idx / max(env.n_shapes - 1, 1)) * 2.0 - 1.0
 
         return np.array([selector, dx, dy], dtype=np.float32)

@@ -51,6 +51,7 @@ GOAL_SCHEMA = {
 SUPPORTED_TASKS = [
     "sort_by_size",
     "group_by_color",
+    "group_by_shape_type",
     "cluster",
     "arrange_in_line",
     "arrange_in_grid",
@@ -197,10 +198,10 @@ def _stub_parse(prompt: str) -> dict:
     if any(kw in prompt for kw in ("right side", "move right", "push right")):
         return {"task": "push_to_region", "axis": "none", "direction": "none",
                 "attribute": "none", "region": "right"}
-    if any(kw in prompt for kw in ("top", "move up", "push up")):
+    if any(kw in prompt for kw in ("to the top", "move up", "push up")):
         return {"task": "push_to_region", "axis": "none", "direction": "none",
                 "attribute": "none", "region": "top"}
-    if any(kw in prompt for kw in ("bottom", "move down", "push down")):
+    if any(kw in prompt for kw in ("to the bottom", "move down", "push down")):
         return {"task": "push_to_region", "axis": "none", "direction": "none",
                 "attribute": "none", "region": "bottom"}
 
@@ -215,6 +216,15 @@ def _stub_parse(prompt: str) -> dict:
         axis = "y" if "vertical" in prompt else "x"
         return {"task": "arrange_in_line", "axis": axis, "direction": "none",
                 "attribute": "none", "region": "none"}
+
+    # group_by_shape_type — check before color keywords
+    shape_type_keywords = ("type", "shape", "circle", "square", "triangle",
+                           "by type", "same type", "same shape")
+    if any(kw in prompt for kw in shape_type_keywords):
+        # avoid matching "sort shapes" — only match explicit grouping intent
+        if any(kw in prompt for kw in ("group", "put", "same", "together", "separately")):
+            return {"task": "group_by_shape_type", "axis": "none", "direction": "none",
+                    "attribute": "shape_type", "region": "none"}
 
     # group_by_color
     color_keywords = ("color", "colour", "red", "blue", "green", "yellow",
@@ -325,9 +335,9 @@ def _validate_goal(goal: dict):
             f"direction must be 'ascending', 'descending', or 'none', "
             f"got '{goal['direction']}'"
         )
-    if goal["attribute"] not in ("size", "color", "none"):
+    if goal["attribute"] not in ("size", "color", "shape_type", "none"):
         raise ValueError(
-            f"attribute must be 'size', 'color', or 'none', "
+            f"attribute must be 'size', 'color', 'shape_type', or 'none', "
             f"got '{goal['attribute']}'"
         )
     if goal["region"] not in ("left", "right", "top", "bottom", "none"):

@@ -9,8 +9,14 @@
 # ---------------------------------------------------------------------------
 
 MAX_SHAPES           = 6   # maximum shapes any episode can have
-OBS_VALUES_PER_SHAPE = 7   # per-shape features: x, y, size, color, dist, dx, dy
+OBS_VALUES_PER_SHAPE = 5   # per-shape features: x, y, size, color, shape_type
 ACTION_HISTORY_SIZE  = 4   # last_shape_idx, steps_on_shape, last_dx, last_dy
+
+# shape types — encoded as a normalized float in obs: index / (N_SHAPE_TYPES - 1)
+# 0.0 = circle, 0.5 = square, 1.0 = triangle
+SHAPE_TYPES    = ["circle", "square", "triangle"]
+N_SHAPE_TYPES  = len(SHAPE_TYPES)
+SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
 
 # ---------------------------------------------------------------------------
 # goal embedding
@@ -47,25 +53,29 @@ def get_obs_size() -> int:
       MAX_SHAPES slots (zero-padded for unused shapes)
       + GOAL_ENCODING_DIM (projected embedding, not raw 384-dim)
       + ACTION_HISTORY_SIZE
+
+   wave 2: OBS_VALUES_PER_SHAPE = 5 (x, y, size, color, shape_type)
+   wave 1 had 7 (also included dist_to_target, dx_to_target, dy_to_target).
+   those are removed because wave 2 uses scoring-based rewards with no
+   fixed targets, so target-relative features are meaningless.
+   net change: 6*(7-5) = 12 fewer values. obs size 110 -> 98.
    """
    return MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM + ACTION_HISTORY_SIZE
 
 # ---------------------------------------------------------------------------
 # task pool
 # ---------------------------------------------------------------------------
-# each entry is a natural language prompt that parse_goal() and get_embedding()
-# both understand. training samples from this list randomly each episode.
+# wave 1 tasks: sort_by_size, group_by_color, arrange_in_line,
+#               arrange_in_grid, push_to_region, cluster
 #
-# wave 1 tasks:
-#   - sort_by_size    (4 variants covering both axes and both directions)
-#   - group_by_color  (2 phrasings for prompt diversity)
-#   - arrange_in_line (horizontal and vertical)
-#   - arrange_in_grid (rectangular n_shapes only for now)
-#   - push_to_region  (4 canvas regions)
+# wave 2 additions:
+#   - group_by_shape: cluster shapes of the same type (circle/square/triangle)
 #
-# to add a task: add prompts here, add a _targets_<task>() method in
-# shape_env.py, add a branch in _compute_targets(), and add oracle logic
-# in oracle.py if the greedy strategy isn't sufficient.
+# reward approach by task:
+#   scoring-based (any valid solution rewarded):
+#       sort_by_size, group_by_color, group_by_shape, cluster
+#   canonical-target (unique solution, fixed targets kept for rendering):
+#       arrange_in_line, arrange_in_grid, push_to_region
 
 TASK_POOL = [
    # sort_by_size
@@ -77,6 +87,11 @@ TASK_POOL = [
    # group_by_color
    "group shapes by color",
    "put shapes of the same color close together",
+
+   # group_by_shape_type (wave 2)
+   "group shapes by type",
+   "put shapes of the same type close together",
+   "group the circles squares and triangles separately",
 
    # arrange_in_line
    "arrange shapes in a horizontal line evenly spaced",
@@ -95,8 +110,8 @@ TASK_POOL = [
 # ---------------------------------------------------------------------------
 # legacy aliases
 # ---------------------------------------------------------------------------
-# kept so any code that still imports these names doesn't break during
-# the wave 1 transition. remove in wave 2.
+# kept so any code that still imports these names doesn't break.
+# remove in wave 3.
 
 N_SHAPES_START = 2
 N_SHAPES_MAX   = MAX_SHAPES
