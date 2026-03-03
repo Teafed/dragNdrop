@@ -37,13 +37,17 @@ import gymnasium as gym
 from gymnasium import spaces
 import pygame
 
+from config import (
+    MAX_SHAPES, OBS_VALUES_PER_SHAPE, ACTION_HISTORY_SIZE,
+    GOAL_ENCODING_DIM, get_obs_size,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 WINDOW_W     = 800
 WINDOW_H     = 600
-MAX_SHAPES   = 5
 SHAPE_RADIUS = 20
 FPS          = 60
 MAX_STEPS    = 500
@@ -72,7 +76,14 @@ COLOR_NAMES  = list(COLORS.keys())
 BG_COLOR     = (30, 30, 35)
 TARGET_COLOR = (80, 80, 80)
 
-SUPPORTED_TASKS = ["sort_by_size", "group_by_color", "cluster"]
+SUPPORTED_TASKS = [
+    "sort_by_size",
+    "group_by_color",
+    "cluster",
+    "arrange_in_line",
+    "arrange_in_grid",
+    "push_to_region",
+]
 TASK_IDX = {t: i for i, t in enumerate(SUPPORTED_TASKS)}
 
 
@@ -130,21 +141,38 @@ class ShapeEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
 
-    def __init__(self, n_shapes: int = 4, goal: dict = None, render_mode: str = None):
+    def __init__(self, n_shapes: int = None, goal: dict = None,
+                 goal_embedding: np.ndarray = None, render_mode: str = None):
         super().__init__()
 
-        self.n_shapes    = n_shapes
-        self.render_mode = render_mode
+        # n_shapes=None means sample randomly each episode up to MAX_SHAPES.
+        # passing a fixed value overrides this (useful for oracle/BC collection).
+        self._fixed_n_shapes = n_shapes
+        self.n_shapes        = n_shapes if n_shapes is not None else 2
+        self.render_mode     = render_mode
 
         self.goal = goal or {
             "task":      "sort_by_size",
             "axis":      "x",
             "direction": "ascending",
             "attribute": "size",
+            "region":    "none",
         }
 
-        # 7 obs values per shape + 3 goal encoding + 4 action history
-        obs_size = self.n_shapes * 7 + 3 + 4
+        # goal_embedding: pre-computed EMBEDDING_DIM vector from get_embedding().
+        # stored as GOAL_ENCODING_DIM zeros until set — the goal encoder MLP
+        # in bc_train.py/train.py projects this down before it enters the policy.
+        # shape_env stores the already-projected GOAL_ENCODING_DIM vector so the
+        # obs space is always the same size regardless of raw embedding dim.
+        self._goal_encoding = (
+            goal_embedding[:GOAL_ENCODING_DIM].astype(np.float32)
+            if goal_embedding is not None
+            else np.zeros(GOAL_ENCODING_DIM, dtype=np.float32)
+        )
+
+        # fixed obs size regardless of n_shapes — unused shape slots are zero-padded.
+        # formula lives in config.get_obs_size() so it's always in sync.
+        obs_size = get_obs_size()
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0,
             shape=(obs_size,),
@@ -179,6 +207,13 @@ class ShapeEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        # sample n_shapes for this episode if not fixed at construction time
+        if self._fixed_n_shapes is None:
+            self.n_shapes = int(self.np_random.integers(2, MAX_SHAPES + 1))
+        else:
+            self.n_shapes = self._fixed_n_shapes
+
         self.steps             = 0
         self.last_shape_idx    = -1
         self.steps_on_shape    = 0
@@ -315,11 +350,15 @@ class ShapeEnv(gym.Env):
     # -----------------------------------------------------------------------
 
     def _spawn_shapes(self) -> list:
-        rng         = self.np_random
-        shapes      = []
-        used_colors = []
-        task        = self.goal.get("task", "sort_by_size")
+        rng   = self.np_random
+        task  = self.goal.get("task", "sort_by_size")
 
+        # sample colors freely — repeats are fine and expected for group tasks.
+        # the old used_colors logic tried to keep colors unique, which ran out
+        # at n_shapes > len(COLOR_NAMES) and produced unpredictable assignments.
+        color_indices = rng.integers(0, len(COLOR_NAMES), size=self.n_shapes)
+
+        shapes = []
         for i in range(self.n_shapes):
             x = rng.uniform(MARGIN, WINDOW_W - MARGIN)
             if task == "sort_by_size":
@@ -328,11 +367,7 @@ class ShapeEnv(gym.Env):
                 y = rng.uniform(MARGIN, WINDOW_H - MARGIN)
 
             size       = rng.uniform(0.5, 2.0)
-            available  = [c for c in COLOR_NAMES if c not in used_colors]
-            if not available:
-                available = COLOR_NAMES
-            color_name = available[rng.integers(0, len(available))]
-            used_colors.append(color_name)
+            color_name = COLOR_NAMES[color_indices[i]]
             shapes.append(Shape(i, x, y, size, color_name))
 
         return shapes
@@ -343,6 +378,12 @@ class ShapeEnv(gym.Env):
             return self._targets_sort_by_size()
         elif task in ("group_by_color", "cluster"):
             return self._targets_group_by_color()
+        elif task == "arrange_in_line":
+            return self._targets_arrange_in_line()
+        elif task == "arrange_in_grid":
+            return self._targets_arrange_in_grid()
+        elif task == "push_to_region":
+            return self._targets_push_to_region()
         else:
             return [(s.x, s.y) for s in self.shapes]
 
@@ -372,8 +413,8 @@ class ShapeEnv(gym.Env):
     def _targets_group_by_color(self) -> list:
         """
         Assign each unique colour a distinct anchor region on the canvas.
-        Shapes within the same colour group get a small horizontal stagger
-        so they don't perfectly overlap.
+        Same-color shapes are staggered in a small grid around their anchor
+        so they don't overlap even when a group has 3-4 members.
         """
         unique_colors = list(dict.fromkeys(s.color_name for s in self.shapes))
         n_colors      = len(unique_colors)
@@ -404,23 +445,103 @@ class ShapeEnv(gym.Env):
             anchors = {c: (float(xs[i]), WINDOW_H / 2)
                        for i, c in enumerate(unique_colors)}
 
-        color_counts  = {c: 0 for c in unique_colors}
-        targets       = []
-        OFFSET_SPREAD = 40
+        # per-group stagger offsets in a small grid so members don't overlap.
+        # pattern: (0,0), (-1,0), (+1,0), (0,-1), (0,+1), ...
+        # SPREAD controls spacing between members within a group.
+        SPREAD  = 50
+        OFFSETS = [
+            ( 0,  0),
+            (-1,  0),
+            ( 1,  0),
+            ( 0, -1),
+            ( 0,  1),
+            (-1, -1),
+            ( 1,  1),
+        ]
+
+        color_counts = {c: 0 for c in unique_colors}
+        targets      = []
 
         for shape in self.shapes:
             ax, ay = anchors[shape.color_name]
             idx    = color_counts[shape.color_name]
-            offset_x = (idx - 0.5) * OFFSET_SPREAD
+            ox, oy = OFFSETS[idx % len(OFFSETS)]
             targets.append((
-                float(np.clip(ax + offset_x, MARGIN, WINDOW_W - MARGIN)),
-                float(np.clip(ay, MARGIN, WINDOW_H - MARGIN)),
+                float(np.clip(ax + ox * SPREAD, MARGIN, WINDOW_W - MARGIN)),
+                float(np.clip(ay + oy * SPREAD, MARGIN, WINDOW_H - MARGIN)),
             ))
             color_counts[shape.color_name] += 1
 
         return targets
 
+    def _targets_arrange_in_line(self) -> list:
+        """
+        evenly spaced line across the canvas.
+        axis="x" → horizontal line at vertical center.
+        axis="y" → vertical line at horizontal center.
+        """
+        axis = self.goal.get("axis", "x")
+        pad  = MARGIN * 2
+        n    = self.n_shapes
+
+        if axis == "x":
+            xs = np.linspace(pad, WINDOW_W - pad, n)
+            return [(float(x), float(WINDOW_H / 2)) for x in xs]
+        else:
+            ys = np.linspace(pad, WINDOW_H - pad, n)
+            return [(float(WINDOW_W / 2), float(y)) for y in ys]
+
+    def _targets_arrange_in_grid(self) -> list:
+        """
+        rectangular grid layout. finds the nearest rectangle to n_shapes,
+        places a partial row at the bottom if n_shapes isn't a perfect rectangle.
+        shapes are assigned to grid slots in their current left-to-right order
+        so the agent doesn't have to cross shapes to reach targets.
+        """
+        n   = self.n_shapes
+        pad = MARGIN * 2
+
+        # find cols x rows such that cols*rows >= n and cols >= rows
+        cols = max(1, int(np.ceil(np.sqrt(n))))
+        rows = max(1, int(np.ceil(n / cols)))
+
+        xs = np.linspace(pad, WINDOW_W - pad, cols)
+        ys = np.linspace(pad, WINDOW_H - pad, rows)
+
+        # assign shapes to slots left-to-right, top-to-bottom
+        targets = []
+        for i in range(n):
+            row = i // cols
+            col = i  % cols
+            targets.append((float(xs[col]), float(ys[row])))
+        return targets
+
+    def _targets_push_to_region(self) -> list:
+        """
+        pack all shapes into one half of the canvas.
+        within the region, shapes are arranged in a line so they don't overlap.
+        """
+        region = self.goal.get("region", "left")
+        n      = self.n_shapes
+        pad    = MARGIN * 2
+
+        if region == "left":
+            xs = np.linspace(pad, WINDOW_W * 0.35, n)
+            ys = np.full(n, WINDOW_H / 2)
+        elif region == "right":
+            xs = np.linspace(WINDOW_W * 0.65, WINDOW_W - pad, n)
+            ys = np.full(n, WINDOW_H / 2)
+        elif region == "top":
+            xs = np.full(n, WINDOW_W / 2)
+            ys = np.linspace(pad, WINDOW_H * 0.35, n)
+        else:   # bottom
+            xs = np.full(n, WINDOW_W / 2)
+            ys = np.linspace(WINDOW_H * 0.65, WINDOW_H - pad, n)
+
+        return [(float(xs[i]), float(ys[i])) for i in range(n)]
+
     def _compute_dists(self) -> list:
+        """distance from each active shape to its target, in pixels."""
         return [
             float(np.sqrt(
                 (self.shapes[i].x - self.target_pos[i][0]) ** 2 +
@@ -431,29 +552,54 @@ class ShapeEnv(gym.Env):
 
     def _compute_rank_corr(self) -> float:
         """
-        Global ordering/grouping quality signal.
+        global ordering/grouping quality signal, task-aware.
 
-        sort_by_size   → Spearman rank correlation ∈ [-1, 1].
-        group_by_color → Combined cohesion score ∈ [0, 1].
-                         Rewards same-color shapes being close AND
-                         different-color shapes being far apart.
-                         This makes the signal non-zero even with 2 shapes
-                         of different colors (the most common training setup).
+        sort_by_size    → Spearman rank correlation ∈ [-1, 1].
+        group_by_color  → combined cohesion score ∈ [0, 1].
+        cluster         → same as group_by_color.
+        arrange_in_line → Spearman correlation of position vs slot order ∈ [-1, 1].
+        arrange_in_grid → fraction of shapes within SOLVE_TOLERANCE of their slot ∈ [0, 1].
+        push_to_region  → fraction of shapes inside the target region ∈ [0, 1].
         """
         task = self.goal.get("task", "sort_by_size")
 
         if task == "sort_by_size":
-            axis = self.goal.get("axis", "x")
-            if axis == "x":
-                current_pos = [s.x for s in self.shapes]
-                target_pos  = [self.target_pos[i][0] for i in range(self.n_shapes)]
-            else:
-                current_pos = [s.y for s in self.shapes]
-                target_pos  = [self.target_pos[i][1] for i in range(self.n_shapes)]
+            axis        = self.goal.get("axis", "x")
+            current_pos = [s.x if axis == "x" else s.y for s in self.shapes]
+            target_pos  = [self.target_pos[i][0] if axis == "x"
+                           else self.target_pos[i][1]
+                           for i in range(self.n_shapes)]
             return _spearman_corr(current_pos, target_pos)
 
         elif task in ("group_by_color", "cluster"):
             return self._group_cohesion_score()
+
+        elif task == "arrange_in_line":
+            axis        = self.goal.get("axis", "x")
+            current_pos = [s.x if axis == "x" else s.y for s in self.shapes]
+            target_pos  = [self.target_pos[i][0] if axis == "x"
+                           else self.target_pos[i][1]
+                           for i in range(self.n_shapes)]
+            return _spearman_corr(current_pos, target_pos)
+
+        elif task == "arrange_in_grid":
+            dists  = self._compute_dists()
+            solved = sum(1 for d in dists if d <= SOLVE_TOLERANCE)
+            return solved / max(self.n_shapes, 1)
+
+        elif task == "push_to_region":
+            region    = self.goal.get("region", "left")
+            in_region = 0
+            for s in self.shapes:
+                if   region == "left"   and s.x < WINDOW_W * 0.4:
+                    in_region += 1
+                elif region == "right"  and s.x > WINDOW_W * 0.6:
+                    in_region += 1
+                elif region == "top"    and s.y < WINDOW_H * 0.4:
+                    in_region += 1
+                elif region == "bottom" and s.y > WINDOW_H * 0.6:
+                    in_region += 1
+            return in_region / max(self.n_shapes, 1)
 
         return 0.0
 
@@ -514,28 +660,39 @@ class ShapeEnv(gym.Env):
         return all(d <= SOLVE_TOLERANCE for d in self._compute_dists())
 
     def _get_obs(self) -> np.ndarray:
-        shape_obs = np.concatenate([
+        # active shape observations
+        active_obs = np.concatenate([
             self.shapes[i].as_obs(*self.target_pos[i])
             for i in range(self.n_shapes)
         ])
+
+        # zero-pad unused shape slots so obs size is always MAX_SHAPES * OBS_VALUES_PER_SHAPE
+        n_padding  = MAX_SHAPES - self.n_shapes
+        padding    = np.zeros(n_padding * OBS_VALUES_PER_SHAPE, dtype=np.float32)
+
         history = np.array([
             self.last_shape_idx / max(self.n_shapes - 1, 1),
             min(self.steps_on_shape / 10.0, 2.0),
             self.last_action_dx,
             self.last_action_dy,
         ], dtype=np.float32)
+
+        # _goal_encoding is GOAL_ENCODING_DIM values set by set_goal_encoding()
+        # or zeros if no embedding has been provided yet
         return np.concatenate(
-            [shape_obs, self._encode_goal(), history]
+            [active_obs, padding, self._goal_encoding, history]
         ).astype(np.float32)
 
-    def _encode_goal(self) -> np.ndarray:
-        task_val = (TASK_IDX.get(self.goal.get("task", "sort_by_size"), 0)
-                    / max(len(SUPPORTED_TASKS) - 1, 1))
-        axis_val = {"x": 0.0, "none": 0.5, "y": 1.0}.get(
-            self.goal.get("axis", "x"), 0.0)
-        dir_val  = {"ascending": 0.0, "none": 0.5, "descending": 1.0}.get(
-            self.goal.get("direction", "ascending"), 0.0)
-        return np.array([task_val, axis_val, dir_val], dtype=np.float32)
+    def set_goal_encoding(self, encoding: np.ndarray):
+        """
+        update the goal encoding used in observations.
+        called by the training loop after projecting the raw embedding through
+        the goal encoder MLP. encoding must be shape (GOAL_ENCODING_DIM,).
+        """
+        assert encoding.shape == (GOAL_ENCODING_DIM,), (
+            f"expected encoding shape ({GOAL_ENCODING_DIM},), got {encoding.shape}"
+        )
+        self._goal_encoding = encoding.astype(np.float32)
 
     def _render_frame(self):
         if self.window is None:

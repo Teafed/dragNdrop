@@ -26,9 +26,12 @@ Usage:
 """
 
 import numpy as np
+import torch
 from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv, SOLVE_TOLERANCE, MAX_NUDGE, WINDOW_W, WINDOW_H
+from llm_goal_parser import parse_goal, get_embedding
+from config import TASK_POOL, MAX_SHAPES, GOAL_ENCODING_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +78,11 @@ class OraclePolicy:
         env  = self.env
         task = env.goal.get("task", "sort_by_size")
 
-        # All tasks currently use the same greedy strategy because the
-        # target positions encode task-specific geometry.
-        # Add elif branches here as new tasks require different logic.
-        if task in ("sort_by_size", "group_by_color", "cluster"):
+        # the greedy nearest-target strategy works for all tasks because
+        # _compute_targets() encodes task-specific geometry into target positions.
+        # any task not listed here gets random actions as a safe fallback.
+        if task in ("sort_by_size", "group_by_color", "cluster",
+                    "arrange_in_line", "arrange_in_grid", "push_to_region"):
             return self._act_greedy()
         else:
             return env.action_space.sample()
@@ -145,32 +149,42 @@ class OraclePolicy:
 # ---------------------------------------------------------------------------
 
 def collect_demonstrations(
-    goal:        dict,
+    goal_encoder,
     n_episodes:  int   = 500,
-    n_shapes:    int   = 2,
     noise_std:   float = 0.05,
     seed:        int   = 0,
     verbose:     bool  = True,
 ) -> dict:
     """
-    Run the oracle for n_episodes and collect (observation, action) pairs.
+    run the oracle across all tasks in TASK_POOL and collect (obs, action) pairs.
 
-    This is dramatically cheaper than RL training:
-        - 500 episodes × ~100 steps/episode = 50 000 transitions
-        - Takes ~10 seconds on a laptop CPU
-        - Typically achieves 90%+ solve rate with noise_std=0.05
+    each episode samples a random task prompt from TASK_POOL and a random
+    n_shapes (2..MAX_SHAPES), so the dataset covers the full task and shape
+    count distribution the policy will see during training.
 
-    Returns:
+    the goal encoder MLP is applied to the raw embedding before it's stored
+    in the observation, so BC training sees the same obs format as PPO training.
+
+    args:
+        goal_encoder: GoalEncoder instance (from bc_train.py). used to project
+                      EMBEDDING_DIM embeddings down to GOAL_ENCODING_DIM before
+                      storing in the observation.
+        n_episodes:   total episodes to collect across all tasks.
+        noise_std:    gaussian noise added to oracle actions for dataset diversity.
+        seed:         rng seed for reproducibility.
+        verbose:      print progress every 10% of episodes.
+
+    returns:
         {
-            "observations":    np.ndarray  [N, obs_dim],
-            "actions":         np.ndarray  [N, 3],
+            "observations":    np.ndarray [N, obs_size],
+            "actions":         np.ndarray [N, 3],
             "episode_rewards": list[float],
             "episode_lengths": list[int],
-            "solve_rate":      float,    # fraction of episodes solved
+            "solve_rate":      float,
         }
     """
-    env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
-    oracle = OraclePolicy(env, noise_std=noise_std, seed=seed)
+    goal_encoder.eval()
+    rng = np.random.default_rng(seed)
 
     all_obs     = []
     all_actions = []
@@ -178,13 +192,27 @@ def collect_demonstrations(
     ep_lengths  = []
     n_solved    = 0
 
-    rng = np.random.default_rng(seed)
-
     for ep in range(n_episodes):
-        obs, _  = env.reset(seed=int(rng.integers(0, 2 ** 31)))
-        total_r = 0.0
-        steps   = 0
-        done    = False
+        # sample task and shape count for this episode
+        prompt   = TASK_POOL[rng.integers(0, len(TASK_POOL))]
+        n_shapes = int(rng.integers(2, MAX_SHAPES + 1))
+        goal     = parse_goal(prompt)
+
+        # compute goal encoding for this episode
+        raw_emb  = get_embedding(prompt)
+        with torch.no_grad():
+            emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+            encoding = goal_encoder(emb_t).squeeze(0).numpy()
+
+        env    = ShapeEnv(n_shapes=n_shapes, goal=goal)
+        env.set_goal_encoding(encoding)
+        oracle = OraclePolicy(env, noise_std=noise_std,
+                              seed=int(rng.integers(0, 2 ** 31)))
+
+        obs, _     = env.reset(seed=int(rng.integers(0, 2 ** 31)))
+        total_r    = 0.0
+        steps      = 0
+        done       = False
         terminated = False
 
         while not done:
@@ -197,6 +225,7 @@ def collect_demonstrations(
             steps   += 1
             done     = terminated or truncated
 
+        env.close()
         ep_rewards.append(total_r)
         ep_lengths.append(steps)
         if terminated:
@@ -207,8 +236,6 @@ def collect_demonstrations(
             print(f"  episode {ep+1:4d}/{n_episodes} | "
                   f"mean reward: {float(np.mean(recent)):7.2f} | "
                   f"solve rate so far: {n_solved / (ep + 1):.1%}")
-
-    env.close()
 
     dataset = {
         "observations":    np.array(all_obs,     dtype=np.float32),

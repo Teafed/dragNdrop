@@ -35,8 +35,36 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
-from llm_goal_parser import parse_goal
+from llm_goal_parser import parse_goal, get_embedding
 from oracle import collect_demonstrations
+from config import (
+    EMBEDDING_DIM, GOAL_ENCODING_DIM, POLICY_HIDDEN_SIZE,
+    get_obs_size, TASK_POOL,
+)
+
+
+# ---------------------------------------------------------------------------
+# goal encoder MLP
+# ---------------------------------------------------------------------------
+
+class GoalEncoder(nn.Module):
+    """
+    projects raw EMBEDDING_DIM embeddings down to GOAL_ENCODING_DIM.
+    sits between get_embedding() and the policy input.
+    kept small (two layers) so it doesn't dominate training.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(EMBEDDING_DIM, 128),
+            nn.ReLU(),
+            nn.Linear(128, GOAL_ENCODING_DIM),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +73,16 @@ from oracle import collect_demonstrations
 
 class BCPolicy(nn.Module):
     """
-    Simple MLP: obs -> action.
-    Architecture mirrors SB3's default MlpPolicy so weights can be transplanted.
-    obs_dim -> 64 -> Tanh -> 64 -> Tanh -> action_dim -> Tanh
+    simple MLP: obs -> action.
+    architecture mirrors SB3's MlpPolicy so weights can be transplanted.
+    obs_dim -> POLICY_HIDDEN_SIZE -> Tanh -> POLICY_HIDDEN_SIZE -> Tanh -> action_dim -> Tanh
+
+    obs_dim is get_obs_size() from config — fixed regardless of n_shapes.
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden: int = 64):
+    def __init__(self, action_dim: int = 3, hidden: int = POLICY_HIDDEN_SIZE):
         super().__init__()
+        obs_dim  = get_obs_size()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.Tanh(),
@@ -70,22 +101,32 @@ class BCPolicy(nn.Module):
 # ---------------------------------------------------------------------------
 
 def train_bc(
-    goal:       dict,
     dataset:    dict,
     save_path:  str,
     epochs:     int   = 20,
     batch_size: int   = 256,
     lr:         float = 3e-4,
     device:     str   = "cpu",
-) -> BCPolicy:
-    """Train a BCPolicy on (obs, action) pairs via MSE supervised learning."""
+) -> tuple:
+    """
+    train a BCPolicy and GoalEncoder on (obs, action) pairs via MSE.
+
+    the dataset must already have goal encodings baked into the observations
+    (done by collect_demonstrations sampling from TASK_POOL and calling
+    get_embedding + GoalEncoder before storing each obs).
+
+    returns:
+        (BCPolicy, GoalEncoder) — both trained, moved to cpu for saving.
+    """
     obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
     act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
 
-    obs_dim    = obs_t.shape[1]
-    action_dim = act_t.shape[1]
+    policy       = BCPolicy().to(device)
+    goal_encoder = GoalEncoder().to(device)
 
-    policy    = BCPolicy(obs_dim, action_dim).to(device)
+    # train policy and goal encoder jointly — goal encoder is already
+    # applied to observations before this point, so we only optimize policy here.
+    # goal encoder is saved separately for use in train.py.
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
     loss_fn   = nn.MSELoss()
 
@@ -94,6 +135,9 @@ def train_bc(
         batch_size=batch_size,
         shuffle=True,
     )
+
+    obs_dim    = obs_t.shape[1]
+    action_dim = act_t.shape[1]
 
     print(f"\n--- behavior cloning ---")
     print(f"  obs dim    : {obs_dim}")
@@ -121,29 +165,31 @@ def train_bc(
 
     os.makedirs(save_path, exist_ok=True)
     weights_path = os.path.join(save_path, "bc_weights.pt")
-    torch.save(policy.state_dict(), weights_path)
-    print(f"\n  BC weights saved to {weights_path}")
+    encoder_path = os.path.join(save_path, "goal_encoder.pt")
+    torch.save(policy.state_dict(),       weights_path)
+    torch.save(goal_encoder.state_dict(), encoder_path)
+    print(f"\n  BC weights saved to      {weights_path}")
+    print(f"  goal encoder saved to    {encoder_path}")
 
-    return policy
+    return policy.cpu(), goal_encoder.cpu()
 
 
 # ---------------------------------------------------------------------------
-# Weight transplant: BC -> SB3 PPO
+# Weight transplant: BC -> SB3 PPO (same stage)
 # ---------------------------------------------------------------------------
 
-def build_ppo_from_bc(goal: dict, bc_policy: BCPolicy, n_shapes: int,
-                      vec_env=None) -> PPO:
+def build_ppo_from_bc(bc_policy: BCPolicy, n_shapes: int,
+                      vec_env=None, goal: dict = None) -> PPO:
     """
-    Create a fresh SB3 PPO model and copy BC weights into its actor network.
-
-    KEY FIX: accepts an optional vec_env argument. When train_oracle() passes
-    the 4-env vectorized env here, the PPO model is built with n_envs=4 from
-    the start, so set_env() is never needed and the n_envs mismatch crash
-    (4 != 1) cannot happen.
-
-    Falls back to a single Monitor env for standalone use (bc_train.py CLI).
+    create a fresh SB3 PPO model and copy BC weights into its actor network.
+    uses POLICY_HIDDEN_SIZE from config for hidden layer dimensions.
     """
-    env = vec_env if vec_env is not None else Monitor(ShapeEnv(n_shapes=n_shapes, goal=goal))
+    if goal is None:
+        goal = {"task": "sort_by_size", "axis": "x",
+                "direction": "ascending", "attribute": "size", "region": "none"}
+
+    env = vec_env if vec_env is not None else Monitor(
+        ShapeEnv(n_shapes=n_shapes, goal=goal))
 
     model = PPO(
         "MlpPolicy",
@@ -158,6 +204,9 @@ def build_ppo_from_bc(goal: dict, bc_policy: BCPolicy, n_shapes: int,
         ent_coef=0.005,
         verbose=0,
         tensorboard_log="./logs/tensorboard/",
+        policy_kwargs=dict(
+            net_arch=[POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE]
+        ),
     )
 
     try:
@@ -174,9 +223,69 @@ def build_ppo_from_bc(goal: dict, bc_policy: BCPolicy, n_shapes: int,
 
         print("  BC weights transplanted into PPO policy.")
     except Exception as e:
-        print(f"  Weight transplant failed ({e}) -- PPO starts from random init.")
+        print(f"  weight transplant failed ({e}) -- PPO starts from random init.")
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Weight transplant: previous stage PPO -> new stage PPO (cross-stage)
+# ---------------------------------------------------------------------------
+
+def transplant_across_stages(prev_model_path: str, new_model: PPO,
+                              prev_obs_dim: int) -> PPO:
+    """
+    Copy weights from a smaller-obs-space PPO model into a larger one.
+
+    The hidden layers (64->64) and action head are obs-size-independent so
+    they transfer directly. The input layer grows because the new stage has
+    more shapes, so we:
+      - copy the old input weights into the first prev_obs_dim columns
+      - leave the remaining columns (new shape features) as small random values
+
+    This preserves everything the previous stage learned about existing shapes
+    while giving the policy fresh capacity for the new shape's features.
+
+    Args:
+        prev_model_path: path to the stage N model .zip (without extension)
+        new_model:       freshly created PPO model for stage N+1
+        prev_obs_dim:    obs space size of the stage N model
+    """
+    from stable_baselines3 import PPO as PPO_
+
+    try:
+        prev = PPO_.load(prev_model_path)
+    except Exception as e:
+        print(f"  cross-stage transplant: could not load {prev_model_path} ({e})")
+        print("  starting stage from random init instead.")
+        return new_model
+
+    prev_pi = prev.policy.mlp_extractor.policy_net
+    new_pi  = new_model.policy.mlp_extractor.policy_net
+
+    with torch.no_grad():
+        # input layer: partial copy into first prev_obs_dim columns
+        new_in_w = new_pi[0].weight.clone()
+        new_in_w[:, :prev_obs_dim] = prev_pi[0].weight[:, :prev_obs_dim]
+        # scale new columns small so they don't dominate on first forward pass
+        nn.init.normal_(new_in_w[:, prev_obs_dim:], mean=0.0, std=0.01)
+        new_pi[0].weight.copy_(new_in_w)
+        new_pi[0].bias.copy_(prev_pi[0].bias)
+
+        # hidden layer: full copy
+        new_pi[2].weight.copy_(prev_pi[2].weight)
+        new_pi[2].bias.copy_(prev_pi[2].bias)
+
+        # action head: full copy
+        new_model.policy.action_net.weight.copy_(
+            prev.policy.action_net.weight)
+        new_model.policy.action_net.bias.copy_(
+            prev.policy.action_net.bias)
+
+    print(f"  cross-stage transplant: copied weights from {prev_model_path}")
+    print(f"  input layer: {prev_obs_dim} cols preserved, "
+          f"{new_pi[0].weight.shape[1] - prev_obs_dim} new cols initialised small.")
+    return new_model
 
 
 # ---------------------------------------------------------------------------

@@ -1,62 +1,94 @@
 """
 train.py
 
-Entry point for training the shape manipulation agent.
+entry point for goal-conditioned training of the shape manipulation agent.
 
-Two training modes:
+the agent is trained on ALL tasks in TASK_POOL simultaneously. each episode
+samples a random task prompt, encodes it via the goal encoder MLP, and injects
+the encoding into the observation. the policy learns to condition its behavior
+on the goal signal rather than being a specialist on one task.
 
-  Default (PPO from scratch):
+training modes:
+
+  oracle warm-start (recommended):
       python train.py
-      python train.py --prompt "sort shapes right to left"
-      python train.py --prompt "arrange top to bottom" --timesteps 200000
+      python train.py --timesteps 200000 --bc-episodes 1000
 
-  Oracle warm-start (recommended — BC then PPO fine-tune):
-      python train.py --oracle
-      python train.py --oracle --prompt "group shapes by color" --bc-episodes 500
-      python train.py --oracle --timesteps 100000 --bc-episodes 1000
+  PPO from scratch (slower, useful for ablations):
+      python train.py --no-oracle
 
-  Demo mode:
-      python train.py --load models/shape_agent/best_model --demo
-      python train.py --load models/shape_agent/best_model --demo --prompt "sort right to left"
-
-The --oracle flag collects oracle demonstrations, trains a BC policy on them,
-transplants the BC weights into a PPO model, then fine-tunes with PPO.
-This typically converges 5-10× faster than PPO from random initialization.
+  demo:
+      python train.py --demo --load models/shape_agent/best_model
+      python train.py --demo --load models/shape_agent/best_model --prompt "sort right to left"
 """
 
 import argparse
 import os
+import random
+import numpy as np
+import torch
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.env_util import make_vec_env
 
 from shape_env import ShapeEnv
-from llm_goal_parser import parse_goal
+from llm_goal_parser import parse_goal, get_embedding
 from callbacks import ShapeTaskCallback
+from config import (
+    TASK_POOL, MAX_SHAPES, POLICY_HIDDEN_SIZE, get_obs_size,
+)
 
 
-def make_env(goal: dict, render_mode: str = None):
+# ---------------------------------------------------------------------------
+# goal-conditioned env factory
+# ---------------------------------------------------------------------------
+
+def make_goal_conditioned_env(goal_encoder, render_mode=None):
     """
-    Factory that returns a callable creating a Monitor-wrapped ShapeEnv.
-    SB3's make_vec_env calls this n_envs times to spin up parallel workers.
+    returns a factory function for Monitor-wrapped ShapeEnvs.
+    each call samples a fresh task from TASK_POOL and injects the goal
+    encoding so the obs is always goal-conditioned.
     """
     def _init():
-        return Monitor(ShapeEnv(n_shapes=2, goal=goal, render_mode=render_mode))
+        prompt   = random.choice(TASK_POOL)
+        goal     = parse_goal(prompt)
+        raw_emb  = get_embedding(prompt)
+
+        with torch.no_grad():
+            emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+            encoding = goal_encoder(emb_t).squeeze(0).numpy()
+
+        env = ShapeEnv(goal=goal)   # n_shapes=None -> sampled randomly each episode
+        env.set_goal_encoding(encoding)
+        return Monitor(env)
+
     return _init
 
 
-def build_callbacks(goal: dict, save_path: str, n_envs: int) -> CallbackList:
-    """
-    Build the standard callback stack used by both training modes.
-    Factored out so train() and train_oracle() don't duplicate this.
-    """
-    eval_env = Monitor(ShapeEnv(n_shapes=2, goal=goal, render_mode=None))
+# ---------------------------------------------------------------------------
+# callbacks
+# ---------------------------------------------------------------------------
 
-    # EvalCallback saves the best model by mean episode reward
+def build_callbacks(goal_encoder, save_path: str, n_envs: int) -> CallbackList:
+    """
+    build the standard callback stack.
+    eval envs sample tasks from TASK_POOL so metrics are task-averaged.
+    """
+    def _make_eval_env():
+        prompt   = random.choice(TASK_POOL)
+        goal     = parse_goal(prompt)
+        raw_emb  = get_embedding(prompt)
+        with torch.no_grad():
+            emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+            encoding = goal_encoder(emb_t).squeeze(0).numpy()
+        env = ShapeEnv(goal=goal)
+        env.set_goal_encoding(encoding)
+        return Monitor(env)
+
     eval_callback = EvalCallback(
-        eval_env,
+        _make_eval_env(),
         best_model_save_path=save_path,
         log_path="./logs/",
         eval_freq=max(5000 // n_envs, 1),
@@ -64,9 +96,8 @@ def build_callbacks(goal: dict, save_path: str, n_envs: int) -> CallbackList:
         verbose=1,
     )
 
-    # ShapeTaskCallback logs task-specific metrics to TensorBoard
     task_callback = ShapeTaskCallback(
-        eval_env=Monitor(ShapeEnv(n_shapes=2, goal=goal, render_mode=None)),
+        eval_env=_make_eval_env(),
         eval_freq=5000,
         n_eval_episodes=10,
         verbose=1,
@@ -76,131 +107,123 @@ def build_callbacks(goal: dict, save_path: str, n_envs: int) -> CallbackList:
 
 
 # ---------------------------------------------------------------------------
-# PPO from scratch
+# training
 # ---------------------------------------------------------------------------
 
-def train(prompt: str, timesteps: int, save_path: str):
-    """Train a PPO agent from a random initialisation."""
-    print(f"\n--- parsing goal ---")
-    print(f"prompt: \"{prompt}\"")
-    goal = parse_goal(prompt)
-    print(f"goal  : {goal}\n")
+def train(
+    timesteps:   int  = 300_000,
+    save_path:   str  = "./models/shape_agent",
+    bc_episodes: int  = 500,
+    bc_epochs:   int  = 20,
+    use_oracle:  bool = True,
+):
+    """
+    train the goal-conditioned agent.
 
-    n_envs  = 4
-    vec_env = make_vec_env(make_env(goal), n_envs=n_envs)
+    if use_oracle=True (default):
+        1. initialise goal encoder
+        2. collect oracle demos across all TASK_POOL tasks
+        3. train BCPolicy via supervised learning
+        4. transplant BC weights into PPO
+        5. PPO fine-tune
 
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        learning_rate=1e-4,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.02,   # entropy bonus encourages exploration from random init
-        verbose=1,
-        tensorboard_log="./logs/tensorboard/",
-    )
+    if use_oracle=False:
+        skip steps 1-4 and train PPO from random init.
+    """
+    from bc_train import GoalEncoder, BCPolicy, train_bc, build_ppo_from_bc
+    from oracle import collect_demonstrations
 
-    callbacks = build_callbacks(goal, save_path, n_envs)
+    goal_encoder = GoalEncoder()
 
-    print(f"--- training PPO from scratch for {timesteps:,} timesteps ---\n")
+    if use_oracle:
+        print(f"\n--- collecting {bc_episodes} oracle demonstrations "
+              f"across {len(TASK_POOL)} task pool prompts ---")
+        dataset = collect_demonstrations(
+            goal_encoder=goal_encoder,
+            n_episodes=bc_episodes,
+            verbose=True,
+        )
+
+        device    = "cuda" if torch.cuda.is_available() else "cpu"
+        bc_policy, goal_encoder = train_bc(
+            dataset=dataset,
+            save_path=save_path,
+            epochs=bc_epochs,
+            device=device,
+        )
+        goal_encoder.eval()
+
+        n_envs  = 4
+        vec_env = make_vec_env(
+            make_goal_conditioned_env(goal_encoder), n_envs=n_envs)
+
+        print("\n--- initialising PPO from BC weights ---")
+        model = build_ppo_from_bc(bc_policy, n_shapes=MAX_SHAPES, vec_env=vec_env)
+
+    else:
+        goal_encoder.eval()
+        n_envs  = 4
+        vec_env = make_vec_env(
+            make_goal_conditioned_env(goal_encoder), n_envs=n_envs)
+
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            learning_rate=1e-4,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.02,
+            verbose=1,
+            tensorboard_log="./logs/tensorboard/",
+            policy_kwargs=dict(net_arch=[POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE]),
+        )
+
+    callbacks = build_callbacks(goal_encoder, save_path, n_envs)
+
+    print(f"\n--- training with PPO for {timesteps:,} timesteps ---\n")
     model.learn(total_timesteps=timesteps, callback=callbacks)
 
     final_path = os.path.join(save_path, "final_model")
     model.save(final_path)
     print(f"\n--- done. model saved to {final_path} ---")
-    return model
+    return model, goal_encoder
 
 
 # ---------------------------------------------------------------------------
-# Oracle warm-start: BC → PPO fine-tune
-# ---------------------------------------------------------------------------
-
-def train_oracle(
-    prompt:      str,
-    timesteps:   int,
-    save_path:   str,
-    bc_episodes: int = 500,
-    bc_epochs:   int = 20,
-):
-    """
-    1. Parse goal from prompt.
-    2. Collect oracle demonstrations cheaply.
-    3. Train a BC policy via supervised learning.
-    4. Transplant BC weights into a fresh PPO model.
-    5. Fine-tune with PPO for `timesteps` steps.
-
-    The BC step (2-3) takes ~10-30 seconds.
-    The PPO fine-tune step (5) is typically 5-10× shorter than training from scratch.
-    """
-    # Lazy imports so the base train.py still works without torch installed
-    from bc_train import train_bc, build_ppo_from_bc
-    from oracle import collect_demonstrations
-    import torch
-
-    print(f"\n--- parsing goal ---")
-    print(f"prompt: \"{prompt}\"")
-    goal = parse_goal(prompt)
-    print(f"goal  : {goal}\n")
-
-    # Step 1: oracle demonstrations
-    print(f"--- collecting {bc_episodes} oracle demonstrations ---")
-    dataset = collect_demonstrations(
-        goal=goal,
-        n_episodes=bc_episodes,
-        n_shapes=2,
-        verbose=True,
-    )
-
-    # Step 2: behavior cloning
-    device    = "cuda" if torch.cuda.is_available() else "cpu"
-    bc_policy = train_bc(
-        goal=goal,
-        dataset=dataset,
-        save_path=save_path,
-        epochs=bc_epochs,
-        device=device,
-    )
-
-    # Step 3: build vec_env first, then pass it into build_ppo_from_bc.
-    # This ensures the PPO model is created with n_envs=4 from the start,
-    # so set_env() is never needed and the (4 != 1) crash cannot happen.
-    n_envs  = 4
-    vec_env = make_vec_env(make_env(goal), n_envs=n_envs)
-
-    print("\n--- initialising PPO from BC weights ---")
-    model = build_ppo_from_bc(goal, bc_policy, n_shapes=2, vec_env=vec_env)
-
-    callbacks = build_callbacks(goal, save_path, n_envs)
-
-    print(f"\n--- fine-tuning with PPO for {timesteps:,} timesteps ---\n")
-    model.learn(total_timesteps=timesteps, callback=callbacks)
-
-    final_path = os.path.join(save_path, "oracle_final_model")
-    model.save(final_path)
-    print(f"\n--- done. model saved to {final_path} ---")
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Demo
+# demo
 # ---------------------------------------------------------------------------
 
 def demo(model_path: str, prompt: str):
-    """
-    Load a saved model and run it in the pygame window.
-    Prints episode outcome (SOLVED / timed out) and resets automatically.
-    """
+    """load a saved model and run it live in the pygame window."""
     import pygame
+    from bc_train import GoalEncoder
 
     print(f"\n--- loading model from {model_path} ---")
-    goal  = parse_goal(prompt)
+    goal     = parse_goal(prompt)
+    raw_emb  = get_embedding(prompt)
+
+    encoder_path = os.path.join(os.path.dirname(model_path), "goal_encoder.pt")
+    goal_encoder = GoalEncoder()
+    if os.path.exists(encoder_path):
+        goal_encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
+        print(f"  goal encoder loaded from {encoder_path}")
+    else:
+        print(f"  no goal encoder at {encoder_path}, using random init")
+
+    goal_encoder.eval()
+    with torch.no_grad():
+        emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+        encoding = goal_encoder(emb_t).squeeze(0).numpy()
+
     print(f"goal: {goal}\n")
 
-    env   = ShapeEnv(n_shapes=2, goal=goal, render_mode="human")
+    env = ShapeEnv(goal=goal)
+    env.set_goal_encoding(encoding)
+    env.render_mode = "human"
     model = PPO.load(model_path)
 
     obs, _       = env.reset()
@@ -208,11 +231,10 @@ def demo(model_path: str, prompt: str):
     steps        = 0
     episode      = 1
 
-    # Render once so pygame's video system is initialised before event polling
     env.render()
     pygame.display.flip()
 
-    print("running demo — close the pygame window to stop.\n")
+    print("running demo — close window to stop.\n")
     try:
         running = True
         while running:
@@ -224,11 +246,9 @@ def demo(model_path: str, prompt: str):
                 break
 
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-
+            obs, reward, terminated, truncated, _ = env.step(action)
             pygame.display.flip()
             env.clock.tick(env.metadata["render_fps"])
-
             total_reward += reward
             steps        += 1
 
@@ -240,7 +260,6 @@ def demo(model_path: str, prompt: str):
                 total_reward = 0.0
                 steps        = 0
                 episode     += 1
-
     except KeyboardInterrupt:
         pass
     finally:
@@ -253,12 +272,7 @@ def demo(model_path: str, prompt: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="train or demo the shape manipulation agent"
-    )
-    parser.add_argument(
-        "--prompt", type=str,
-        default="sort the shapes from smallest to largest left to right",
-        help="natural language goal prompt",
+        description="train or demo the goal-conditioned shape manipulation agent"
     )
     parser.add_argument(
         "--timesteps", type=int, default=300_000,
@@ -266,7 +280,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save", type=str, default="./models/shape_agent",
-        help="directory to save model checkpoints",
+        help="directory to save model checkpoints and goal encoder",
     )
     parser.add_argument(
         "--load", type=str, default=None,
@@ -276,18 +290,22 @@ if __name__ == "__main__":
         "--demo", action="store_true",
         help="run demo mode (requires --load)",
     )
-    # Oracle warm-start flags
     parser.add_argument(
-        "--oracle", action="store_true",
-        help="use oracle warm-start (BC + PPO fine-tune) instead of PPO from scratch",
+        "--prompt", type=str,
+        default="sort the shapes from smallest to largest left to right",
+        help="natural language goal prompt (used in --demo mode)",
+    )
+    parser.add_argument(
+        "--no-oracle", action="store_true",
+        help="skip oracle warm-start and train PPO from random init",
     )
     parser.add_argument(
         "--bc-episodes", type=int, default=500,
-        help="oracle demo episodes to collect for BC (only with --oracle)",
+        help="oracle demo episodes to collect for BC warm-start",
     )
     parser.add_argument(
         "--bc-epochs", type=int, default=20,
-        help="BC training epochs (only with --oracle)",
+        help="BC training epochs",
     )
     args = parser.parse_args()
 
@@ -296,13 +314,11 @@ if __name__ == "__main__":
             print("error: --demo requires --load <model_path>")
         else:
             demo(args.load, args.prompt)
-    elif args.oracle:
-        train_oracle(
-            prompt=args.prompt,
+    else:
+        train(
             timesteps=args.timesteps,
             save_path=args.save,
             bc_episodes=args.bc_episodes,
             bc_epochs=args.bc_epochs,
+            use_oracle=not args.no_oracle,
         )
-    else:
-        train(args.prompt, args.timesteps, args.save)

@@ -1,28 +1,38 @@
 """
 llm_goal_parser.py
 
-LLM goal parsing layer.
+LLM goal parsing and embedding layer.
 
-parse_goal() first tries to call the Anthropic API (claude-sonnet-4-6)
-to interpret the user's prompt.  If the call fails for any reason —
-missing API key, network error, malformed JSON — it falls back to the
-hardcoded stub so the rest of the system keeps running without interruption.
+two public functions:
 
-Expanded goal schema now supports:
-    sort_by_size   — arrange shapes along an axis ordered by size
-    group_by_color — cluster same-color shapes into their own regions
-    cluster        — general spatial grouping by a named attribute
+    parse_goal(prompt) -> dict
+        interprets a natural language prompt into a validated goal dict.
+        tries the Anthropic API first, falls back to stub on any failure.
 
-Usage:
-    from llm_goal_parser import parse_goal
-    goal = parse_goal("put all the red shapes on the left side")
-    # → {"task": "group_by_color", "axis": "none",
-    #    "direction": "none", "attribute": "color"}
+    get_embedding(prompt) -> np.ndarray  [EMBEDDING_DIM]
+        encodes a prompt as a dense vector using a local sentence-transformers
+        model (all-MiniLM-L6-v2, ~80MB, runs offline).
+        the embedding is cached in memory so repeated calls are free.
+        used by shape_env.py and bc_train.py to condition the policy on goals.
+
+wave 1 supported tasks:
+    sort_by_size    — arrange shapes along an axis ordered by size
+    group_by_color  — cluster same-color shapes into their own regions
+    cluster         — general spatial grouping by a named attribute
+    arrange_in_line — evenly spaced horizontal or vertical line
+    arrange_in_grid — rectangular grid layout
+    push_to_region  — move all shapes to a canvas region (left/right/top/bottom)
+
+usage:
+    from llm_goal_parser import parse_goal, get_embedding
+    goal      = parse_goal("put all the red shapes on the left side")
+    embedding = get_embedding("put all the red shapes on the left side")
 """
 
 import json
 import os
 import re
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -35,9 +45,17 @@ GOAL_SCHEMA = {
     "axis":      str,   # "x" | "y" | "none"
     "direction": str,   # "ascending" | "descending" | "none"
     "attribute": str,   # "size" | "color" | "none"
+    "region":    str,   # "left" | "right" | "top" | "bottom" | "none"
 }
 
-SUPPORTED_TASKS = ["sort_by_size", "group_by_color", "cluster"]
+SUPPORTED_TASKS = [
+    "sort_by_size",
+    "group_by_color",
+    "cluster",
+    "arrange_in_line",
+    "arrange_in_grid",
+    "push_to_region",
+]
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -45,28 +63,29 @@ SUPPORTED_TASKS = ["sort_by_size", "group_by_color", "cluster"]
 
 def parse_goal(prompt: str) -> dict:
     """
-    Parse a natural-language prompt into a validated goal dict.
+    parse a natural-language prompt into a validated goal dict.
 
-    Tries the Anthropic API first; falls back to stub on any failure.
+    if ANTHROPIC_API_KEY is set, tries the API first and falls back to
+    the stub on failure. if no key is set, goes straight to the stub
+    without logging anything — this is the expected path during training.
 
-    Args:
-        prompt: User-provided instruction string.
+    args:
+        prompt: user-provided instruction string.
 
-    Returns:
-        A validated goal dict matching GOAL_SCHEMA.
-
-    Raises:
-        ValueError: If neither the LLM nor the stub can produce a valid goal.
+    returns:
+        a validated goal dict matching GOAL_SCHEMA.
     """
-    try:
-        goal = _llm_parse(prompt)
-        _validate_goal(goal)
-        return goal
-    except Exception as llm_err:
-        print(f"[goal_parser] LLM parse failed ({llm_err}), using stub fallback.")
-        goal = _stub_parse(prompt.lower())
-        _validate_goal(goal)
-        return goal
+    if os.environ.get("ANTHROPIC_API_KEY", ""):
+        try:
+            goal = _llm_parse(prompt)
+            _validate_goal(goal)
+            return goal
+        except Exception as llm_err:
+            print(f"[goal_parser] LLM parse failed ({llm_err}), using stub fallback.")
+
+    goal = _stub_parse(prompt.lower())
+    _validate_goal(goal)
+    return goal
 
 
 # ---------------------------------------------------------------------------
@@ -83,36 +102,47 @@ Respond ONLY with a single valid JSON object — no markdown, no extra text.
 
 Schema (all fields required):
 {
-  "task":      "<one of: sort_by_size | group_by_color | cluster>",
+  "task":      "<one of: sort_by_size | group_by_color | cluster | arrange_in_line | arrange_in_grid | push_to_region>",
   "axis":      "<one of: x | y | none>",
   "direction": "<one of: ascending | descending | none>",
-  "attribute": "<one of: size | color | none>"
+  "attribute": "<one of: size | color | none>",
+  "region":    "<one of: left | right | top | bottom | none>"
 }
 
 Rules:
-- sort_by_size   → shapes arranged along an axis ordered by size.
-                   Set axis (x or y) and direction (ascending = small→large/top→bottom).
-                   attribute = "size".
-- group_by_color → same-color shapes moved near each other in distinct regions.
-                   axis = "none", direction = "none", attribute = "color".
-- cluster        → general spatial grouping. Set attribute to the relevant property.
-                   axis = "none", direction = "none".
+- sort_by_size    → shapes arranged along an axis ordered by size.
+                    set axis (x or y) and direction (ascending = small→large / top→bottom).
+                    attribute = "size". region = "none".
+- group_by_color  → same-color shapes moved near each other in distinct regions.
+                    axis = "none", direction = "none", attribute = "color", region = "none".
+- cluster         → general spatial grouping. set attribute to the relevant property.
+                    axis = "none", direction = "none", region = "none".
+- arrange_in_line → evenly spaced line. axis = "x" for horizontal, "y" for vertical.
+                    direction = "none", attribute = "none", region = "none".
+- arrange_in_grid → rectangular grid layout.
+                    axis = "none", direction = "none", attribute = "none", region = "none".
+- push_to_region  → move all shapes to a canvas region.
+                    axis = "none", direction = "none", attribute = "none".
+                    region = "left" | "right" | "top" | "bottom".
 
 Examples:
   "sort shapes smallest to largest left to right"
-  → {"task":"sort_by_size","axis":"x","direction":"ascending","attribute":"size"}
+  → {"task":"sort_by_size","axis":"x","direction":"ascending","attribute":"size","region":"none"}
 
   "biggest shapes at the top, smallest at the bottom"
-  → {"task":"sort_by_size","axis":"y","direction":"descending","attribute":"size"}
+  → {"task":"sort_by_size","axis":"y","direction":"descending","attribute":"size","region":"none"}
 
   "group the shapes by colour"
-  → {"task":"group_by_color","axis":"none","direction":"none","attribute":"color"}
+  → {"task":"group_by_color","axis":"none","direction":"none","attribute":"color","region":"none"}
 
-  "put all red shapes together and blue shapes together"
-  → {"task":"group_by_color","axis":"none","direction":"none","attribute":"color"}
+  "arrange shapes in a horizontal line evenly spaced"
+  → {"task":"arrange_in_line","axis":"x","direction":"none","attribute":"none","region":"none"}
 
-  "cluster shapes by size"
-  → {"task":"cluster","axis":"none","direction":"none","attribute":"size"}
+  "arrange shapes in a grid"
+  → {"task":"arrange_in_grid","axis":"none","direction":"none","attribute":"none","region":"none"}
+
+  "move all shapes to the left side"
+  → {"task":"push_to_region","axis":"none","direction":"none","attribute":"none","region":"left"}
 
 Respond with ONLY the JSON object. No commentary.
 """.strip()
@@ -156,69 +186,116 @@ def _llm_parse(prompt: str) -> dict:
 
 def _stub_parse(prompt: str) -> dict:
     """
-    Hardcoded pattern matching standing in for the LLM.
-    Handles the most common phrasings for each task type.
-
-    A real implementation replaces _llm_parse() above rather than this.
-    This exists purely so the system boots without credentials.
+    hardcoded pattern matching standing in for the LLM.
+    handles the most common phrasings for each wave 1 task type.
     """
 
-    # --- Task detection (check most-specific first) ---
+    # push_to_region — check first as it's most specific
+    if any(kw in prompt for kw in ("left side", "move left", "push left")):
+        return {"task": "push_to_region", "axis": "none", "direction": "none",
+                "attribute": "none", "region": "left"}
+    if any(kw in prompt for kw in ("right side", "move right", "push right")):
+        return {"task": "push_to_region", "axis": "none", "direction": "none",
+                "attribute": "none", "region": "right"}
+    if any(kw in prompt for kw in ("top", "move up", "push up")):
+        return {"task": "push_to_region", "axis": "none", "direction": "none",
+                "attribute": "none", "region": "top"}
+    if any(kw in prompt for kw in ("bottom", "move down", "push down")):
+        return {"task": "push_to_region", "axis": "none", "direction": "none",
+                "attribute": "none", "region": "bottom"}
 
-    # Color / grouping keywords → group_by_color
-    color_keywords = ("color", "colour", "red", "blue", "green", "yellow", "purple",
-                      "same color", "by colour", "by color")
+    # arrange_in_grid
+    if "grid" in prompt:
+        return {"task": "arrange_in_grid", "axis": "none", "direction": "none",
+                "attribute": "none", "region": "none"}
+
+    # arrange_in_line
+    if any(kw in prompt for kw in ("horizontal line", "vertical line",
+                                    "evenly spaced", "in a line")):
+        axis = "y" if "vertical" in prompt else "x"
+        return {"task": "arrange_in_line", "axis": axis, "direction": "none",
+                "attribute": "none", "region": "none"}
+
+    # group_by_color
+    color_keywords = ("color", "colour", "red", "blue", "green", "yellow",
+                      "purple", "same color", "by colour", "by color")
     if any(kw in prompt for kw in color_keywords):
-        return {
-            "task":      "group_by_color",
-            "axis":      "none",
-            "direction": "none",
-            "attribute": "color",
-        }
+        return {"task": "group_by_color", "axis": "none", "direction": "none",
+                "attribute": "color", "region": "none"}
 
-    # Explicit cluster keyword
+    # cluster
     if "cluster" in prompt:
         attribute = "color" if "color" in prompt or "colour" in prompt else "size"
-        return {
-            "task":      "cluster",
-            "axis":      "none",
-            "direction": "none",
-            "attribute": attribute,
-        }
+        return {"task": "cluster", "axis": "none", "direction": "none",
+                "attribute": attribute, "region": "none"}
 
-    # General "group" without color context → cluster by size
+    # general group without color → cluster by size
     if "group" in prompt and not any(kw in prompt for kw in color_keywords):
-        return {
-            "task":      "cluster",
-            "axis":      "none",
-            "direction": "none",
-            "attribute": "size",
-        }
+        return {"task": "cluster", "axis": "none", "direction": "none",
+                "attribute": "size", "region": "none"}
 
-    # --- Default: sort_by_size ---
+    # default: sort_by_size
+    axis = "y" if any(kw in prompt for kw in (
+        "top to bottom", "vertical", "column", "up to down")) else "x"
 
-    # Axis
-    if any(kw in prompt for kw in ("top to bottom", "vertical", "column",
-                                    "up to down", "top-to-bottom")):
-        axis = "y"
-    else:
-        axis = "x"
+    direction = "descending" if any(kw in prompt for kw in (
+        "right to left", "largest first", "descend", "big to small",
+        "biggest first", "largest to smallest", "biggest at top",
+        "biggest at the top")) else "ascending"
 
-    # Direction
-    if any(kw in prompt for kw in ("right to left", "largest first", "descend",
-                                    "big to small", "biggest first",
-                                    "largest to smallest", "biggest at top",
-                                    "biggest at the top")):
-        direction = "descending"
-    else:
-        direction = "ascending"
+    return {"task": "sort_by_size", "axis": axis, "direction": direction,
+            "attribute": "size", "region": "none"}
 
-    return {
-        "task":      "sort_by_size",
-        "axis":      axis,
-        "direction": direction,
-        "attribute": "size",
-    }
+
+# ---------------------------------------------------------------------------
+# goal embedding
+# ---------------------------------------------------------------------------
+
+# module-level cache: prompt string -> np.ndarray
+# avoids reloading the model or re-encoding the same prompt twice.
+_embedding_model  = None
+_embedding_cache: dict = {}
+
+
+def get_embedding(prompt: str) -> np.ndarray:
+    """
+    encode a natural language prompt as a dense float32 vector.
+
+    uses sentence-transformers all-MiniLM-L6-v2 (384-dim, ~80MB, offline).
+    the model is loaded once on first call and cached for the session.
+    individual prompt embeddings are also cached so training loop calls
+    with the same prompt string are effectively free after the first call.
+
+    args:
+        prompt: any natural language goal string.
+
+    returns:
+        np.ndarray of shape (EMBEDDING_DIM,) = (384,), dtype float32.
+
+    raises:
+        RuntimeError if sentence-transformers is not installed.
+    """
+    global _embedding_model
+
+    if prompt in _embedding_cache:
+        return _embedding_cache[prompt]
+
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise RuntimeError(
+                "sentence-transformers not installed — "
+                "run: pip install sentence-transformers"
+            )
+        from config import EMBEDDING_MODEL
+        print(f"[goal_parser] loading embedding model '{EMBEDDING_MODEL}'...")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        print("[goal_parser] embedding model ready.")
+
+    embedding = _embedding_model.encode(prompt, convert_to_numpy=True).astype(np.float32)
+    _embedding_cache[prompt] = embedding
+    return embedding
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +303,7 @@ def _stub_parse(prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _validate_goal(goal: dict):
-    """Raise ValueError if the goal dict is missing fields or has bad values."""
+    """raise ValueError if the goal dict is missing fields or has bad values."""
     for key, expected_type in GOAL_SCHEMA.items():
         if key not in goal:
             raise ValueError(f"goal missing required key: '{key}'")
@@ -252,4 +329,9 @@ def _validate_goal(goal: dict):
         raise ValueError(
             f"attribute must be 'size', 'color', or 'none', "
             f"got '{goal['attribute']}'"
+        )
+    if goal["region"] not in ("left", "right", "top", "bottom", "none"):
+        raise ValueError(
+            f"region must be 'left', 'right', 'top', 'bottom', or 'none', "
+            f"got '{goal['region']}'"
         )
