@@ -105,7 +105,7 @@ def train_bc(
     save_path:  str,
     epochs:     int   = 20,
     batch_size: int   = 256,
-    lr:         float = 3e-4,
+    lr:         float = 1e-3,   # increased from 3e-4 — plateau suggests lr was too low
     device:     str   = "cpu",
 ) -> tuple:
     """
@@ -114,6 +114,12 @@ def train_bc(
     the dataset must already have goal encodings baked into the observations
     (done by collect_demonstrations sampling from TASK_POOL and calling
     get_embedding + GoalEncoder before storing each obs).
+
+    improvements over wave 1:
+        - higher default lr (1e-3 vs 3e-4)
+        - cosine annealing lr schedule — avoids plateau by decaying smoothly
+        - gradient clipping (max_norm=1.0) — stabilises training
+        - per-output loss breakdown — shows whether selector or dx/dy is the issue
 
     returns:
         (BCPolicy, GoalEncoder) — both trained, moved to cpu for saving.
@@ -124,11 +130,11 @@ def train_bc(
     policy       = BCPolicy().to(device)
     goal_encoder = GoalEncoder().to(device)
 
-    # train policy and goal encoder jointly — goal encoder is already
-    # applied to observations before this point, so we only optimize policy here.
-    # goal encoder is saved separately for use in train.py.
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
-    loss_fn   = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
+    )
+    loss_fn   = nn.MSELoss(reduction="none")
 
     loader = DataLoader(
         TensorDataset(obs_t, act_t),
@@ -145,23 +151,43 @@ def train_bc(
     print(f"  samples    : {len(obs_t):,}")
     print(f"  epochs     : {epochs}")
     print(f"  batch size : {batch_size}")
+    print(f"  lr         : {lr} (cosine decay to 1e-5)")
     print(f"  device     : {device}\n")
 
     for epoch in range(1, epochs + 1):
-        epoch_loss = 0.0
-        n_batches  = 0
+        epoch_loss      = 0.0
+        epoch_loss_sel  = 0.0   # shape selector component
+        epoch_loss_dxy  = 0.0   # dx, dy components
+        n_batches       = 0
+
         for obs_batch, act_batch in loader:
-            pred = policy(obs_batch)
-            loss = loss_fn(pred, act_batch)
+            pred       = policy(obs_batch)
+            # per-output losses for diagnostics
+            per_output = loss_fn(pred, act_batch)   # (batch, 3)
+            loss       = per_output.mean()
+
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             optimizer.step()
-            epoch_loss += loss.item()
-            n_batches  += 1
 
-        avg_loss = epoch_loss / max(n_batches, 1)
+            epoch_loss     += loss.item()
+            epoch_loss_sel += per_output[:, 0].mean().item()   # selector
+            epoch_loss_dxy += per_output[:, 1:].mean().item()  # dx, dy
+            n_batches      += 1
+
+        scheduler.step()
+
+        avg_loss     = epoch_loss     / max(n_batches, 1)
+        avg_sel_loss = epoch_loss_sel / max(n_batches, 1)
+        avg_dxy_loss = epoch_loss_dxy / max(n_batches, 1)
+        cur_lr       = scheduler.get_last_lr()[0]
+
         if epoch % max(epochs // 5, 1) == 0 or epoch == 1:
-            print(f"  epoch {epoch:3d}/{epochs} | loss: {avg_loss:.6f}")
+            print(f"  epoch {epoch:3d}/{epochs} | "
+                  f"loss: {avg_loss:.6f}  "
+                  f"(selector: {avg_sel_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
+                  f"lr: {cur_lr:.2e}")
 
     os.makedirs(save_path, exist_ok=True)
     weights_path = os.path.join(save_path, "bc_weights.pt")
@@ -170,6 +196,8 @@ def train_bc(
     torch.save(goal_encoder.state_dict(), encoder_path)
     print(f"\n  BC weights saved to      {weights_path}")
     print(f"  goal encoder saved to    {encoder_path}")
+    print(f"  watch selector loss — if it stays high (>0.2) the policy")
+    print(f"  is averaging over shape choices, which causes single-shape collapse.")
 
     return policy.cpu(), goal_encoder.cpu()
 
@@ -185,8 +213,9 @@ def build_ppo_from_bc(bc_policy: BCPolicy, n_shapes: int,
     uses POLICY_HIDDEN_SIZE from config for hidden layer dimensions.
     """
     if goal is None:
-        goal = {"task": "sort_by_size", "axis": "x",
-                "direction": "ascending", "attribute": "size", "region": "none"}
+        goal = {"task": "arrange_in_sequence", "axis": "x",
+                "direction": "ascending", "attribute": "size",
+                "region": "none", "bounded": False}
 
     env = vec_env if vec_env is not None else Monitor(
         ShapeEnv(n_shapes=n_shapes, goal=goal))

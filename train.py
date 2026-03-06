@@ -169,14 +169,16 @@ def train(
         model = PPO(
             "MlpPolicy",
             vec_env,
-            learning_rate=1e-4,
+            learning_rate=3e-4,   # increased from 1e-4
             n_steps=2048,
             batch_size=128,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.02,
+            ent_coef=0.05,        # increased from 0.02 — encourages shape selector exploration
+            vf_coef=0.5,
+            max_grad_norm=0.5,
             verbose=1,
             tensorboard_log="./logs/tensorboard/",
             policy_kwargs=dict(net_arch=[POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE]),

@@ -11,10 +11,12 @@ checking that the model moves shapes at all).
 
 usage:
     python demo.py --model models/shape_agent/best_model
-    python demo.py --model models/shape_agent/best_model --prompt "sort right to left"
+    python demo.py --model models/shape_agent/best_model --prompt "sort shapes smallest to largest"
     python demo.py --model models/shape_agent/best_model --prompt "group shapes by color"
-    python demo.py --model models/shape_agent/best_model --prompt "arrange shapes in a grid"
-    python demo.py --random     # watch a random agent (no model needed)
+    python demo.py --model models/shape_agent/best_model --prompt "move all shapes to the left side"
+    python demo.py --oracle --prompt "arrange shapes in a horizontal line evenly spaced"
+    python demo.py --oracle --sequential
+    python demo.py --random
 """
 
 import argparse
@@ -63,18 +65,10 @@ def draw_env(surface, env, font):
     """draw current env state onto an existing pygame surface."""
     surface.fill(BG_COLOR)
 
-    # ghost circles only for canonical tasks — scoring tasks have no fixed targets
-    task           = env.goal.get("task", "sort_by_size")
-    canonical_task = task in ("arrange_in_line", "arrange_in_grid", "push_to_region")
-    if canonical_task and env.target_pos:
-        for i, (tx, ty) in enumerate(env.target_pos):
-            pygame.draw.circle(surface, (80, 80, 80),
-                               (int(tx), int(ty)),
-                               env.shapes[i].radius, 2)
-
     for shape in env.shapes:
         shape.draw(surface, font)
 
+    task      = env.goal.get("task", "arrange_in_sequence")
     score     = env._compute_score()
     rank      = env._compute_rank_corr()
     goal_str  = (f"task: {task}   progress: {score:.2%}   "
@@ -82,13 +76,13 @@ def draw_env(surface, env, font):
     surface.blit(font.render(goal_str, True, (200, 200, 200)), (10, 10))
 
 
-def run_oracle_demo(sequential: bool):
+def run_oracle_demo(sequential: bool, prompt: str = None):
     """
-    watch the oracle solve episodes. useful for verifying oracle behavior
-    before blaming the trained policy.
+    watch the oracle solve episodes.
 
-    --sequential: cycle through TASK_POOL prompts in order, repeating.
-    default: random task each episode (same as --multi-task for agent).
+    --prompt:     use this prompt for every episode (oracle stays on one task).
+    --sequential: cycle through TASK_POOL in order, ignoring --prompt.
+    default:      random task each episode.
     """
     from oracle import OraclePolicy
     import torch
@@ -108,12 +102,13 @@ def run_oracle_demo(sequential: bool):
 
     def next_prompt():
         nonlocal task_cursor
+        if prompt is not None and not sequential:
+            return prompt
         if sequential:
             p           = task_pool[task_cursor % len(task_pool)]
             task_cursor += 1
-        else:
-            p = random.choice(task_pool)
-        return p
+            return p
+        return random.choice(task_pool)
 
     cur_prompt = next_prompt()
     goal       = parse_goal(cur_prompt)
@@ -315,7 +310,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--prompt", type=str,
-        default="sort the shapes from smallest to largest left to right",
+        default="sort shapes from smallest to largest left to right",
         help="natural language goal prompt",
     )
     parser.add_argument(
@@ -337,6 +332,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.oracle:
-        run_oracle_demo(sequential=args.sequential)
+        run_oracle_demo(sequential=args.sequential, prompt=args.prompt)
     else:
         run_demo(args.model, args.prompt, args.random, args.multi_task)

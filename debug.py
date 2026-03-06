@@ -29,24 +29,24 @@ from config import GOAL_ENCODING_DIM, get_obs_size
 # ---------------------------------------------------------------------------
 
 def _default_goal(task: str) -> dict:
-    """return a minimal valid goal dict for a given task."""
+    """return a minimal valid goal dict for a given wave 3 task."""
     base = {
         "task":      task,
         "axis":      "none",
         "direction": "none",
         "attribute": "none",
         "region":    "none",
+        "bounded":   False,
     }
-    if task == "sort_by_size":
-        base.update({"axis": "x", "direction": "ascending", "attribute": "size"})
-    elif task in ("group_by_color", "cluster"):
-        base.update({"attribute": "color"})
-    elif task == "group_by_shape_type":
-        base.update({"attribute": "shape_type"})
+    if task == "arrange_in_sequence":
+        base.update({"axis": "x", "direction": "ascending",
+                     "attribute": "size", "bounded": False})
     elif task == "arrange_in_line":
-        base.update({"axis": "x"})
-    elif task == "push_to_region":
-        base.update({"region": "left"})
+        base.update({"axis": "x", "bounded": True})
+    elif task == "arrange_in_region":
+        base.update({"region": "left", "bounded": True})
+    elif task == "arrange_in_groups":
+        base.update({"attribute": "color", "bounded": True})
     return base
 
 
@@ -56,12 +56,12 @@ def _default_goal(task: str) -> dict:
 
 def test_env_steps(n_shapes: int = 3) -> bool:
     """
-    wave 2 note: sort_by_size rewards will appear flat (-0.02 each step)
+    wave 3 note: arrange_in_sequence rewards will appear flat (-0.02 each step)
     under random actions because rank correlation barely changes. this is
     expected — the reward is a score delta, not a distance improvement.
     """
     print(f"=== test 1: do env steps actually move shapes? (n_shapes={n_shapes}) ===")
-    goal   = _default_goal("sort_by_size")
+    goal   = _default_goal("arrange_in_sequence")
     env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
     obs, _ = env.reset()
 
@@ -101,15 +101,15 @@ def test_env_steps(n_shapes: int = 3) -> bool:
 
 def test_random_rewards(n_shapes: int = 3) -> bool:
     """
-    wave 2 note: sort_by_size produces near-constant rewards under random
-    actions (rank correlation barely moves). use group_by_color instead —
+    wave 3 note: arrange_in_sequence produces near-constant rewards under random
+    actions. use arrange_in_groups instead —
     random moves do affect cohesion score, so rewards should vary.
     also test arrange_in_line as a canonical task sanity check.
     """
     print(f"=== test 2: do rewards vary across episodes? (n_shapes={n_shapes}) ===")
     all_ok = True
 
-    for task in ("group_by_color", "arrange_in_line"):
+    for task in ("arrange_in_groups", "arrange_in_region"):
         goal    = _default_goal(task)
         env     = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
         rewards = []
@@ -132,7 +132,7 @@ def test_random_rewards(n_shapes: int = 3) -> bool:
         if not ok:
             all_ok = False
 
-    print(f"  note: sort_by_size rewards are intentionally flat under random "
+    print(f"  note: arrange_in_sequence rewards are intentionally flat under random "
           f"actions (rank corr barely moves — this is expected)")
     if all_ok:
         print("  reward function looks healthy")
@@ -145,10 +145,12 @@ def test_random_rewards(n_shapes: int = 3) -> bool:
 # ---------------------------------------------------------------------------
 
 def test_all_tasks() -> bool:
-    print("=== test 3: do all wave 1 tasks initialise and step correctly? ===")
+    print("=== test 3: do all wave 3 tasks initialise and step correctly? ===")
     tasks  = [
-        "sort_by_size", "group_by_color", "group_by_shape_type", "cluster",
-        "arrange_in_line", "arrange_in_grid", "push_to_region",
+        "arrange_in_sequence",
+        "arrange_in_line",
+        "arrange_in_region",
+        "arrange_in_groups",
     ]
     all_ok = True
 
@@ -210,7 +212,7 @@ def test_goal_encoder() -> bool:
         print(f"  encoding : {encoding.shape}  (expected ({GOAL_ENCODING_DIM},))")
 
         # verify integration with ShapeEnv
-        goal = _default_goal("sort_by_size")
+        goal = _default_goal("arrange_in_sequence")
         env  = ShapeEnv(n_shapes=2, goal=goal)
         env.set_goal_encoding(encoding)
         obs, _ = env.reset()
@@ -249,7 +251,7 @@ def test_trained_model(model_path: str, n_shapes: int = 2):
         print(f"  could not load model: {e}")
         return
 
-    goal = _default_goal("sort_by_size")
+    goal = _default_goal("arrange_in_sequence")
     env  = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
 
     obs, _          = env.reset()
@@ -291,7 +293,7 @@ def test_render():
     print("=== test 6: does pygame render without crashing? ===")
     try:
         import pygame
-        goal   = _default_goal("sort_by_size")
+        goal   = _default_goal("arrange_in_sequence")
         env    = ShapeEnv(n_shapes=2, goal=goal, render_mode="human")
         obs, _ = env.reset()
 
@@ -335,11 +337,9 @@ def test_render():
 
 def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
     """
-    run the oracle separately on each task and report solve rate per task.
-    a healthy oracle should hit 80%+ on sort/line/push and somewhat lower
-    on group/grid where random initial positions make it harder.
-    anything at 0% indicates the oracle or target computation is broken
-    for that task.
+    run the oracle on each wave 3 task and report solve rate.
+    a healthy oracle should hit 80%+ on all tasks.
+    anything at 0% indicates the oracle or score function is broken.
     """
     print(f"=== test 7: oracle per-task solve rate "
           f"({n_episodes_per_task} episodes each) ===")
@@ -348,20 +348,15 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
     import torch
     from bc_train import GoalEncoder
     from llm_goal_parser import get_embedding
-    from config import TASK_POOL
 
     goal_encoder = GoalEncoder()
     goal_encoder.eval()
 
-    # one representative prompt per task type
     task_prompts = {
-        "sort_by_size":       "sort shapes from smallest to largest left to right",
-        "group_by_color":     "group shapes by color",
-        "group_by_shape_type":"group shapes by type",
-        "arrange_in_line":    "arrange shapes in a horizontal line evenly spaced",
-        "arrange_in_grid":    "arrange shapes in a grid",
-        "push_to_region":     "move all shapes to the left side",
-        "cluster":            "put shapes of the same color close together",
+        "arrange_in_sequence": "sort shapes from smallest to largest left to right",
+        "arrange_in_line":     "arrange shapes in a horizontal line evenly spaced",
+        "arrange_in_region":   "move all shapes to the left side",
+        "arrange_in_groups":   "group shapes by color",
     }
 
     all_ok = True
@@ -378,10 +373,10 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
         mean_reward = 0.0
 
         for _ in range(n_episodes_per_task):
-            n_shapes = int(rng.integers(2, 5))   # 2-4 for tractable oracle check
+            n_shapes = int(rng.integers(2, 5))
             env      = ShapeEnv(n_shapes=n_shapes, goal=goal)
             env.set_goal_encoding(encoding)
-            oracle   = OraclePolicy(env, noise_std=0.0)   # no noise for clean check
+            oracle   = OraclePolicy(env, noise_std=0.0)
 
             obs, _ = env.reset(seed=int(rng.integers(0, 2 ** 31)))
             done   = False
@@ -389,7 +384,7 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
 
             while not done:
                 action = oracle.act(obs)
-                obs, reward, terminated, truncated, _ = env.step(action)
+                obs, reward, terminated, truncated, info = env.step(action)
                 ep_r  += reward
                 done   = terminated or truncated
 
@@ -400,11 +395,11 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
 
         solve_rate  = n_solved / n_episodes_per_task
         mean_reward = mean_reward / n_episodes_per_task
-        ok          = solve_rate >= 0.5   # flag anything below 50%
+        ok          = solve_rate >= 0.5
 
-        print(f"  {task:<20} solve={solve_rate:.0%}  "
+        print(f"  {task:<22} solve={solve_rate:.0%}  "
               f"mean_reward={mean_reward:7.2f}  "
-              f"{'OK' if ok else '!! LOW — check _targets and oracle logic'}")
+              f"{'OK' if ok else '!! LOW — check oracle and score function'}")
 
         if not ok:
             all_ok = False
@@ -439,13 +434,12 @@ def test_bc_loss(n_episodes: int = 100, epochs: int = 10) -> bool:
 
         print("  collecting oracle demos...")
         dataset = collect_demonstrations(
-            goal_encoder=goal_encoder,
             n_episodes=n_episodes,
             noise_std=0.05,
             verbose=False,
         )
-        print(f"  collected {len(dataset['observations']):,} transitions  "
-              f"oracle solve rate: {dataset['solve_rate']:.0%}")
+        n_trans = len(dataset['observations'])
+        print(f"  collected {n_trans:,} transitions")
 
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:
@@ -474,7 +468,7 @@ def test_bc_loss(n_episodes: int = 100, epochs: int = 10) -> bool:
 # test 9: oracle visual check
 # ---------------------------------------------------------------------------
 
-def test_oracle_render(task: str = "sort_by_size", n_shapes: int = 3):
+def test_oracle_render(task: str = "arrange_in_sequence", n_shapes: int = 3):
     """
     watch the oracle solve one episode in pygame.
     useful for visually confirming that targets are placed correctly and
@@ -491,12 +485,10 @@ def test_oracle_render(task: str = "sort_by_size", n_shapes: int = 3):
         from llm_goal_parser import get_embedding
 
         task_prompts = {
-            "sort_by_size":        "sort shapes from smallest to largest left to right",
-            "group_by_color":      "group shapes by color",
-            "group_by_shape_type": "group shapes by type",
+            "arrange_in_sequence": "sort shapes from smallest to largest left to right",
             "arrange_in_line":     "arrange shapes in a horizontal line evenly spaced",
-            "arrange_in_grid":     "arrange shapes in a grid",
-            "push_to_region":      "move all shapes to the left side",
+            "arrange_in_region":   "move all shapes to the left side",
+            "arrange_in_groups":   "group shapes by color",
         }
 
         goal_encoder = GoalEncoder()
@@ -540,10 +532,6 @@ def test_oracle_render(task: str = "sort_by_size", n_shapes: int = 3):
 
                 # draw
                 window.fill((30, 30, 35))
-                for i, (tx, ty) in enumerate(env.target_pos):
-                    pygame.draw.circle(window, (80, 80, 80),
-                                       (int(tx), int(ty)),
-                                       env.shapes[i].radius, 2)
                 for shape in env.shapes:
                     shape.draw(window, font)
 

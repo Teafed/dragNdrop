@@ -1,9 +1,11 @@
-# shape manipulation agent
+# dragNdrop
 
-A goal-conditioned reinforcement learning agent that arranges shapes on a 2D
-canvas in response to natural language prompts. A single policy handles all
-tasks simultaneously; the goal is encoded from the prompt text and injected
-into the observation rather than training a separate specialist per task.
+A goal-conditioned reinforcement learning agent that manipulates objects in
+2D space in response to natural language prompts.
+
+Currently, a single policy handles all tasks simultaneously; the goal is
+encoded from the prompt text and injected into the observation rather than
+training a separate specialist per task. 
 
 ```
 "sort shapes from smallest to largest"  →  agent sorts by size left to right
@@ -18,20 +20,20 @@ into the observation rather than training a separate specialist per task.
 ## architecture
 
 ```
-natural language prompt
-        │
-        ▼
+            natural language prompt
+                       │
+                       ▼
 sentence-transformer (all-MiniLM-L6-v2, 384-dim, offline)
-        │
-        ▼
-GoalEncoder MLP (384 → 128 → 64)
-        │
-        ├──────────────────────────────────────────┐
+                       │
+                       ▼
+        GoalEncoder MLP (384 → 128 → 64)
+                       │
+        ┌──────────────┴───────────────────────────┐
         │                                          │
         ▼                                          ▼
-per-shape obs (up to 6 shapes,              goal encoding (64-dim)
-zero-padded, 5 values each):
-  x, y, size, color, shape_type
+ per-shape obs (up to 6 shapes,            goal encoding (64-dim)
+  zero-padded, 5 values each):                     │
+[ x, y, size, color, shape_type ]                  │
         │                                          │
         └──────────────┬───────────────────────────┘
                        │  + action history (4 values)
@@ -42,12 +44,12 @@ zero-padded, 5 values each):
            PPO policy (MLP 256→256)
                        │
                        ▼
-         action: [shape_selector, dx, dy] ∈ [-1, 1]³
+     action: [shape_selector, dx, dy] ∈ [-1, 1]³
 ```
 
-**obs size breakdown:** `6 shapes × 5 features + 64 goal + 4 history = 98`
+**obs size:** `6 shapes * 5 features + 64 goals + 4 history = 98`
 
-**training pipeline:** oracle warm-start → behaviour cloning → PPO fine-tuning
+**training pipeline:** `oracle warm-start -> behavior cloning -> PPO fine-tuning`
 
 ---
 
@@ -90,7 +92,7 @@ ghost circles are drawn at target positions during rendering for these tasks onl
 ## setup
 
 ```bash
-pip install stable-baselines3 gymnasium pygame sentence-transformers torch numpy
+pip install stable-baselines3 gymnasium pygame sentence-transformers torch numpy matplotlib "setuptools<71" tensorboard
 
 # first run downloads all-MiniLM-L6-v2 (~80MB) and caches it locally.
 # set this to avoid network calls on subsequent runs:
@@ -185,6 +187,6 @@ than reading fixed `target_pos`, spawn diversity guarantees for group tasks.
 **wave 3 (planned):** collision detection, physical constraints, or hierarchical
 primitive decomposition depending on wave 2 agent weaknesses after further training.
 
-**known issue:** trained policy collapses to moving a single shape. bc loss
-plateaus at ~0.44 suggesting the warm-start isn't transferring multi-shape
-behavior well. under investigation.
+**known issues:** trained policy collapses to moving a single shape; `shape_selector`
+may need to be separated from the movement policy bc loss plateaus at ~0.44 suggesting
+the warm-start isn't transferring multi-shape behavior well. under investigation. 
