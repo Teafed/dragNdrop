@@ -24,15 +24,23 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 GOAL_SCHEMA = {
-   "task":      str,
-   "axis":      str,
-   "direction": str,
-   "attribute": str,
-   "region":    str,
-   "bounded":   bool,
+   "task":         str,
+   "axis":         str,
+   "direction":    str,
+   "attribute":    str,
+   "region":       str,
+   "bounded":      bool,
+   "target_color": str,   # "none" | "any" | color name (reach/touch/drag)
+   "target_type":  str,   # "none" | "any" | shape type  (reach/touch/drag)
 }
 
+VALID_COLORS = ("red", "green", "teal", "yellow", "purple", "any", "none")
+VALID_TYPES  = ("circle", "square", "triangle", "any", "none")
+
 SUPPORTED_TASKS = [
+   "reach",
+   "touch",
+   "drag",
    "arrange_in_sequence",
    "arrange_in_line",
    "arrange_in_region",
@@ -71,7 +79,7 @@ Respond ONLY with a single valid JSON object — no markdown, no extra text.
 
 Schema (all fields required):
 {
-  "task":      "<arrange_in_sequence | arrange_in_line | arrange_in_region | arrange_in_groups>",
+  "task":      "<reach | touch | drag | arrange_in_sequence | arrange_in_line | arrange_in_region | arrange_in_groups>",
   "axis":      "<x | y | none>",
   "direction": "<ascending | descending | none>",
   "attribute": "<size | color | shape_type | none>",
@@ -80,6 +88,10 @@ Schema (all fields required):
 }
 
 Rules:
+- reach: move cursor close to the target shape. all fields none/false.
+- touch: activate grip while overlapping the target shape. all fields none/false.
+- drag: grip the target shape and drag it into a region.
+  region=left/right/top/bottom, all other fields none, bounded=false.
 - arrange_in_sequence: ordered along axis, perpendicular unconstrained.
   axis=x/y, direction=ascending/descending, attribute=size/color/shape_type,
   region=none, bounded=false.
@@ -93,6 +105,12 @@ Rules:
   axis=none, direction=none, attribute=color/shape_type, region=none, bounded=true.
 
 Examples:
+  "move the cursor to the shape"
+  -> {"task":"reach","axis":"none","direction":"none","attribute":"none","region":"none","bounded":false}
+  "click on the shape"
+  -> {"task":"touch","axis":"none","direction":"none","attribute":"none","region":"none","bounded":false}
+  "drag the shape to the left side"
+  -> {"task":"drag","axis":"none","direction":"none","attribute":"none","region":"left","bounded":false}
   "sort shapes smallest to largest left to right"
   -> {"task":"arrange_in_sequence","axis":"x","direction":"ascending","attribute":"size","region":"none","bounded":false}
   "arrange shapes in a horizontal line evenly spaced"
@@ -133,9 +151,54 @@ def _llm_parse(prompt: str) -> dict:
 
 def _stub_parse(prompt: str) -> dict:
    """
-   keyword-matching fallback. handles common phrasings for all four tasks.
+   keyword-matching fallback. handles common phrasings for all seven tasks.
    ambiguous prompts default to arrange_in_sequence by size ascending.
    """
+
+   # --- starter tasks: reach, touch, drag ---
+   # detect color and type early — used by all three starter tasks
+   tc = _infer_target_color(prompt)
+   tt = _infer_target_type(prompt)
+
+   # drag: any explicit drag word, OR "move/push/carry [a/any/the] shape to [direction]"
+   # checked before region so "drag the red square to the left side" doesn't
+   # collapse into arrange_in_region
+   _drag_direction_kws = ("to the left", "to the right", "to the top",
+                          "to the bottom", "leftward", "rightward")
+   is_single_shape_move = (
+      any(kw in prompt for kw in ("a shape", "any shape", "the shape",
+                                  "one shape", "this shape"))
+      and any(kw in prompt for kw in _drag_direction_kws)
+   )
+   is_drag = any(kw in prompt for kw in ("drag", "pull", "carry", "slide")) \
+             or is_single_shape_move
+   if is_drag:
+      region = "left"
+      if any(kw in prompt for kw in ("right",)):
+         region = "right"
+      elif any(kw in prompt for kw in ("top", "up")):
+         region = "top"
+      elif any(kw in prompt for kw in ("bottom", "down")):
+         region = "bottom"
+      return {**_starter_goal("drag", tc, tt), "region": region}
+
+   # reach: cursor navigation prompts
+   if any(kw in prompt for kw in (
+      "move the cursor", "navigate to", "move cursor",
+      "reach the", "reach shape", "go to the",
+      "cursor to",
+   )):
+      return _starter_goal("reach", tc, tt)
+
+   # touch: grip-activation prompts. "touch the" must come before the groups
+   # check so "touch the triangle" doesn't fall through to arrange_in_sequence.
+   if any(kw in prompt for kw in (
+      "click on", "click the", "tap the", "tap on",
+      "touch the", "touch shape",
+      "press the", "press on",
+      "activate the", "grab the", "pick up the",
+   )):
+      return _starter_goal("touch", tc, tt)
 
    # --- arrange_in_region ---
    if any(kw in prompt for kw in ("left side", "move left", "push left", "to the left")):
@@ -166,9 +229,15 @@ def _stub_parse(prompt: str) -> dict:
       return _groups_goal("color")
 
    # --- arrange_in_line vs arrange_in_sequence ---
-   is_line = any(kw in prompt for kw in ("in a line", "in a horizontal line",
-                                          "in a vertical line", "evenly spaced",
-                                          "in a row", "in a column"))
+   is_line = any(kw in prompt for kw in (
+      "in a line", "in line",
+      "in a horizontal line", "in horizontal line",
+      "in a vertical line",   "in vertical line",
+      "in a row", "in a column",
+      "evenly spaced", "equally spaced", "equally distributed",
+      "lined up", "line up", "line them up",
+      "in a straight line", "in straight line",
+   ))
    axis      = _infer_axis(prompt)
    direction = _infer_direction(prompt)
    attribute = _infer_attribute(prompt)
@@ -177,33 +246,66 @@ def _stub_parse(prompt: str) -> dict:
       has_order = attribute != "none" or any(kw in prompt for kw in (
          "sort", "order", "ascending", "descending", "smallest", "largest"))
       return {
-         "task":      "arrange_in_line",
-         "axis":      axis,
-         "direction": direction if has_order else "none",
-         "attribute": attribute if has_order else "none",
-         "region":    "none",
-         "bounded":   True,
+         "task":         "arrange_in_line",
+         "axis":         axis,
+         "direction":    direction if has_order else "none",
+         "attribute":    attribute if has_order else "none",
+         "region":       "none",
+         "bounded":      True,
+         "target_color": "none",
+         "target_type":  "none",
       }
 
    # default: arrange_in_sequence
    return {
-      "task":      "arrange_in_sequence",
-      "axis":      axis,
-      "direction": direction,
-      "attribute": attribute if attribute != "none" else "size",
-      "region":    "none",
-      "bounded":   False,
+      "task":         "arrange_in_sequence",
+      "axis":         axis,
+      "direction":    direction,
+      "attribute":    attribute if attribute != "none" else "size",
+      "region":       "none",
+      "bounded":      False,
+      "target_color": "none",
+      "target_type":  "none",
    }
+
+
+def _starter_goal(task: str, target_color: str = "none",
+                  target_type: str = "none") -> dict:
+   return {"task": task, "axis": "none", "direction": "none",
+           "attribute": "none", "region": "none", "bounded": False,
+           "target_color": target_color, "target_type": target_type}
+
+
+def _infer_target_color(prompt: str) -> str:
+   """return color name if mentioned, 'any' if 'any'/'a shape', else 'none'."""
+   for color in ("red", "green", "teal", "yellow", "purple"):
+      if color in prompt:
+         return color
+   if any(kw in prompt for kw in ("any shape", "any", "a shape", "the shape")):
+      return "any"
+   return "none"
+
+
+def _infer_target_type(prompt: str) -> str:
+   """return shape type if mentioned, 'any' if 'any'/'a shape', else 'none'."""
+   for shape_type in ("circle", "square", "triangle"):
+      if shape_type in prompt:
+         return shape_type
+   if any(kw in prompt for kw in ("any shape", "any", "a shape", "the shape")):
+      return "any"
+   return "none"
 
 
 def _region_goal(region: str) -> dict:
    return {"task": "arrange_in_region", "axis": "none", "direction": "none",
-           "attribute": "none", "region": region, "bounded": True}
+           "attribute": "none", "region": region, "bounded": True,
+           "target_color": "none", "target_type": "none"}
 
 
 def _groups_goal(attribute: str) -> dict:
    return {"task": "arrange_in_groups", "axis": "none", "direction": "none",
-           "attribute": attribute, "region": "none", "bounded": True}
+           "attribute": attribute, "region": "none", "bounded": True,
+           "target_color": "none", "target_type": "none"}
 
 
 def _infer_axis(prompt: str) -> str:
@@ -295,3 +397,7 @@ def _validate_goal(goal: dict):
       raise ValueError(f"bad attribute: '{goal['attribute']}'")
    if goal["region"] not in ("left", "right", "top", "bottom", "none"):
       raise ValueError(f"bad region: '{goal['region']}'")
+   if goal["target_color"] not in VALID_COLORS:
+      raise ValueError(f"bad target_color: '{goal['target_color']}'")
+   if goal["target_type"] not in VALID_TYPES:
+      raise ValueError(f"bad target_type: '{goal['target_type']}'")

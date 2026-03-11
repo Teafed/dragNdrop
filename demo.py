@@ -62,18 +62,25 @@ def encode_goal(goal_encoder, prompt: str) -> np.ndarray:
 
 
 def draw_env(surface, env, font):
-    """draw current env state onto an existing pygame surface."""
-    surface.fill(BG_COLOR)
+   """draw current env state onto an existing pygame surface."""
+   surface.fill(BG_COLOR)
 
-    for shape in env.shapes:
-        shape.draw(surface, font)
+   for shape in env.shapes:
+      shape.draw(surface, font)
 
-    task      = env.goal.get("task", "arrange_in_sequence")
-    score     = env._compute_score()
-    rank      = env._compute_rank_corr()
-    goal_str  = (f"task: {task}   progress: {score:.2%}   "
-                 f"rank/cohesion: {rank:+.2f}")
-    surface.blit(font.render(goal_str, True, (200, 200, 200)), (10, 10))
+   # draw cursor — borrow env's own draw method by temporarily
+   # pointing its window at our surface
+   _prev_window   = env.window
+   env.window     = surface
+   env._draw_cursor()
+   env.window     = _prev_window
+
+   task     = env.goal.get("task", "arrange_in_sequence")
+   score    = env._compute_score()
+   rank     = env._compute_rank_corr()
+   goal_str = (f"task: {task}   progress: {score:.2%}   "
+               f"rank/cohesion: {rank:+.2f}")
+   surface.blit(font.render(goal_str, True, (200, 200, 200)), (10, 10))
 
 
 def run_oracle_demo(sequential: bool, prompt: str = None):
@@ -84,7 +91,7 @@ def run_oracle_demo(sequential: bool, prompt: str = None):
     --sequential: cycle through TASK_POOL in order, ignoring --prompt.
     default:      random task each episode.
     """
-    from oracle import OraclePolicy
+    from oracle import OraclePolicy, IDLE_THRESHOLD
     import torch
     from bc_train import GoalEncoder
 
@@ -125,7 +132,38 @@ def run_oracle_demo(sequential: bool, prompt: str = None):
     episode      = 1
     steps        = 0
     total_reward = 0.0
-    print(f"episode {episode} — {cur_prompt}  (Q to quit, N to skip to next task)")
+    paused       = False
+    print(f"episode {episode} — {cur_prompt}  (Q quit  N next  SPACE pause  D dump state)")
+
+    # keybind legend — rendered once per frame in top-right corner
+    legend_lines = [
+        "Q  quit",
+        "N  next episode",
+        "SPC  pause / unpause",
+        "D  dump state to console",
+    ]
+
+    def draw_legend(surface, font):
+        x = WINDOW_W - 160
+        for i, line in enumerate(legend_lines):
+            surface.blit(font.render(line, True, (140, 140, 140)), (x, 28 + i * 14))
+
+    def dump_state(env, oracle, step, score):
+        print(f"\n--- state dump  ep {episode}  step {step} ---")
+        print(f"  task        : {env.goal.get('task')}  score={score:.4f}  "
+              f"idle_threshold={IDLE_THRESHOLD:.2f}")
+        print(f"  oracle      : phase={oracle.phase}  "
+              f"committed_shape={oracle.committed_shape}  "
+              f"committed_target={oracle.committed_target}")
+        if hasattr(oracle, '_group_zones') and oracle._group_zones:
+            print(f"  group zones : {oracle._group_zones}")
+        print(f"  cursor      : ({env.cx:.1f}, {env.cy:.1f})  "
+              f"holding={env.holding}  grabbed_idx={env.grabbed_idx}")
+        for i, s in enumerate(env.shapes):
+            attr = getattr(s, 'color_name', '?')
+            print(f"  shape {i}     : ({s.x:.1f}, {s.y:.1f})  "
+                  f"color={attr}  size={s.size:.1f}  type={s.shape_type}")
+        print()
 
     running = True
     while running:
@@ -138,37 +176,50 @@ def run_oracle_demo(sequential: bool, prompt: str = None):
                     running = False
                 if event.key == pygame.K_n:
                     skip = True
+                if event.key == pygame.K_SPACE:
+                    paused = not paused
+                    print(f"[demo] {'paused' if paused else 'resumed'}  "
+                          f"ep {episode}  step {steps}")
+                if event.key == pygame.K_d:
+                    dump_state(env, oracle, steps, env._compute_score())
 
         if not running:
             break
 
-        action                                       = oracle.act(obs)
-        obs, reward, terminated, truncated, info     = env.step(action)
-        total_reward += reward
-        steps        += 1
+        if not paused and not skip:
+            action                                   = oracle.act(obs)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            steps        += 1
+        else:
+            # still need info for the HUD when paused
+            terminated = truncated = False
+            info       = {"score": env._compute_score(), "task": env.goal.get("task")}
 
         draw_env(window, env, font)
+        draw_legend(window, font)
 
-        # highlight the shape the oracle just moved
-        shape_idx = int(np.clip(
-            round((action[0] + 1.0) / 2.0 * (env.n_shapes - 1)),
-            0, env.n_shapes - 1
-        ))
-        s = env.shapes[shape_idx]
-        pygame.draw.circle(window, (255, 255, 255),
-                           (int(s.x), int(s.y)), s.radius + 4, 2)
-
-        status_str = "SOLVED!" if terminated else ""
-        step_label = font.render(
-            f"ORACLE  ep {episode}  step {steps}  n_shapes {env.n_shapes}  "
-            f"{cur_prompt}  {status_str}",
-            True, (100, 220, 180)
+        # bottom bar: oracle phase + idle indicator
+        score       = env._compute_score()
+        idle_now    = score >= IDLE_THRESHOLD
+        phase_str   = oracle.phase or "none"
+        status_str  = "SOLVED!" if (not paused and terminated) else ""
+        pause_str   = "  [PAUSED]" if paused else ""
+        bottom_line = (
+            f"ORACLE  ep {episode}  step {steps}  "
+            f"score {score:.3f}  phase={phase_str}  "
+            f"{'IDLE ' if idle_now else ''}"
+            f"{status_str}{pause_str}"
         )
-        window.blit(step_label, (10, WINDOW_H - 24))
+        window.blit(
+            font.render(bottom_line, True,
+                        (255, 220, 80) if paused else (100, 220, 180)),
+            (10, WINDOW_H - 24)
+        )
         pygame.display.flip()
         clock.tick(FPS)
 
-        if terminated or truncated or skip:
+        if not paused and (terminated or truncated or skip):
             status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
             print(f"episode {episode} {status} — "
                   f"steps: {steps}  reward: {total_reward:.2f}  "
@@ -189,6 +240,7 @@ def run_oracle_demo(sequential: bool, prompt: str = None):
             episode     += 1
             steps        = 0
             total_reward = 0.0
+            paused       = False
             print(f"episode {episode} — {cur_prompt}")
 
     pygame.quit()

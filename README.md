@@ -1,206 +1,67 @@
 # dragNdrop
 
-A goal-conditioned reinforcement learning agent that arranges shapes on a 2D
-canvas in response to natural language prompts.
+A gymnasium + stable-baselines3 proof of concept for an RL agent that
+manipulates objects on a canvas in response to natural language goals.
 
-Currently, a single policy handles all tasks simultaneously; the goal is encoded
-from the prompt and injected into the observation rather than training a separate
-specialist per task.
-
-```
-"sort shapes from smallest to largest"          →  agent sorts by size left to right
-"arrange shapes in a horizontal line"           →  agent forms a horizontal line
-"move all shapes to the left side"              →  agent pushes shapes into region
-"group shapes by color"                         →  agent clusters by color
-"group circles squares & triangles separately"  →  agent separates by shape type
-```
+The agent controls a cursor that navigates the canvas, grabs shapes, and
+drags them to satisfy goal conditions. The goal is encoded from a free-text
+prompt via a sentence embedding model.
 
 ---
 
-## architecture
-
-```
-natural language prompt
-        │
-        ▼
-sentence-transformer (all-MiniLM-L6-v2, 384-dim, offline)
-        │
-        ▼
-GoalEncoder MLP (384 → 128 → 64)
-        │
-        ├──────────────────────────────────────────┐
-        │                                          │
-        ▼                                          ▼
-per-shape obs (up to 6 shapes,              goal encoding (64-dim)
-zero-padded, 5 values each):
-  x, y, size, color, shape_type
-        │                                          │
-        └──────────────┬───────────────────────────┘
-                       │  + action history (4 values)
-                       ▼
-              obs vector (98-dim)
-                       │
-                       ▼
-           PPO policy (MLP 256→256)
-                       │
-                       ▼
-         action: [shape_selector, dx, dy] ∈ [-1, 1]³
-```
-
-**obs size breakdown:** `6 shapes × 5 features + 64 goal + 4 history = 98`
-
-**training pipeline:** `oracle warm-start -> behavior cloning -> PPO fine-tuning`
-
----
-
-## task framework
-
-tasks are defined by three orthogonal binary dimensions, forming a 2×2×2 cube:
-
-| dimension | values | meaning |
-|---|---|---|
-| n_target_spaces | one / many | all shapes share one target region, or each attribute group gets its own |
-| bounded | no / yes | shapes must be spatially contained within the target, or just ordered |
-| ordered | no / yes | shapes placed in attribute order within the target, or just placed |
-
-the four active tasks occupy four cells of this cube:
-
-| task | n_target_spaces | bounded | ordered | description |
-|---|---|---|---|---|
-| `arrange_in_sequence` | one | no | yes | ordered along an axis by attribute; perpendicular position unconstrained |
-| `arrange_in_line` | one | yes | yes/no | ordered or evenly spaced along axis AND minimising perpendicular spread |
-| `arrange_in_region` | one | yes | no | all shapes inside a canvas subregion, distributed across it |
-| `arrange_in_groups` | many | yes | no | shapes partitioned by attribute, each group in its own subregion |
-
-all tasks are **scoring-based**: the reward is a score delta (0→1) and any
-valid solution is accepted. the episode terminates when score ≥ 0.85. there
-are no fixed target positions anywhere in the codebase.
-
-**per-shape scores** (averaged for the episode score):
-
-- `arrange_in_sequence`: `1 - |current_rank - ideal_rank| / (n-1)` per shape
-- `arrange_in_line`: 0.6 × order score + 0.4 × perpendicular spread score
-- `arrange_in_region`: 0.7 × in_region + 0.3 × progress toward boundary
-- `arrange_in_groups`: 0.6 × nearest-neighbor correct + 0.4 × separation score
-
-**goal dict schema:**
-
-```python
-{
-  "task":      str,    # one of SUPPORTED_TASKS
-  "axis":      str,    # "x" | "y" | "none"
-  "direction": str,    # "ascending" | "descending" | "none"
-  "attribute": str,    # "size" | "color" | "shape_type" | "none"
-  "region":    str,    # "left" | "right" | "top" | "bottom" | "none"
-  "bounded":   bool,   # True for line/region/groups tasks
-}
-```
-
----
-
-## oracle
-
-the oracle uses an **explore / commit** loop rather than globally greedy
-shape selection:
-
-**explore:** select the next shape to move using weighted random selection.
-the "most wrong" shape is most likely to be chosen but not guaranteed —
-this produces varied demonstrations for behaviour cloning.
-
-priority functions by task:
-- `arrange_in_sequence/line`: `|current_rank − ideal_rank|` per shape
-- `arrange_in_region`: distance outside the boundary per shape
-- `arrange_in_groups`: per-shape cohesion deficit (1 − per_shape_score)
-
-**commit:** move the selected shape toward its computed target until the
-local completion condition is satisfied, then return to explore.
-
-local completion conditions:
-- sequence/line: shape is within `MAX_NUDGE × 1.5` pixels of its ideal slot
-- region: shape is past the boundary and within `MAX_NUDGE × 1.5` of target
-- groups: shape is within `MAX_NUDGE × 2.0` of committed group centroid
-
-target positions include random jitter (`COMMIT_JITTER = 30px`) so
-demonstrations are varied rather than all landing on the same pixel.
-
----
-
-## project structure
-
-| file | purpose |
-|---|---|
-| `config.py` | single source of truth for all architecture constants and task pool |
-| `shape_env.py` | gymnasium environment — shapes, scoring functions, reward, rendering |
-| `llm_goal_parser.py` | prompt → structured goal dict + sentence-transformer embedding |
-| `oracle.py` | explore/commit oracle policy + demonstration collection |
-| `bc_train.py` | GoalEncoder, BCPolicy, behaviour cloning training loop |
-| `train.py` | full training pipeline entry point |
-| `demo.py` | pygame demo — trained agent, random agent, or oracle |
-| `callbacks.py` | SB3 eval callback with per-task metrics |
-| `debug.py` | diagnostic test suite (9 tests) |
-
----
-
-## setup
+## install
 
 ```bash
-pip install stable-baselines3 gymnasium pygame sentence-transformers torch numpy
-
-# first run downloads all-MiniLM-L6-v2 (~80MB) and caches it locally.
-# set this to avoid network calls on subsequent runs:
-export TRANSFORMERS_OFFLINE=1
+pip install gymnasium stable-baselines3 pygame numpy torch \
+            sentence-transformers tensorboard
 ```
 
 ---
 
-## usage
+## quickstart
 
-**run diagnostic tests (always do this before training):**
+**watch the oracle solve tasks (no training needed):**
 ```bash
-python debug.py --oracle --skip-render
+python demo.py --oracle --prompt "move all shapes to the left side"
+python demo.py --oracle --prompt "arrange shapes in horizontal line"
+python demo.py --oracle --prompt "group shapes by color"
+python demo.py --oracle --sequential   # cycle through all task pool prompts
 ```
 
-all tests should pass. key checks:
-- obs shape is 98
-- all 4 tasks initialise and step without error
-- oracle achieves 100% solve rate on sequence/line/region, ≥50% on groups
-- BC loss decreases over epochs and selector loss stays below 0.2
-
-**train:**
-```bash
-# full pipeline: oracle collection → BC warm-start → PPO fine-tuning
-python train.py --bc-episodes 500 --bc-epochs 30 --timesteps 500000
-
-# skip oracle warm-start (faster, worse initialisation)
-python train.py --no-oracle --timesteps 500000
+**demo keybinds:**
+```
+space    pause / unpause
+n        skip to next episode
+d        dump full env + oracle state to console
+q        quit
 ```
 
-checkpoints are saved to `./models/shape_agent/`. the best model by eval
-reward is saved as `best_model`, the final model as `final_model`.
-
-**demo — trained agent:**
+**full training pipeline (oracle warm-start → BC → PPO):**
 ```bash
-# single fixed task
-python demo.py --model models/shape_agent/best_model \
-               --prompt "group shapes by color"
-
-# cycle random tasks each episode
-python demo.py --model models/shape_agent/best_model --multi-task
+python train.py
+python train.py --timesteps 800000 --bc-episodes 500 --bc-epochs 30 # same as default
+python train.py --force-demos          # re-collect oracle demos even if cached
+python train.py --start-stage 3        # skip straight to curriculum stage 3 tasks
 ```
 
-**demo — oracle:**
+**skip oracle warm-start:**
 ```bash
-# fixed task (useful for inspecting oracle behavior on one task)
-python demo.py --oracle --prompt "arrange shapes in a horizontal line evenly spaced"
-
-# random tasks each episode
-python demo.py --oracle
-
-# cycle through all TASK_POOL prompts in order
-python demo.py --oracle --sequential
+python train.py --no-oracle
+python train.py --no-curriculum        # all tasks from step 0
 ```
 
-press `N` in the oracle demo to skip to the next task. press `Q` to quit.
+**watch a trained agent:**
+```bash
+python demo.py --model models/shape_agent/best_model
+python demo.py --model models/shape_agent/best_model --prompt "group shapes by color"
+```
+
+**run diagnostics:**
+```bash
+python debug.py
+python debug.py --oracle --skip-render # includes oracle solve rates + BC loss
+python debug.py --oracle-episodes 40 --skip-render
+```
 
 **tensorboard:**
 ```bash
@@ -209,39 +70,182 @@ tensorboard --logdir logs/tensorboard
 
 ---
 
-## key config constants
+## file overview
 
-| constant | value | description |
-|---|---|---|
-| `MAX_SHAPES` | 6 | max shapes per episode |
-| `OBS_VALUES_PER_SHAPE` | 5 | x, y, size, color, shape_type |
-| `GOAL_ENCODING_DIM` | 64 | projected goal embedding size |
-| `POLICY_HIDDEN_SIZE` | 256 | PPO/BC MLP hidden layer width |
-| `EMBEDDING_DIM` | 384 | sentence-transformer output dim |
-| `SCORE_SOLVE_THRESHOLD` | 0.85 | episode solved when mean per-shape score ≥ this |
-| `EXPLORE_TEMP` | 0.5 | oracle softmax temperature (lower = more greedy) |
-| `COMMIT_JITTER` | 30px | random offset added to oracle target positions |
-
-to change the obs size, edit `OBS_VALUES_PER_SHAPE` or `MAX_SHAPES` in
-`config.py`. `get_obs_size()` updates automatically everywhere.
+```
+config.py           — shared constants: canvas size, obs dims, task lists
+shape_env.py        — gymnasium environment: cursor, shapes, obs/action spaces, rewards
+llm_goal_parser.py  — rule-based goal parser (task, axis, direction, attribute, region)
+oracle.py           — scripted expert policy + demo collection for BC warm-start
+bc_train.py         — behavior cloning trainer + bicameral network definition
+curriculum.py       — staged curriculum manager (7 stages, performance-gated)
+train.py            — training entry point (oracle BC warm-start → PPO fine-tune)
+callbacks.py        — SB3 callbacks: per-task solve rates, curriculum advancement
+demo.py             — pygame demo: oracle or trained model, pause/dump controls
+debug.py            — diagnostic script: env sanity, oracle solve rates, BC loss curve
+```
 
 ---
 
-## development notes
+## architecture
 
-**wave 1 (complete):** fixed-target distance rewards, oracle covers all tasks,
-multi-task training pipeline, BC warm-start, per-task eval callbacks.
+```
+user prompt
+    |
+    v
+llm_goal_parser.parse_goal()
+    |   rule-based pattern matching -> goal dict
+    |
+    v
+GoalEncoder (MLP)
+    |   sentence embedding (384-dim, all-MiniLM-L6-v2)
+    |   -> 64-dim goal encoding
+    |
+    v
+ShapeEnv (Gymnasium)
+    |   observation : 108-dim (cursor state + shape features + goal encoding)
+    |   action      : [dx, dy, grip]  all in [-1, 1]
+    |   reward      : score delta + step penalty + completion bonus
+    |
+    v
+BicameralPolicy (PPO)
+    |-- left encoder   : obs[0:44]   -- cursor-local stream
+    |-- right encoder  : obs[14:108] -- scene-global stream
+    |-- cross-attention: right queries left (global reads cursor state)
+    +-- action head    : concat(left, right) -> [dx, dy, grip]
+```
 
-**wave 2 (complete):** scoring-based rewards (any valid solution accepted),
-removed target-relative obs features, added shape types (circle/square/triangle),
-oracle heuristics rather than fixed targets, spawn diversity for group tasks.
+---
 
-**wave 3 (current):** consolidated 7 tasks into 4 using the 2×2×2 cube framework
-(n_target_spaces × bounded × ordered). explore/commit oracle with stochastic shape
-selection. all tasks scoring-based with per-shape scores. `bounded` field added to
-goal schema.
+## observation space (108-dim)
 
-**wave 4 (planned):** two-stream policy architecture — separate streams for the
-shape being moved and the relational context (where should it go relative to others),
-with cross-attention between streams. addresses the implicit nature of dual attention
-in the current flat MLP.
+```
+[0-3]    cursor state         cx_norm, cy_norm, holding, grabbed_idx_norm
+[4-8]    grabbed shape        features of currently held shape (zeros if none)
+[9-13]   nearest free shape   features of closest non-grabbed shape
+[14-43]  all shapes           6 x 5 values, zero-padded
+[44-107] goal encoding        64-dim from GoalEncoder
+
+per-shape features (5 values):
+    x_norm, y_norm, size_norm, color_idx_norm, shape_type_norm
+
+left stream  (cursor-local):  indices  0-43   (44 values)
+right stream (scene-global):  indices 14-107  (94 values)
+overlap on [14-43] is intentional.
+```
+
+---
+
+## action space
+
+```
+[dx, dy, grip]   all continuous in [-1, 1]
+
+dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (25px)
+grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
+          <= GRIP_THRESHOLD       -> release held shape
+```
+
+---
+
+## supported tasks
+
+| task                  | description                              | example prompt                              |
+|-----------------------|------------------------------------------|---------------------------------------------|
+| reach                 | move cursor within grip radius of shape  | "move the cursor to the shape"              |
+| touch                 | activate grip while overlapping shape    | "click on the shape"                        |
+| drag                  | grip and drag shape into a target region | "drag the shape to the left side"           |
+| arrange_in_sequence   | order shapes along axis by attribute     | "sort shapes smallest to largest"           |
+| arrange_in_line       | place shapes in an evenly spaced line    | "arrange shapes in a horizontal line"       |
+| arrange_in_region     | move all shapes into a canvas region     | "move all shapes to the left side"          |
+| arrange_in_groups     | cluster shapes by color or type          | "group shapes by color"                     |
+
+---
+
+## curriculum (7 stages)
+
+Training builds from cursor fundamentals up to full multi-shape tasks:
+
+| stage | tasks active                  | n_shapes | gate | step ceiling |
+|-------|-------------------------------|----------|------|--------------|
+| 0     | reach                         | 1        | 80%  | 50k          |
+| 1     | touch                         | 1        | 80%  | 50k          |
+| 2     | drag                          | 1        | 70%  | 75k          |
+| 3     | arrange_in_sequence           | 2-3      | 60%  | 150k         |
+| 4     | + arrange_in_region           | 2-3      | 60%  | 150k         |
+| 5     | + arrange_in_line             | 2-4      | 60%  | 200k         |
+| 6     | all tasks                     | 2-6      | --   | remaining    |
+
+Advancement is performance-gated on the newest task's solve rate,
+with a step ceiling so training never stalls on a hard stage.
+
+To skip ahead: `python train.py --start-stage 3`
+
+---
+
+## training strategy: oracle warm-start
+
+Training from scratch is slow because the agent must simultaneously discover
+cursor mechanics and task semantics. The oracle warm-start decouples these:
+
+1. oracle - scripted policy using navigate-then-drag sub-phases:
+   navigate -> grip_on -> drag -> grip_off. solves all tasks analytically.
+   demos saved to logs/oracle_demos.npz and reused across runs.
+
+2. behavior cloning - supervised imitation of oracle demos trains the
+   bicameral network. gives the policy a strong cursor-control prior before
+   any RL signal is seen.
+
+3. PPO fine-tune - refines the BC policy through environment interaction,
+   handling spawn variance the deterministic oracle navigates perfectly.
+
+---
+
+## reward design
+
+```
+step reward  = score_delta x REWARD_SCALE
+             + STEP_PENALTY (-0.02 per step)
+             + COMPLETION_BONUS (+25.0 on solve)
+
+score_delta  = current_score - previous_score
+               (positive when shapes move toward goal, negative otherwise)
+```
+
+Score functions per task:
+- reach / touch / drag: proximity or grip-activation score in [0, 1]
+- arrange_in_sequence: spearman rank correlation of positions vs attribute values
+- arrange_in_line: 0.6 x gap evenness + 0.4 x perpendicular spread score
+- arrange_in_region: mean per-shape region penetration score
+- arrange_in_groups: 0.5 x global inter/intra distance ratio
+                   + 0.5 x per-shape nearest-neighbor isolation score
+
+---
+
+## oracle design
+
+The oracle uses a zone-planning approach per task:
+
+- sequence / line: assigns each shape to an ideal slot via greedy
+  nearest-available-slot. priority is proportional to pixel distance from
+  ideal position, so the most-displaced shape is always tackled first.
+
+- region: targets a random depth 30-120px past the boundary so shapes
+  land comfortably inside, not just over the threshold.
+
+- groups: pre-assigns each unique attribute value to a canvas zone using
+  greedy maximin (each new group gets the zone furthest from all existing
+  groups). new attribute values discovered mid-episode get the next
+  farthest unoccupied zone.
+
+---
+
+## adding new tasks
+
+1. add score function \_score_<task>() in shape_env.py
+2. add branch in _compute_task_score() to call it
+3. add task name to SUPPORTED_TASKS and TASK_POOL in config.py
+4. add goal parsing in llm_goal_parser.py
+5. add oracle priority function \_priorities_<task>() in oracle.py
+6. add oracle target computation in _compute_target() in oracle.py
+7. add a curriculum stage in curriculum.py if needed

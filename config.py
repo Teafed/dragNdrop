@@ -1,18 +1,36 @@
 # config.py
 # shared constants for training, demo, callbacks, debug, and the environment.
-# single source of truth for architecture dimensions — changing OBS_VALUES_PER_SHAPE
-# or ACTION_HISTORY_SIZE updates get_obs_size() automatically everywhere.
+# single source of truth for architecture dimensions.
 
 # ---------------------------------------------------------------------------
 # observation space
 # ---------------------------------------------------------------------------
 
-MAX_SHAPES           = 6   # maximum shapes any episode can have
-OBS_VALUES_PER_SHAPE = 5   # per-shape features: x, y, size, color, shape_type
-ACTION_HISTORY_SIZE  = 4   # last_shape_idx, steps_on_shape, last_dx, last_dy
+MAX_SHAPES           = 6    # maximum shapes any episode can have
+OBS_VALUES_PER_SHAPE = 5    # per-shape features: x, y, size, color, shape_type
 
-# shape types — encoded as normalized float: index / (N_SHAPE_TYPES - 1)
-# 0.0 = circle, 0.5 = square, 1.0 = triangle
+# obs vector layout (108-dim total):
+#   [0-3]    cursor state: cx_norm, cy_norm, holding, grabbed_idx_norm
+#   [4-8]    grabbed shape features (zeros if nothing grabbed)
+#   [9-13]   nearest non-grabbed shape features (zeros if no shapes)
+#   [14-43]  all shapes zero-padded (MAX_SHAPES * OBS_VALUES_PER_SHAPE)
+#   [44-107] goal encoding (GOAL_ENCODING_DIM)
+#
+# left stream  (cursor-local):  indices  0-43  (44 values)
+# right stream (scene-global):  indices 14-107 (94 values)
+# overlap on [14-43] is intentional — both streams see all shape positions.
+
+CURSOR_STATE_SIZE    = 4    # cx_norm, cy_norm, holding, grabbed_idx_norm
+FOCAL_SHAPE_SIZE     = OBS_VALUES_PER_SHAPE * 2   # grabbed + nearest (5 + 5)
+
+LEFT_STREAM_DIM      = CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE + MAX_SHAPES * OBS_VALUES_PER_SHAPE
+# = 4 + 10 + 30 = 44
+RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + 64   # shapes + goal = 94
+
+# ---------------------------------------------------------------------------
+# shape types
+# ---------------------------------------------------------------------------
+
 SHAPE_TYPES    = ["circle", "square", "triangle"]
 N_SHAPE_TYPES  = len(SHAPE_TYPES)
 SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
@@ -32,50 +50,57 @@ GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
 POLICY_HIDDEN_SIZE = 256   # hidden layer width for PPO and BC MLPs
 
 # ---------------------------------------------------------------------------
+# cursor physics
+# ---------------------------------------------------------------------------
+
+CURSOR_SPEED    = 25    # pixels per step
+GRIP_THRESHOLD  = 0.0   # action[2] > this -> holding = True
+GRIP_RADIUS     = 20    # pixels — cursor must be within this to attach to shape
+
+# ---------------------------------------------------------------------------
 # obs size helper
 # ---------------------------------------------------------------------------
 
 def get_obs_size() -> int:
    """
-   total flattened observation vector size.
-   = MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM + ACTION_HISTORY_SIZE
-   = 6*5 + 64 + 4 = 98
+   total flattened observation vector size: 108.
+
+      CURSOR_STATE_SIZE                          4
+    + FOCAL_SHAPE_SIZE  (grabbed + nearest)     10
+    + MAX_SHAPES * OBS_VALUES_PER_SHAPE         30
+    + GOAL_ENCODING_DIM                         64
+                                               ---
+                                               108
    """
-   return MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM + ACTION_HISTORY_SIZE
+   return (CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE
+           + MAX_SHAPES * OBS_VALUES_PER_SHAPE
+           + GOAL_ENCODING_DIM)
 
 # ---------------------------------------------------------------------------
-# task framework — wave 3
+# task framework — wave 4
 # ---------------------------------------------------------------------------
 #
-# tasks are defined by three orthogonal binary dimensions:
+# starter tasks (cursor skill building):
+#   reach      move cursor within GRIP_RADIUS of target shape
+#   touch      activate grip while overlapping target shape
+#   drag       grip shape and move it into a target region
 #
-#   n_target_spaces  one | many   — all shapes share a target, or each group
-#                                    gets its own
-#   bounded          no  | yes    — position within the target space is
-#                                    unconstrained (rank only) or spatially
-#                                    contained
-#   ordered          no  | yes    — shapes placed in attribute order, or just
-#                                    placed
-#
-#   task name              n_target_spaces  bounded  ordered
-#   ─────────────────────  ───────────────  ───────  ───────
-#   arrange_in_sequence    one              no       yes
-#   arrange_in_line        one              yes      yes/no
-#   arrange_in_region      one              yes      no
-#   arrange_in_groups      many             yes      no
-#
-# goal dict parameters:
-#   axis      "x" | "y" | "none"
-#   direction "ascending" | "descending" | "none"
-#   attribute "size" | "color" | "shape_type" | "none"
-#   region    "left" | "right" | "top" | "bottom" | "none"
-#   bounded   True | False
+# wave 3 tasks (2x2x2 cube):
+#   arrange_in_sequence  one target space, unbounded, ordered
+#   arrange_in_line      one target space, bounded, ordered/unordered
+#   arrange_in_region    one target space, bounded, unordered
+#   arrange_in_groups    many target spaces, bounded, unordered
 
 SUPPORTED_TASKS = [
-   "arrange_in_sequence",   # one target space, unbounded, ordered by attribute
-   "arrange_in_line",       # one target space, bounded (actual line), ordered or unordered
-   "arrange_in_region",     # one target space, bounded (canvas subregion), unordered
-   "arrange_in_groups",     # many target spaces (one per attribute value), bounded, unordered
+   # starter tasks
+   "reach",
+   "touch",
+   "drag",
+   # wave 3 tasks
+   "arrange_in_sequence",
+   "arrange_in_line",
+   "arrange_in_region",
+   "arrange_in_groups",
 ]
 
 # ---------------------------------------------------------------------------
@@ -83,6 +108,18 @@ SUPPORTED_TASKS = [
 # ---------------------------------------------------------------------------
 
 TASK_POOL = [
+   # starter tasks
+   "move the cursor to the shape",
+   "move the cursor to the yellow shape",
+   "move the cursor to the triangle",
+   "click on the shape",
+   "click on the red shape",
+   "click on the square",
+   "drag the shape to the left side",
+   "drag the shape to the right side",
+   "drag the shape to the top",
+   "drag the shape to the bottom",
+
    # arrange_in_sequence
    "sort shapes from smallest to largest left to right",
    "sort shapes from largest to smallest left to right",

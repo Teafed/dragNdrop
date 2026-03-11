@@ -1,46 +1,68 @@
 """
 bc_train.py
 
-Behavior Cloning (BC) trainer for the shape manipulation agent.
+behavior cloning trainer for the shape manipulation agent.
 
-Instead of learning from scratch via RL, BC:
-  1. Runs the scripted oracle to collect (obs, action) pairs cheaply.
-  2. Trains an MLP to imitate those demonstrations via supervised learning.
-  3. Optionally fine-tunes the result with PPO — the "warm start" cuts RL
-     training time because the policy already has a sensible prior.
+--- bicameral network architecture ---
+   the policy is split into two streams that each process a different
+   slice of the observation, then cross-attend before producing actions.
 
-The output is a standard SB3 PPO model saved to disk, loadable by
-demo.py / train.py exactly like a fully RL-trained model.
+   left stream  (cursor-local, manipulation):
+      input:  obs[0:44]  — cursor state + grabbed shape + nearest shape + all shapes
+      purpose: "what is the cursor doing right now, and what is it near?"
 
-Usage:
-    # Pure BC:
-    python bc_train.py
+   right stream (scene-global, relational):
+      input:  obs[14:108] — all shapes + goal encoding
+      purpose: "where is everything and what does the goal say?"
 
-    # BC then PPO fine-tune:
-    python bc_train.py --prompt "sort shapes left to right" --finetune --finetune-steps 100000
+   overlap on obs[14:43] (all shapes) is intentional — both streams see
+   the full shape layout but with different contextual emphasis.
 
-    # Group task:
-    python bc_train.py --prompt "group shapes by color" --episodes 800
+   cross-attention:
+      right stream queries the left stream output.
+      allows global context to read fine-grained cursor state.
+      single-head attention, lightweight (no positional encoding needed).
+
+   action head:
+      combined left+right output -> [dx, dy, grip]
+      dx, dy:  MSE loss during BC
+      grip:    treated as continuous during BC (also MSE), threshold at runtime
+
+--- BC training details ---
+   loss = MSE on all three action outputs (dx, dy, grip together).
+   grip is continuous during BC even though it becomes binary at runtime.
+   separate loss reporting for grip vs dx/dy for diagnostics.
+   cosine annealing lr schedule, gradient clipping max_norm=1.0.
+
+--- weight transplant ---
+   SB3's MlpPolicy does not support the bicameral architecture.
+   build_ppo_from_bc() creates a CustomActorCriticPolicy that wraps the
+   bicameral network inside SB3's actor-critic framework. this lets us
+   keep SB3's PPO training loop while using our custom network.
 """
 
-import argparse
 import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
-from llm_goal_parser import parse_goal, get_embedding
-from oracle import collect_demonstrations
 from config import (
-    EMBEDDING_DIM, GOAL_ENCODING_DIM, POLICY_HIDDEN_SIZE,
-    get_obs_size, TASK_POOL,
+   EMBEDDING_DIM, GOAL_ENCODING_DIM, POLICY_HIDDEN_SIZE,
+   LEFT_STREAM_DIM, RIGHT_STREAM_DIM,
+   get_obs_size,
 )
+
+# obs slice indices — must match shape_env._get_obs() layout
+_LEFT_SLICE  = slice(0,  44)    # cursor state + focal shapes + all shapes
+_RIGHT_SLICE = slice(14, 108)   # all shapes + goal encoding
 
 
 # ---------------------------------------------------------------------------
@@ -48,331 +70,355 @@ from config import (
 # ---------------------------------------------------------------------------
 
 class GoalEncoder(nn.Module):
-    """
-    projects raw EMBEDDING_DIM embeddings down to GOAL_ENCODING_DIM.
-    sits between get_embedding() and the policy input.
-    kept small (two layers) so it doesn't dominate training.
-    """
+   """
+   projects raw EMBEDDING_DIM sentence embeddings down to GOAL_ENCODING_DIM.
+   sits between get_embedding() and the policy input.
+   """
 
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(EMBEDDING_DIM, 128),
-            nn.ReLU(),
-            nn.Linear(128, GOAL_ENCODING_DIM),
-            nn.Tanh(),
-        )
+   def __init__(self):
+      super().__init__()
+      self.net = nn.Sequential(
+         nn.Linear(EMBEDDING_DIM, 128),
+         nn.ReLU(),
+         nn.Linear(128, GOAL_ENCODING_DIM),
+         nn.Tanh(),
+      )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-# ---------------------------------------------------------------------------
-# BC network
-# ---------------------------------------------------------------------------
-
-class BCPolicy(nn.Module):
-    """
-    simple MLP: obs -> action.
-    architecture mirrors SB3's MlpPolicy so weights can be transplanted.
-    obs_dim -> POLICY_HIDDEN_SIZE -> Tanh -> POLICY_HIDDEN_SIZE -> Tanh -> action_dim -> Tanh
-
-    obs_dim is get_obs_size() from config — fixed regardless of n_shapes.
-    """
-
-    def __init__(self, action_dim: int = 3, hidden: int = POLICY_HIDDEN_SIZE):
-        super().__init__()
-        obs_dim  = get_obs_size()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, action_dim),
-            nn.Tanh(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+   def forward(self, x: torch.Tensor) -> torch.Tensor:
+      return self.net(x)
 
 
 # ---------------------------------------------------------------------------
-# Training
+# bicameral policy network
+# ---------------------------------------------------------------------------
+
+class BicameralNetwork(nn.Module):
+   """
+   two-stream policy network with cross-attention.
+
+   left stream:   obs[0:44]   -> hidden_size features  (cursor-local)
+   right stream:  obs[14:108] -> hidden_size features  (scene-global)
+   cross-attn:    right queries left (global reads local cursor state)
+   action head:   (left + right) -> action_dim
+
+   used directly for BC training and wrapped inside SB3 for PPO.
+   """
+
+   def __init__(self, action_dim: int = 3,
+                hidden: int = POLICY_HIDDEN_SIZE):
+      super().__init__()
+      self.hidden = hidden
+
+      # left stream: cursor-local encoder
+      self.left_encoder = nn.Sequential(
+         nn.Linear(LEFT_STREAM_DIM, hidden),
+         nn.Tanh(),
+         nn.Linear(hidden, hidden),
+         nn.Tanh(),
+      )
+
+      # right stream: scene-global encoder
+      self.right_encoder = nn.Sequential(
+         nn.Linear(RIGHT_STREAM_DIM, hidden),
+         nn.Tanh(),
+         nn.Linear(hidden, hidden),
+         nn.Tanh(),
+      )
+
+      # cross-attention: right queries left
+      # Q from right, K and V from left — global reads local cursor context
+      self.attn_q = nn.Linear(hidden, hidden, bias=False)
+      self.attn_k = nn.Linear(hidden, hidden, bias=False)
+      self.attn_v = nn.Linear(hidden, hidden, bias=False)
+      self.attn_scale = hidden ** -0.5
+
+      # action head: combined (left + right) -> action
+      self.action_head = nn.Sequential(
+         nn.Linear(hidden * 2, hidden),
+         nn.Tanh(),
+         nn.Linear(hidden, action_dim),
+         nn.Tanh(),
+      )
+
+   def forward(self, obs: torch.Tensor) -> torch.Tensor:
+      """
+      obs: (batch, 108)
+      returns: (batch, action_dim) in [-1, 1]
+      """
+      left_in  = obs[:, _LEFT_SLICE]    # (batch, 44)
+      right_in = obs[:, _RIGHT_SLICE]   # (batch, 94)
+
+      left_feat  = self.left_encoder(left_in)    # (batch, hidden)
+      right_feat = self.right_encoder(right_in)  # (batch, hidden)
+
+      # cross-attention: right queries left
+      # add sequence dim of 1 for F.scaled_dot_product_attention
+      q = self.attn_q(right_feat).unsqueeze(1)   # (batch, 1, hidden)
+      k = self.attn_k(left_feat).unsqueeze(1)    # (batch, 1, hidden)
+      v = self.attn_v(left_feat).unsqueeze(1)    # (batch, 1, hidden)
+
+      # scaled dot-product attention
+      scores   = torch.bmm(q, k.transpose(1, 2)) * self.attn_scale  # (batch, 1, 1)
+      weights  = F.softmax(scores, dim=-1)
+      attended = torch.bmm(weights, v).squeeze(1)   # (batch, hidden)
+
+      # residual: attended right + original right
+      right_out = right_feat + attended   # (batch, hidden)
+
+      # concat and decode to action
+      combined = torch.cat([left_feat, right_out], dim=-1)   # (batch, hidden*2)
+      return self.action_head(combined)
+
+   def features_dim(self) -> int:
+      """combined feature dimension before action head — used by SB3 wrapper."""
+      return self.hidden * 2
+
+
+# ---------------------------------------------------------------------------
+# SB3 custom policy wrapper
+# ---------------------------------------------------------------------------
+
+class BicameralPolicy(ActorCriticPolicy):
+   """
+   SB3 ActorCriticPolicy that wraps BicameralNetwork.
+
+   SB3's PPO requires an ActorCriticPolicy. this subclass replaces the
+   default MLP extractor with BicameralNetwork while keeping SB3's
+   value head and action distribution unchanged.
+   """
+
+   def __init__(self, observation_space, action_space, lr_schedule,
+                **kwargs):
+      # disable SB3's default net_arch so we can use our own network
+      kwargs.pop("net_arch", None)
+      super().__init__(
+         observation_space, action_space, lr_schedule,
+         net_arch=[],   # empty — we override mlp_extractor below
+         **kwargs,
+      )
+
+   def _build_mlp_extractor(self):
+      """replace SB3's mlp_extractor with BicameralNetwork."""
+      self.mlp_extractor = _BicameralExtractor(
+         observation_space=self.observation_space,
+         hidden=POLICY_HIDDEN_SIZE,
+      )
+
+
+class _BicameralExtractor(nn.Module):
+   """
+   adapter that makes BicameralNetwork conform to SB3's mlp_extractor interface.
+   SB3 expects mlp_extractor to produce (policy_features, value_features).
+   """
+
+   def __init__(self, observation_space, hidden: int = POLICY_HIDDEN_SIZE):
+      super().__init__()
+      self.net             = BicameralNetwork(action_dim=3, hidden=hidden)
+      self.latent_dim_pi   = hidden * 2   # policy feature dim
+      self.latent_dim_vf   = hidden * 2   # value feature dim (shared)
+
+   def forward(self, obs: torch.Tensor):
+      left_in  = obs[:, _LEFT_SLICE]
+      right_in = obs[:, _RIGHT_SLICE]
+
+      left_feat  = self.net.left_encoder(left_in)
+      right_feat = self.net.right_encoder(right_in)
+
+      q = self.net.attn_q(right_feat).unsqueeze(1)
+      k = self.net.attn_k(left_feat).unsqueeze(1)
+      v = self.net.attn_v(left_feat).unsqueeze(1)
+      scores   = torch.bmm(q, k.transpose(1, 2)) * self.net.attn_scale
+      weights  = F.softmax(scores, dim=-1)
+      attended = torch.bmm(weights, v).squeeze(1)
+      right_out = right_feat + attended
+
+      features = torch.cat([left_feat, right_out], dim=-1)
+      return features, features   # (policy_features, value_features)
+
+   def forward_actor(self, obs: torch.Tensor) -> torch.Tensor:
+      features, _ = self.forward(obs)
+      return features
+
+   def forward_critic(self, obs: torch.Tensor) -> torch.Tensor:
+      _, features = self.forward(obs)
+      return features
+
+
+# ---------------------------------------------------------------------------
+# BC training
 # ---------------------------------------------------------------------------
 
 def train_bc(
-    dataset:    dict,
-    save_path:  str,
-    epochs:     int   = 20,
-    batch_size: int   = 256,
-    lr:         float = 1e-3,   # increased from 3e-4 — plateau suggests lr was too low
-    device:     str   = "cpu",
+   dataset:    dict,
+   save_path:  str,
+   epochs:     int   = 30,
+   batch_size: int   = 256,
+   lr:         float = 1e-3,
+   device:     str   = "cpu",
 ) -> tuple:
-    """
-    train a BCPolicy and GoalEncoder on (obs, action) pairs via MSE.
+   """
+   train a BicameralNetwork and GoalEncoder on (obs, action) pairs via MSE.
 
-    the dataset must already have goal encodings baked into the observations
-    (done by collect_demonstrations sampling from TASK_POOL and calling
-    get_embedding + GoalEncoder before storing each obs).
+   loss breakdown:
+      grip loss:  MSE on action[:, 2]  — whether to grip
+      dxy loss:   MSE on action[:, 0:2] — cursor movement
 
-    improvements over wave 1:
-        - higher default lr (1e-3 vs 3e-4)
-        - cosine annealing lr schedule — avoids plateau by decaying smoothly
-        - gradient clipping (max_norm=1.0) — stabilises training
-        - per-output loss breakdown — shows whether selector or dx/dy is the issue
+   returns:
+      (BicameralNetwork, GoalEncoder) — both on cpu, eval mode.
+   """
+   obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
+   act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
 
-    returns:
-        (BCPolicy, GoalEncoder) — both trained, moved to cpu for saving.
-    """
-    obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
-    act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
+   network      = BicameralNetwork().to(device)
+   goal_encoder = GoalEncoder().to(device)
 
-    policy       = BCPolicy().to(device)
-    goal_encoder = GoalEncoder().to(device)
+   optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max=epochs, eta_min=1e-5)
+   loss_fn = nn.MSELoss(reduction="none")
 
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-5
-    )
-    loss_fn   = nn.MSELoss(reduction="none")
+   loader = DataLoader(
+      TensorDataset(obs_t, act_t),
+      batch_size=batch_size,
+      shuffle=True,
+   )
 
-    loader = DataLoader(
-        TensorDataset(obs_t, act_t),
-        batch_size=batch_size,
-        shuffle=True,
-    )
+   print(f"\n--- behavior cloning (bicameral network) ---")
+   print(f"  obs dim     : {obs_t.shape[1]}  (left={LEFT_STREAM_DIM} right={RIGHT_STREAM_DIM})")
+   print(f"  action dim  : {act_t.shape[1]}  [dx, dy, grip]")
+   print(f"  samples     : {len(obs_t):,}")
+   print(f"  epochs      : {epochs}")
+   print(f"  batch size  : {batch_size}")
+   print(f"  lr          : {lr} (cosine decay to 1e-5)")
+   print(f"  device      : {device}\n")
 
-    obs_dim    = obs_t.shape[1]
-    action_dim = act_t.shape[1]
+   for epoch in range(1, epochs + 1):
+      epoch_loss      = 0.0
+      epoch_loss_grip = 0.0
+      epoch_loss_dxy  = 0.0
+      n_batches       = 0
 
-    print(f"\n--- behavior cloning ---")
-    print(f"  obs dim    : {obs_dim}")
-    print(f"  action dim : {action_dim}")
-    print(f"  samples    : {len(obs_t):,}")
-    print(f"  epochs     : {epochs}")
-    print(f"  batch size : {batch_size}")
-    print(f"  lr         : {lr} (cosine decay to 1e-5)")
-    print(f"  device     : {device}\n")
+      for obs_batch, act_batch in loader:
+         pred       = network(obs_batch)
+         per_output = loss_fn(pred, act_batch)   # (batch, 3)
+         loss       = per_output.mean()
 
-    for epoch in range(1, epochs + 1):
-        epoch_loss      = 0.0
-        epoch_loss_sel  = 0.0   # shape selector component
-        epoch_loss_dxy  = 0.0   # dx, dy components
-        n_batches       = 0
+         optimizer.zero_grad()
+         loss.backward()
+         torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
+         optimizer.step()
 
-        for obs_batch, act_batch in loader:
-            pred       = policy(obs_batch)
-            # per-output losses for diagnostics
-            per_output = loss_fn(pred, act_batch)   # (batch, 3)
-            loss       = per_output.mean()
+         epoch_loss      += loss.item()
+         epoch_loss_grip += per_output[:, 2].mean().item()   # grip
+         epoch_loss_dxy  += per_output[:, 0:2].mean().item() # dx, dy
+         n_batches       += 1
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-            optimizer.step()
+      scheduler.step()
 
-            epoch_loss     += loss.item()
-            epoch_loss_sel += per_output[:, 0].mean().item()   # selector
-            epoch_loss_dxy += per_output[:, 1:].mean().item()  # dx, dy
-            n_batches      += 1
+      avg_loss      = epoch_loss      / max(n_batches, 1)
+      avg_grip_loss = epoch_loss_grip / max(n_batches, 1)
+      avg_dxy_loss  = epoch_loss_dxy  / max(n_batches, 1)
+      cur_lr        = scheduler.get_last_lr()[0]
 
-        scheduler.step()
+      if epoch % max(epochs // 5, 1) == 0 or epoch == 1:
+         print(f"  epoch {epoch:3d}/{epochs} | "
+               f"loss: {avg_loss:.4f}  "
+               f"(grip: {avg_grip_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
+               f"lr: {cur_lr:.2e}")
 
-        avg_loss     = epoch_loss     / max(n_batches, 1)
-        avg_sel_loss = epoch_loss_sel / max(n_batches, 1)
-        avg_dxy_loss = epoch_loss_dxy / max(n_batches, 1)
-        cur_lr       = scheduler.get_last_lr()[0]
+   os.makedirs(save_path, exist_ok=True)
+   weights_path = os.path.join(save_path, "bc_weights.pt")
+   encoder_path = os.path.join(save_path, "goal_encoder.pt")
+   torch.save(network.state_dict(),      weights_path)
+   torch.save(goal_encoder.state_dict(), encoder_path)
+   print(f"\n  bicameral weights saved to  {weights_path}")
+   print(f"  goal encoder saved to       {encoder_path}")
 
-        if epoch % max(epochs // 5, 1) == 0 or epoch == 1:
-            print(f"  epoch {epoch:3d}/{epochs} | "
-                  f"loss: {avg_loss:.6f}  "
-                  f"(selector: {avg_sel_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
-                  f"lr: {cur_lr:.2e}")
-
-    os.makedirs(save_path, exist_ok=True)
-    weights_path = os.path.join(save_path, "bc_weights.pt")
-    encoder_path = os.path.join(save_path, "goal_encoder.pt")
-    torch.save(policy.state_dict(),       weights_path)
-    torch.save(goal_encoder.state_dict(), encoder_path)
-    print(f"\n  BC weights saved to      {weights_path}")
-    print(f"  goal encoder saved to    {encoder_path}")
-    print(f"  watch selector loss — if it stays high (>0.2) the policy")
-    print(f"  is averaging over shape choices, which causes single-shape collapse.")
-
-    return policy.cpu(), goal_encoder.cpu()
+   return network.cpu(), goal_encoder.cpu()
 
 
 # ---------------------------------------------------------------------------
-# Weight transplant: BC -> SB3 PPO (same stage)
+# PPO from BC weights
 # ---------------------------------------------------------------------------
 
-def build_ppo_from_bc(bc_policy: BCPolicy, n_shapes: int,
-                      vec_env=None, goal: dict = None) -> PPO:
-    """
-    create a fresh SB3 PPO model and copy BC weights into its actor network.
-    uses POLICY_HIDDEN_SIZE from config for hidden layer dimensions.
-    """
-    if goal is None:
-        goal = {"task": "arrange_in_sequence", "axis": "x",
-                "direction": "ascending", "attribute": "size",
-                "region": "none", "bounded": False}
+def build_ppo_from_bc(bc_network: BicameralNetwork,
+                      n_shapes: int,
+                      vec_env=None,
+                      goal: dict = None) -> PPO:
+   """
+   create a PPO model using BicameralPolicy and copy BC network weights in.
 
-    env = vec_env if vec_env is not None else Monitor(
-        ShapeEnv(n_shapes=n_shapes, goal=goal))
+   because BicameralPolicy uses a custom mlp_extractor, the weight copy
+   targets _BicameralExtractor.net (which is a BicameralNetwork instance)
+   rather than SB3's default policy_net layers.
+   """
+   if goal is None:
+      goal = {
+         "task": "arrange_in_sequence", "axis": "x",
+         "direction": "ascending", "attribute": "size",
+         "region": "none", "bounded": False,
+      }
 
-    model = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=3e-5,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.005,
-        verbose=0,
-        tensorboard_log="./logs/tensorboard/",
-        policy_kwargs=dict(
-            net_arch=[POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE]
-        ),
-    )
+   env = vec_env if vec_env is not None else Monitor(
+      ShapeEnv(n_shapes=n_shapes, goal=goal))
 
-    try:
-        sb3_pi = model.policy.mlp_extractor.policy_net
-        bc_net = bc_policy.net
+   model = PPO(
+      BicameralPolicy,
+      env,
+      learning_rate=3e-5,
+      n_steps=2048,
+      batch_size=128,
+      n_epochs=10,
+      gamma=0.99,
+      gae_lambda=0.95,
+      clip_range=0.2,
+      ent_coef=0.005,
+      verbose=0,
+      tensorboard_log="./logs/tensorboard/",
+   )
 
-        with torch.no_grad():
-            sb3_pi[0].weight.copy_(bc_net[0].weight)
-            sb3_pi[0].bias.copy_(bc_net[0].bias)
-            sb3_pi[2].weight.copy_(bc_net[2].weight)
-            sb3_pi[2].bias.copy_(bc_net[2].bias)
-            model.policy.action_net.weight.copy_(bc_net[4].weight)
-            model.policy.action_net.bias.copy_(bc_net[4].bias)
+   try:
+      target_net = model.policy.mlp_extractor.net
+      with torch.no_grad():
+         target_net.load_state_dict(bc_network.state_dict())
+      print("  bicameral BC weights transplanted into PPO policy.")
+   except Exception as e:
+      print(f"  weight transplant failed ({e}) — PPO starts from random init.")
 
-        print("  BC weights transplanted into PPO policy.")
-    except Exception as e:
-        print(f"  weight transplant failed ({e}) -- PPO starts from random init.")
-
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Weight transplant: previous stage PPO -> new stage PPO (cross-stage)
-# ---------------------------------------------------------------------------
-
-def transplant_across_stages(prev_model_path: str, new_model: PPO,
-                              prev_obs_dim: int) -> PPO:
-    """
-    Copy weights from a smaller-obs-space PPO model into a larger one.
-
-    The hidden layers (64->64) and action head are obs-size-independent so
-    they transfer directly. The input layer grows because the new stage has
-    more shapes, so we:
-      - copy the old input weights into the first prev_obs_dim columns
-      - leave the remaining columns (new shape features) as small random values
-
-    This preserves everything the previous stage learned about existing shapes
-    while giving the policy fresh capacity for the new shape's features.
-
-    Args:
-        prev_model_path: path to the stage N model .zip (without extension)
-        new_model:       freshly created PPO model for stage N+1
-        prev_obs_dim:    obs space size of the stage N model
-    """
-    from stable_baselines3 import PPO as PPO_
-
-    try:
-        prev = PPO_.load(prev_model_path)
-    except Exception as e:
-        print(f"  cross-stage transplant: could not load {prev_model_path} ({e})")
-        print("  starting stage from random init instead.")
-        return new_model
-
-    prev_pi = prev.policy.mlp_extractor.policy_net
-    new_pi  = new_model.policy.mlp_extractor.policy_net
-
-    with torch.no_grad():
-        # input layer: partial copy into first prev_obs_dim columns
-        new_in_w = new_pi[0].weight.clone()
-        new_in_w[:, :prev_obs_dim] = prev_pi[0].weight[:, :prev_obs_dim]
-        # scale new columns small so they don't dominate on first forward pass
-        nn.init.normal_(new_in_w[:, prev_obs_dim:], mean=0.0, std=0.01)
-        new_pi[0].weight.copy_(new_in_w)
-        new_pi[0].bias.copy_(prev_pi[0].bias)
-
-        # hidden layer: full copy
-        new_pi[2].weight.copy_(prev_pi[2].weight)
-        new_pi[2].bias.copy_(prev_pi[2].bias)
-
-        # action head: full copy
-        new_model.policy.action_net.weight.copy_(
-            prev.policy.action_net.weight)
-        new_model.policy.action_net.bias.copy_(
-            prev.policy.action_net.bias)
-
-    print(f"  cross-stage transplant: copied weights from {prev_model_path}")
-    print(f"  input layer: {prev_obs_dim} cols preserved, "
-          f"{new_pi[0].weight.shape[1] - prev_obs_dim} new cols initialised small.")
-    return new_model
+   return model
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="train shape agent via behavior cloning from the oracle"
-    )
-    parser.add_argument("--prompt", type=str,
-        default="sort the shapes from smallest to largest left to right")
-    parser.add_argument("--episodes",      type=int,   default=500)
-    parser.add_argument("--epochs",        type=int,   default=20)
-    parser.add_argument("--n-shapes",      type=int,   default=2)
-    parser.add_argument("--save",          type=str,   default="./models/bc_agent")
-    parser.add_argument("--finetune",      action="store_true")
-    parser.add_argument("--finetune-steps",type=int,   default=100_000)
-    parser.add_argument("--noise",         type=float, default=0.05)
-    args = parser.parse_args()
-
-    print(f"\n--- parsing goal ---")
-    print(f"prompt : \"{args.prompt}\"")
-    goal = parse_goal(args.prompt)
-    print(f"goal   : {goal}\n")
-
-    print(f"--- collecting {args.episodes} oracle demonstrations ---")
-    dataset = collect_demonstrations(
-        goal=goal, n_episodes=args.episodes,
-        n_shapes=args.n_shapes, noise_std=args.noise, verbose=True,
-    )
-
-    device    = "cuda" if torch.cuda.is_available() else "cpu"
-    bc_policy = train_bc(goal=goal, dataset=dataset, save_path=args.save,
-                         epochs=args.epochs, device=device)
-
-    print("\n--- building SB3 PPO model from BC weights ---")
-    # No vec_env here — standalone CLI uses single env
-    model = build_ppo_from_bc(goal, bc_policy, args.n_shapes)
-
-    bc_model_path = os.path.join(args.save, "bc_model")
-    model.save(bc_model_path)
-    print(f"  BC model saved to {bc_model_path}")
-
-    if args.finetune:
-        from train import make_env
-        print(f"\n--- fine-tuning with PPO for {args.finetune_steps:,} steps ---")
-        vec_env = make_vec_env(make_env(goal), n_envs=4)
-        # Use PPO.load with env instead of set_env to avoid n_envs mismatch
-        model = PPO.load(bc_model_path, env=vec_env)
-        model.learn(total_timesteps=args.finetune_steps)
-        ft_path = os.path.join(args.save, "bc_finetuned_model")
-        model.save(ft_path)
-        print(f"  Fine-tuned model saved to {ft_path}")
-
-    print("\n--- done ---")
-    print(f"Load with:  from stable_baselines3 import PPO; PPO.load('{bc_model_path}')")
-
-
 if __name__ == "__main__":
-    main()
+   import argparse
+   from oracle import collect_demonstrations
+
+   parser = argparse.ArgumentParser(
+      description="train shape agent via behavior cloning from the oracle"
+   )
+   parser.add_argument("--episodes",  type=int,   default=500)
+   parser.add_argument("--epochs",    type=int,   default=30)
+   parser.add_argument("--save",      type=str,   default="./models/bc_agent")
+   parser.add_argument("--noise",     type=float, default=0.06)
+   parser.add_argument("--force",     action="store_true",
+                       help="force re-collection of oracle demos")
+   args = parser.parse_args()
+
+   dataset = collect_demonstrations(
+      n_episodes=args.episodes,
+      noise_std=args.noise,
+      verbose=True,
+      force=args.force,
+   )
+
+   device  = "cuda" if torch.cuda.is_available() else "cpu"
+   network, goal_encoder = train_bc(
+      dataset=dataset,
+      save_path=args.save,
+      epochs=args.epochs,
+      device=device,
+   )
+   print("\n--- done ---")

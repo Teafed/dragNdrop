@@ -1,34 +1,41 @@
 """
 shape_env.py
 
-Gymnasium environment for 2D shape manipulation via relative nudges.
+gymnasium environment for 2D shape manipulation via a cursor.
 
 --- action space ---
-    [shape_selector, dx, dy]
-    shape_selector in [-1, 1] -> mapped to a shape index
-    dx, dy         in [-1, 1] -> scaled by MAX_NUDGE pixels per step
+   [dx, dy, grip]  all in [-1, 1]
+   dx, dy:  cursor movement, scaled by CURSOR_SPEED pixels per step
+   grip:    > GRIP_THRESHOLD -> holding = True
 
---- observation space ---
-    per shape (up to MAX_SHAPES, zero-padded): x, y, size, color, shape_type
-    goal encoding: GOAL_ENCODING_DIM values from GoalEncoder MLP
-    action history: last_shape_idx, steps_on_shape, last_dx, last_dy
-    total: MAX_SHAPES*5 + 64 + 4 = 98
+--- observation space (108-dim) ---
+   [0-3]    cursor state: cx_norm, cy_norm, holding, grabbed_idx_norm
+   [4-8]    grabbed shape features (zeros if nothing grabbed)
+   [9-13]   nearest non-grabbed shape features (zeros if no shapes)
+   [14-43]  all shapes zero-padded (MAX_SHAPES * OBS_VALUES_PER_SHAPE)
+   [44-107] goal encoding (GOAL_ENCODING_DIM)
 
---- wave 3 tasks (2x2x2 cube) ---
-    arrange_in_sequence  one target space, unbounded, ordered by attribute
-    arrange_in_line      one target space, bounded (actual line), ordered or unordered
-    arrange_in_region    one target space, bounded (canvas subregion), unordered
-    arrange_in_groups    many target spaces (one per attribute value), bounded, unordered
+   left stream  (cursor-local):  indices  0-43  (44 values)
+   right stream (scene-global):  indices 14-107 (94 values)
+
+--- tasks ---
+   starter:
+      reach        move cursor within GRIP_RADIUS of target shape
+      touch        activate grip while overlapping target shape
+      drag         grip shape and move into a target region
+
+   wave 3 (2x2x2 cube):
+      arrange_in_sequence  one target space, unbounded, ordered by attribute
+      arrange_in_line      one target space, bounded, ordered or unordered
+      arrange_in_region    one target space, bounded, unordered
+      arrange_in_groups    many target spaces, bounded, unordered
 
 --- reward design ---
-    1. task score delta        - improvement in per-task score function
-    2. rank/cohesion delta     - secondary signal (same as score for most tasks)
-    3. oscillation penalty     - discourages score going up then immediately down
-    4. wall penalty            - discourages pushing into canvas borders
-    5. inactivity penalty      - discourages zero-nudge actions
-    6. neglect penalty         - escalating penalty for ignoring shapes too long
-    7. fixation penalty        - discourages moving only one shape all episode
-    8. completion bonus        - large reward when all shapes satisfy task
+   1. task score delta        improvement in per-task score function
+   2. oscillation penalty     discourages score going up then immediately down
+   3. wall penalty            discourages cursor pushing against canvas border
+   4. inactivity penalty      discourages zero-movement actions
+   5. completion bonus        large reward when task is solved
 """
 
 import numpy as np
@@ -37,9 +44,10 @@ from gymnasium import spaces
 import pygame
 
 from config import (
-   MAX_SHAPES, OBS_VALUES_PER_SHAPE, ACTION_HISTORY_SIZE,
-   GOAL_ENCODING_DIM, get_obs_size,
+   MAX_SHAPES, OBS_VALUES_PER_SHAPE, GOAL_ENCODING_DIM, get_obs_size,
    SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
+   CURSOR_SPEED, GRIP_THRESHOLD, GRIP_RADIUS,
+   CURSOR_STATE_SIZE, FOCAL_SHAPE_SIZE,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,27 +59,22 @@ WINDOW_H     = 600
 SHAPE_RADIUS = 20
 FPS          = 60
 MAX_STEPS    = 500
-MAX_NUDGE    = 25
 MARGIN       = SHAPE_RADIUS * 2
 
-SCORE_SOLVE_THRESHOLD = 0.85   # episode solved when score >= this
-SOLVE_TOLERANCE       = 60     # pixels (kept for legacy; unused in wave 3)
-
-STEP_PENALTY     = -0.02
-COMPLETION_BONUS = 25.0
-
-MOVEMENT_THRESHOLD = 0.5    # pixels — below this = not moving
-NEGLECT_PATIENCE   = 10     # steps before neglect penalty fires
+SCORE_SOLVE_THRESHOLD = 0.85
+STEP_PENALTY          = -0.02
+COMPLETION_BONUS      = 25.0
+MOVEMENT_THRESHOLD    = 0.5   # pixels — below this cursor = not moving
 
 COLORS = {
-   "red":    (220,  60,  60),
-   "green":  ( 60, 180,  60),
-   "blue":   ( 60, 100, 220),
-   "yellow": (220, 200,  50),
-   "purple": (160,  60, 200),
+   "red":    (173,  46,  52),
+   "green":  ( 78,  99,  30),
+   "teal":   ( 87, 220, 215),
+   "yellow": (199, 227,  54),
+   "purple": (155,  90, 195),
 }
-COLOR_NAMES  = list(COLORS.keys())
-BG_COLOR     = (30, 30, 35)
+COLOR_NAMES = list(COLORS.keys())
+BG_COLOR    = (30, 30, 30)
 
 # region boundaries (fraction of canvas) — shared by env score and oracle
 REGION_INNER = {
@@ -81,16 +84,24 @@ REGION_INNER = {
    "bottom": WINDOW_H * 0.65,
 }
 
-# perpendicular spread threshold for arrange_in_line (solve condition)
-LINE_SPREAD_THRESHOLD = 80   # pixels — max allowed spread on perpendicular axis
+LINE_SPREAD_THRESHOLD = 120  # pixels — max allowed perpendicular spread
 
-# supported tasks — matches config.SUPPORTED_TASKS
 SUPPORTED_TASKS = [
+   "reach",
+   "touch",
+   "drag",
    "arrange_in_sequence",
    "arrange_in_line",
    "arrange_in_region",
    "arrange_in_groups",
 ]
+
+# cursor crosshair dimensions
+_CURSOR_RADIUS   = 3    # circle radius (pixels)
+_CURSOR_GAP      = 4    # gap between circle edge and crosshair line start
+_CURSOR_ARM      = 8    # crosshair arm length (pixels)
+_CURSOR_COLOR    = (220, 220, 220)
+_CURSOR_COLOR_ON = (220, 220, 220)   # same color — grip shown by fill only
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +155,7 @@ class Shape:
 
 class ShapeEnv(gym.Env):
    """
-   Gymnasium environment for 2D shape manipulation.
+   gymnasium environment for 2D shape manipulation via a cursor.
    accepts a goal dict produced by llm_goal_parser.parse_goal().
    """
 
@@ -179,19 +190,22 @@ class ShapeEnv(gym.Env):
       self.action_space = spaces.Box(
          low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
-      self.shapes            = []
-      self.steps             = 0
-      self.last_shape_idx    = -1
-      self.steps_on_shape    = 0
-      self.last_action_dx    = 0.0
-      self.last_action_dy    = 0.0
-      self.steps_since_moved = []
-      self.prev_score        = 0.0
-      self.prev_score_delta  = 0.0
-      self.prev_rank_corr    = 0.0
-      self.window            = None
-      self.clock             = None
-      self.font              = None
+      # cursor state
+      self.cx          = float(WINDOW_W / 2)
+      self.cy          = float(WINDOW_H / 2)
+      self.holding     = False
+      self.grabbed_idx = -1   # index into self.shapes, -1 = nothing grabbed
+
+      # episode state
+      self.shapes           = []
+      self.steps            = 0
+      self.prev_score       = 0.0
+      self.prev_score_delta = 0.0
+      self.prev_rank_corr   = 0.0
+      self.target_idx       = 0   # index of target shape for reach/touch/drag
+      self.window           = None
+      self.clock            = None
+      self.font             = None
 
    # -------------------------------------------------------------------------
    # gymnasium interface
@@ -205,90 +219,90 @@ class ShapeEnv(gym.Env):
       else:
          self.n_shapes = self._fixed_n_shapes
 
-      self.steps             = 0
-      self.last_shape_idx    = -1
-      self.steps_on_shape    = 0
-      self.last_action_dx    = 0.0
-      self.last_action_dy    = 0.0
-      self.shapes            = self._spawn_shapes()
-      self.steps_since_moved = [0] * self.n_shapes
-      self.prev_score        = self._compute_task_score()
-      self.prev_score_delta  = 0.0
-      self.prev_rank_corr    = self._compute_rank_corr()
+      # cursor starts at center each episode
+      self.cx          = float(WINDOW_W / 2)
+      self.cy          = float(WINDOW_H / 2)
+      self.holding     = False
+      self.grabbed_idx = -1
+
+      self.steps            = 0
+      self.prev_score_delta = 0.0
+      self.shapes           = self._spawn_shapes()
+      self.target_idx       = self._pick_target_idx()
+      self.prev_score       = self._compute_task_score()
+      self.prev_rank_corr   = self._compute_rank_corr()
+
       return self._get_obs(), {}
 
    def step(self, action):
       self.steps += 1
 
-      raw_idx   = float(action[0])
-      shape_idx = int(np.clip(
-         round((raw_idx + 1.0) / 2.0 * (self.n_shapes - 1)),
-         0, self.n_shapes - 1
-      ))
+      dx_raw   = float(action[0])
+      dy_raw   = float(action[1])
+      grip_raw = float(action[2])
 
-      s     = self.shapes[shape_idx]
-      pre_x = s.x
-      pre_y = s.y
+      # --- move cursor ---
+      new_cx = float(np.clip(
+         self.cx + dx_raw * CURSOR_SPEED, MARGIN, WINDOW_W - MARGIN))
+      new_cy = float(np.clip(
+         self.cy + dy_raw * CURSOR_SPEED, MARGIN, WINDOW_H - MARGIN))
+      cursor_moved = np.sqrt(
+         (new_cx - self.cx) ** 2 + (new_cy - self.cy) ** 2)
+      self.cx = new_cx
+      self.cy = new_cy
 
-      dx  = float(action[1]) * MAX_NUDGE
-      dy  = float(action[2]) * MAX_NUDGE
-      s.x = float(np.clip(s.x + dx, MARGIN, WINDOW_W - MARGIN))
-      s.y = float(np.clip(s.y + dy, MARGIN, WINDOW_H - MARGIN))
+      # --- grip logic ---
+      new_holding = grip_raw > GRIP_THRESHOLD
 
-      actual_move   = np.sqrt((s.x - pre_x) ** 2 + (s.y - pre_y) ** 2)
-      intended_move = np.sqrt(dx ** 2 + dy ** 2)
+      if new_holding and not self.holding:
+         # grip just activated — try to attach to a shape
+         self.grabbed_idx = self._try_grab()
 
-      # 1. task score delta
+      elif not new_holding:
+         # grip released
+         self.grabbed_idx = -1
+
+      self.holding = new_holding
+
+      # --- drag grabbed shape ---
+      if self.holding and self.grabbed_idx >= 0:
+         s   = self.shapes[self.grabbed_idx]
+         s.x = float(np.clip(self.cx, MARGIN, WINDOW_W - MARGIN))
+         s.y = float(np.clip(self.cy, MARGIN, WINDOW_H - MARGIN))
+
+      # --- wall penalty: cursor tried to move but hit the margin ---
+      intended_move = np.sqrt(
+         (dx_raw * CURSOR_SPEED) ** 2 + (dy_raw * CURSOR_SPEED) ** 2)
+      wall_penalty = (
+         -0.05 if intended_move > 5.0 and cursor_moved < intended_move * 0.25
+         else 0.0)
+
+      # --- inactivity penalty ---
+      inactivity_penalty = (
+         -0.04 if cursor_moved < MOVEMENT_THRESHOLD else 0.0)
+
+      # --- task score delta ---
       new_score    = self._compute_task_score()
       score_delta  = new_score - self.prev_score
       score_reward = score_delta * 10.0
 
-      # 2. rank / cohesion delta
+      # --- rank / cohesion delta ---
       new_rank_corr = self._compute_rank_corr()
       rank_delta    = new_rank_corr - self.prev_rank_corr
       rank_reward   = rank_delta * 2.0
 
-      # 3. oscillation penalty
+      # --- oscillation penalty ---
       oscillation_penalty = (
-         -0.06 if self.prev_score_delta > 0.01 and score_delta < -0.01 else 0.0)
-
-      # 4. wall penalty
-      wall_penalty = (
-         -0.05 if intended_move > 5.0 and actual_move < intended_move * 0.25
+         -0.06 if self.prev_score_delta > 0.01 and score_delta < -0.01
          else 0.0)
 
-      # 5. inactivity penalty
-      inactivity_penalty = -0.04 if actual_move < MOVEMENT_THRESHOLD else 0.0
-
-      # 6. neglect penalty — escalates linearly with overdue steps
-      neglect_penalty = 0.0
-      for i in range(self.n_shapes):
-         if i != shape_idx and self.steps_since_moved[i] > NEGLECT_PATIENCE:
-            overdue = self.steps_since_moved[i] - NEGLECT_PATIENCE
-            neglect_penalty -= min(0.005 * overdue, 0.02)
-
-      # 7. fixation penalty — discourages single-shape collapse
-      fixation_penalty = (
-         -0.005 * min(self.steps_on_shape - 20, 20)
-         if self.steps_on_shape > 20 else 0.0)
-
       # bookkeeping
-      for i in range(self.n_shapes):
-         self.steps_since_moved[i] = (
-            0 if i == shape_idx else self.steps_since_moved[i] + 1)
-      self.steps_on_shape   = (
-         self.steps_on_shape + 1 if shape_idx == self.last_shape_idx else 1)
-      self.last_shape_idx   = shape_idx
-      self.last_action_dx   = float(action[1])
-      self.last_action_dy   = float(action[2])
       self.prev_score_delta = score_delta
       self.prev_score       = new_score
       self.prev_rank_corr   = new_rank_corr
 
       reward = (score_reward + rank_reward + oscillation_penalty
-                + wall_penalty + inactivity_penalty
-                + neglect_penalty + fixation_penalty
-                + STEP_PENALTY)
+                + wall_penalty + inactivity_penalty + STEP_PENALTY)
 
       terminated = self._is_solved()
       if terminated:
@@ -319,6 +333,38 @@ class ShapeEnv(gym.Env):
          self.window = None
 
    # -------------------------------------------------------------------------
+   # cursor helpers
+   # -------------------------------------------------------------------------
+
+   def _try_grab(self) -> int:
+      """
+      attempt to grab the closest shape within GRIP_RADIUS of the cursor.
+      returns the shape index if found, else -1.
+      if multiple shapes overlap, picks the closest (approximates topmost).
+      """
+      best_idx  = -1
+      best_dist = float("inf")
+      for i, s in enumerate(self.shapes):
+         dist = np.sqrt((self.cx - s.x) ** 2 + (self.cy - s.y) ** 2)
+         if dist <= GRIP_RADIUS and dist < best_dist:
+            best_dist = dist
+            best_idx  = i
+      return best_idx
+
+   def _nearest_non_grabbed(self) -> int:
+      """return index of nearest shape that isn't currently grabbed, or -1."""
+      best_idx  = -1
+      best_dist = float("inf")
+      for i, s in enumerate(self.shapes):
+         if i == self.grabbed_idx:
+            continue
+         dist = np.sqrt((self.cx - s.x) ** 2 + (self.cy - s.y) ** 2)
+         if dist < best_dist:
+            best_dist = dist
+            best_idx  = i
+      return best_idx
+
+   # -------------------------------------------------------------------------
    # spawn
    # -------------------------------------------------------------------------
 
@@ -326,32 +372,47 @@ class ShapeEnv(gym.Env):
       rng       = self.np_random
       task      = self.goal.get("task", "arrange_in_sequence")
       attribute = self.goal.get("attribute", "none")
+      tc        = self.goal.get("target_color", "none")
+      tt        = self.goal.get("target_type",  "none")
 
-      # color assignment — for group tasks guarantee at least one repeated color
       color_indices = rng.integers(0, len(COLOR_NAMES), size=self.n_shapes)
       if task == "arrange_in_groups" and attribute == "color" and self.n_shapes >= 2:
-         if len(set(color_indices)) == self.n_shapes:
+         if len(set(color_indices.tolist())) == self.n_shapes:
             color_indices[1] = color_indices[0]
 
-      # shape type assignment — for group tasks guarantee at least one repeated type
       type_indices = rng.integers(0, N_SHAPE_TYPES, size=self.n_shapes)
       if task == "arrange_in_groups" and attribute == "shape_type" and self.n_shapes >= 2:
-         if len(set(type_indices)) == self.n_shapes:
+         if len(set(type_indices.tolist())) == self.n_shapes:
             type_indices[1] = type_indices[0]
-      elif self.n_shapes >= 2 and len(set(type_indices)) < 2:
-         # always at least 2 distinct shape types for visual variety
-         type_indices[1] = (type_indices[0] + 1) % N_SHAPE_TYPES
+      elif self.n_shapes >= 2 and len(set(type_indices.tolist())) < 2:
+         type_indices[1] = (int(type_indices[0]) + 1) % N_SHAPE_TYPES
+
+      # for starter tasks with a specific target: force shapes[0] to match,
+      # then ensure no other shape accidentally also matches (keeps the target
+      # unambiguous and avoids spawning a canvas full of red squares)
+      if task in ("reach", "touch", "drag"):
+         if tc not in ("none", "any"):
+            target_color_idx = COLOR_NAMES.index(tc)
+            color_indices[0] = target_color_idx
+            for i in range(1, self.n_shapes):
+               while color_indices[i] == target_color_idx:
+                  color_indices[i] = rng.integers(0, len(COLOR_NAMES))
+         if tt not in ("none", "any"):
+            target_type_idx = SHAPE_TYPES.index(tt)
+            type_indices[0] = target_type_idx
+            for i in range(1, self.n_shapes):
+               while type_indices[i] == target_type_idx:
+                  type_indices[i] = rng.integers(0, N_SHAPE_TYPES)
 
       shapes = []
       for i in range(self.n_shapes):
-         x = float(rng.uniform(MARGIN, WINDOW_W - MARGIN))
-         y = float(rng.uniform(MARGIN, WINDOW_H - MARGIN))
+         x          = float(rng.uniform(MARGIN, WINDOW_W - MARGIN))
+         y          = float(rng.uniform(MARGIN, WINDOW_H - MARGIN))
          size       = float(rng.uniform(0.5, 2.0))
-         color_name = COLOR_NAMES[color_indices[i]]
-         shape_type = SHAPE_TYPES[type_indices[i]]
+         color_name = COLOR_NAMES[int(color_indices[i])]
+         shape_type = SHAPE_TYPES[int(type_indices[i])]
          shapes.append(Shape(i, x, y, size, color_name, shape_type))
 
-      # ensure spawn isn't already solved (can happen for group/region tasks)
       MAX_SPAWN_RETRIES = 10
       for _ in range(MAX_SPAWN_RETRIES):
          if not self._initial_score_solved(shapes):
@@ -363,24 +424,110 @@ class ShapeEnv(gym.Env):
       return shapes
 
    def _initial_score_solved(self, shapes) -> bool:
-      """temporarily swap self.shapes to reuse scoring without touching env state."""
       original    = self.shapes
       self.shapes = shapes
       solved      = self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
       self.shapes = original
       return solved
 
+   def _pick_target_idx(self) -> int:
+      """
+      for reach/touch/drag: find the index of the shape that best matches
+      target_color and target_type from the goal.
+
+      matching priority:
+        1. exact match on both color and type (if both specified)
+        2. match on the one specified field
+        3. any shape (fallback — covers "any" and "none")
+
+      always returns a valid index (0 if nothing else matches).
+      for non-starter tasks the value is unused but kept at 0.
+      """
+      task = self.goal.get("task", "none")
+      if task not in ("reach", "touch", "drag"):
+         return 0
+
+      tc = self.goal.get("target_color", "none")
+      tt = self.goal.get("target_type",  "none")
+
+      # "any" / "none" → just use the first shape
+      if tc in ("any", "none") and tt in ("any", "none"):
+         return 0
+
+      want_color = tc not in ("any", "none")
+      want_type  = tt not in ("any", "none")
+
+      for i, s in enumerate(self.shapes):
+         color_ok = (not want_color) or (s.color_name == tc)
+         type_ok  = (not want_type)  or (s.shape_type == tt)
+         if color_ok and type_ok:
+            return i
+
+      # shouldn't reach here if _spawn_shapes guaranteed a match, but fall back
+      return 0
+
    # -------------------------------------------------------------------------
-   # per-shape score functions
+   # obs and goal encoding
    # -------------------------------------------------------------------------
-   # each returns a value in [0, 1].
-   # the episode score is the mean of per-shape scores.
-   # _compute_task_score() is the single entry point used by step() and _is_solved().
+
+   def _get_obs(self) -> np.ndarray:
+      # [0-3] cursor state
+      grabbed_norm = (self.grabbed_idx / max(self.n_shapes - 1, 1)
+                      if self.grabbed_idx >= 0 else -1.0)
+      cursor_state = np.array([
+         self.cx / WINDOW_W * 2.0 - 1.0,   # -1 to 1
+         self.cy / WINDOW_H * 2.0 - 1.0,   # -1 to 1
+         1.0 if self.holding else 0.0,
+         float(grabbed_norm),
+      ], dtype=np.float32)
+
+      # [4-8] grabbed shape features (zeros if nothing grabbed)
+      if self.grabbed_idx >= 0:
+         grabbed_feats = self.shapes[self.grabbed_idx].as_obs()
+      else:
+         grabbed_feats = np.zeros(OBS_VALUES_PER_SHAPE, dtype=np.float32)
+
+      # [9-13] nearest non-grabbed shape features (zeros if no shapes)
+      nearest_idx = self._nearest_non_grabbed()
+      if nearest_idx >= 0:
+         nearest_feats = self.shapes[nearest_idx].as_obs()
+      else:
+         nearest_feats = np.zeros(OBS_VALUES_PER_SHAPE, dtype=np.float32)
+
+      # [14-43] all shapes zero-padded
+      active_obs = np.concatenate(
+         [self.shapes[i].as_obs() for i in range(self.n_shapes)])
+      n_padding  = MAX_SHAPES - self.n_shapes
+      padding    = np.zeros(n_padding * OBS_VALUES_PER_SHAPE, dtype=np.float32)
+      all_shapes = np.concatenate([active_obs, padding])
+
+      # [44-107] goal encoding
+      return np.concatenate([
+         cursor_state,
+         grabbed_feats,
+         nearest_feats,
+         all_shapes,
+         self._goal_encoding,
+      ]).astype(np.float32)
+
+   def set_goal_encoding(self, encoding: np.ndarray):
+      assert encoding.shape == (GOAL_ENCODING_DIM,), (
+         f"expected ({GOAL_ENCODING_DIM},), got {encoding.shape}")
+      self._goal_encoding = encoding.astype(np.float32)
+
+   # -------------------------------------------------------------------------
+   # score dispatch
+   # -------------------------------------------------------------------------
 
    def _compute_task_score(self) -> float:
-      """dispatch to the appropriate per-task score function."""
       task = self.goal.get("task", "arrange_in_sequence")
-      if task == "arrange_in_sequence":
+      if task == "reach":
+         return self._score_reach()
+      elif task == "touch":
+         return self._score_touch()
+      elif task == "drag":
+         return self._score_drag()
+      elif task == "arrange_in_sequence":
          return self._score_arrange_in_sequence()
       elif task == "arrange_in_line":
          return self._score_arrange_in_line()
@@ -390,20 +537,78 @@ class ShapeEnv(gym.Env):
          return self._score_arrange_in_groups()
       return 0.0
 
+   def _compute_rank_corr(self) -> float:
+      return self._compute_task_score()
+
+   def _compute_score(self) -> float:
+      return self._compute_task_score()
+
+   def _is_solved(self) -> bool:
+      return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+
+   # -------------------------------------------------------------------------
+   # starter task score functions
+   # -------------------------------------------------------------------------
+
+   def _score_reach(self) -> float:
+      """
+      score for reach: how close is the cursor to the target shape?
+
+      uses a short reference distance (half the canvas width) rather than
+      the full diagonal so the score stays well below IDLE_THRESHOLD until
+      the cursor is actually close. solved (score=1.0) when within GRIP_RADIUS.
+      """
+      if not self.shapes:
+         return 0.0
+      target = self.shapes[self.target_idx]
+      dist   = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      if dist <= GRIP_RADIUS:
+         return 1.0
+      # reference: half canvas width — cursor needs to be genuinely close
+      # before the score approaches the solve threshold
+      ref_dist  = WINDOW_W / 2.0
+      proximity = 1.0 - min(dist / ref_dist, 1.0)
+      # cap below IDLE_THRESHOLD (0.78) so the oracle never idles before
+      # the cursor actually enters GRIP_RADIUS and score jumps to 1.0
+      return float(min(proximity, 0.75))
+
+   def _score_touch(self) -> float:
+      """
+      score for touch: grip must be active while overlapping the target shape.
+      score = 0.5 * proximity + 0.5 * grip_on_target.
+      solved when holding and overlapping target.
+      """
+      if not self.shapes:
+         return 0.0
+      target   = self.shapes[self.target_idx]
+      dist     = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      max_dist = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
+      proximity = 1.0 - min(dist / max_dist, 1.0)
+      over_target = dist <= GRIP_RADIUS
+      grip_on     = float(self.holding and over_target)
+      if self.holding and over_target:
+         return 1.0
+      return float(0.5 * proximity + 0.5 * grip_on)
+
+   def _score_drag(self) -> float:
+      """
+      score for drag: grip target shape and move it into the target region.
+      reuses _per_shape_region_score for consistency with arrange_in_region.
+      solved when score >= SCORE_SOLVE_THRESHOLD.
+      """
+      if not self.shapes:
+         return 0.0
+      region = self.goal.get("region", "left")
+      return self._per_shape_region_score(self.shapes[self.target_idx], region)
+
+   # -------------------------------------------------------------------------
+   # wave 3 score functions
+   # -------------------------------------------------------------------------
+
    def _score_arrange_in_sequence(self) -> float:
       """
-      score for arrange_in_sequence: how well are shapes ordered by attribute
-      along the axis?
-
-      per-shape score = 1 - |current_rank - ideal_rank| / (n - 1)
-      episode score   = mean per-shape score.
-
-      1.0 = every shape in its ideal rank position.
-      0.5 = random permutation on average.
-      0.0 = perfectly reversed.
-
-      perpendicular axis is unconstrained — any y position is fine for
-      horizontal sorting, any x for vertical.
+      per-shape score = 1 - |current_rank - ideal_rank| / (n - 1).
+      episode score = mean per-shape score.
       """
       n         = self.n_shapes
       axis      = self.goal.get("axis", "x")
@@ -413,13 +618,11 @@ class ShapeEnv(gym.Env):
       if n <= 1:
          return 1.0
 
-      positions  = [s.x if axis == "x" else s.y for s in self.shapes]
-      attr_vals  = self._get_attribute_values(attribute)
-
-      ideal_ranks = np.argsort(np.argsort(attr_vals)).astype(float)
+      positions     = [s.x if axis == "x" else s.y for s in self.shapes]
+      attr_vals     = self._get_attribute_values(attribute)
+      ideal_ranks   = np.argsort(np.argsort(attr_vals)).astype(float)
       if direction == "descending":
          ideal_ranks = (n - 1) - ideal_ranks
-
       current_ranks = np.argsort(np.argsort(positions)).astype(float)
 
       per_shape = [
@@ -430,16 +633,7 @@ class ShapeEnv(gym.Env):
 
    def _score_arrange_in_line(self) -> float:
       """
-      score for arrange_in_line: shapes must lie along a line (bounded
-      perpendicular spread) and optionally be ordered by attribute.
-
-      two components:
-        - order score (0.6 weight): same as _score_arrange_in_sequence if
-          attribute is set, else 1.0 (evenly spaced, no ordering constraint)
-        - spread score (0.4 weight): how tightly are shapes aligned on the
-          perpendicular axis? 1.0 = all at the same perpendicular coordinate.
-
-      this rewards getting shapes into a line AND keeping them there.
+      order score (0.6) + perpendicular spread score (0.4).
       """
       n         = self.n_shapes
       axis      = self.goal.get("axis", "x")
@@ -448,62 +642,35 @@ class ShapeEnv(gym.Env):
       if n <= 1:
          return 1.0
 
-      # --- order component ---
       if attribute != "none":
          order_score = self._score_arrange_in_sequence()
       else:
-         # no ordering required — just check spacing is reasonably even
          positions = sorted(s.x if axis == "x" else s.y for s in self.shapes)
          gaps      = [positions[i+1] - positions[i] for i in range(n - 1)]
          if not gaps or max(gaps) == 0:
             order_score = 1.0
          else:
-            # coefficient of variation of gaps — 0 = perfectly even
-            cv = np.std(gaps) / (np.mean(gaps) + 1e-6)
+            cv          = np.std(gaps) / (np.mean(gaps) + 1e-6)
             order_score = max(0.0, 1.0 - cv)
 
-      # --- spread component (perpendicular axis) ---
-      perp_vals = [s.y if axis == "x" else s.x for s in self.shapes]
-      spread    = max(perp_vals) - min(perp_vals)
-      # normalize: spread of 0 = 1.0, spread of LINE_SPREAD_THRESHOLD = 0.0
+      perp_vals    = [s.y if axis == "x" else s.x for s in self.shapes]
+      spread       = max(perp_vals) - min(perp_vals)
       spread_score = max(0.0, 1.0 - spread / LINE_SPREAD_THRESHOLD)
 
       return 0.6 * order_score + 0.4 * spread_score
 
    def _score_arrange_in_region(self) -> float:
-      """
-      score for arrange_in_region: all shapes inside the target canvas subregion,
-      distributed across it (not just at the boundary).
-
-      per-shape score:
-        - 0.0   if on the wrong side of the region boundary
-        - scales from 0.0 to 1.0 as the shape moves from the boundary to
-          the far wall of the region
-
-      episode score = mean per-shape score.
-      threshold 0.85 requires most shapes to be well inside the region.
-      """
+      """mean per-shape region score."""
       region = self.goal.get("region", "left")
       scores = [self._per_shape_region_score(s, region) for s in self.shapes]
       return float(np.mean(scores))
 
    def _per_shape_region_score(self, s, region: str) -> float:
       """
-      per-shape score for arrange_in_region in [0, 1].
-
-      two components:
-        - in_region (0.7 weight): 1.0 if shape is inside the region, else 0.0.
-          crossing the boundary is the primary event.
-        - progress  (0.3 weight): smooth 0->1 gradient as shape approaches and
-          crosses the boundary. provides signal before crossing and rewards
-          depth after.
-
+      0.7 * in_region + 0.3 * progress toward the boundary.
       a shape just past the boundary scores ~0.7.
-      a shape well inside the region scores toward 1.0.
-      mean across all shapes >= 0.85 requires most shapes clearly inside.
       """
       boundary = REGION_INNER[region]
-
       if region == "left":
          inside   = s.x <= boundary
          progress = 1.0 - max(s.x - boundary, 0) / max(WINDOW_W - boundary, 1)
@@ -516,24 +683,31 @@ class ShapeEnv(gym.Env):
       else:   # bottom
          inside   = s.y >= boundary
          progress = 1.0 - max(boundary - s.y, 0) / max(boundary, 1)
-
       return 0.7 * float(inside) + 0.3 * float(np.clip(progress, 0.0, 1.0))
 
    def _score_arrange_in_groups(self) -> float:
       """
-      score for arrange_in_groups: shapes partitioned by attribute, each group
-      in its own subregion, groups separated from each other.
+      grouping score: 0.5 * global_ratio + 0.5 * nn_isolation.
 
-      per-shape score = 0.6 * nn_correct + 0.4 * separation_score
-        - nn_correct:       1.0 if nearest neighbor is same attribute, else 0.0
-        - separation_score: how far is the nearest different-attribute shape?
-                            normalized by half-diagonal. rewards well-separated groups.
+      global_ratio = inter_mean / (inter_mean + intra_mean)
+         smooth ratio of mean cross-group distance to mean total distance.
+         high when groups are far apart relative to their internal spread.
 
-      episode score = mean per-shape score.
+      nn_isolation = mean over shapes of:
+         min_diff_dist / (min_diff_dist + min_same_dist)
+         per-shape check that each shape's nearest neighbor is same-group.
+         singletons (no same-group peers) use nominal same_dist=1px so
+         they are scored purely on how far they sit from the nearest
+         different-group shape — correctly penalising a lone shape that
+         has wandered into another group's territory.
+
+      blending the two catches cases the other misses:
+         global_ratio alone: inflated when one distant outlier boosts
+            inter_mean while a singleton sits inside another group.
+         nn_isolation alone: misses global layout quality.
       """
       n         = self.n_shapes
       attribute = self.goal.get("attribute", "color")
-      half_diag = np.sqrt((WINDOW_W / 2) ** 2 + (WINDOW_H / 2) ** 2)
 
       if n <= 1:
          return 1.0
@@ -541,86 +715,59 @@ class ShapeEnv(gym.Env):
       def get_attr(s):
          return s.color_name if attribute == "color" else s.shape_type
 
+      def dist(a, b):
+         return float(np.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2))
+
+      # --- global ratio ---
+      intra_dists = []
+      inter_dists = []
+      for i in range(n):
+         for j in range(i + 1, n):
+            d = dist(self.shapes[i], self.shapes[j])
+            if get_attr(self.shapes[i]) == get_attr(self.shapes[j]):
+               intra_dists.append(d)
+            else:
+               inter_dists.append(d)
+
+      if not inter_dists:
+         return 1.0   # only one group — trivially solved
+
+      intra_mean   = float(np.mean(intra_dists)) if intra_dists else 1.0
+      inter_mean   = float(np.mean(inter_dists))
+      global_score = inter_mean / (inter_mean + intra_mean)
+
+      # --- per-shape nn isolation ---
       per_shape = []
       for i in range(n):
-         same_d = [
-            np.sqrt((self.shapes[i].x - self.shapes[j].x) ** 2 +
-                    (self.shapes[i].y - self.shapes[j].y) ** 2)
-            for j in range(n)
-            if i != j and get_attr(self.shapes[i]) == get_attr(self.shapes[j])
-         ]
-         diff_d = [
-            np.sqrt((self.shapes[i].x - self.shapes[j].x) ** 2 +
-                    (self.shapes[i].y - self.shapes[j].y) ** 2)
-            for j in range(n)
-            if i != j and get_attr(self.shapes[i]) != get_attr(self.shapes[j])
-         ]
-
-         # nn_correct: 1 if nearest neighbor is same attribute
-         if not same_d or not diff_d:
-            nn_correct = 1.0   # only one attribute value — trivially grouped
-         else:
-            nn_correct = 1.0 if min(same_d) < min(diff_d) else 0.0
-
-         # separation_score: how far is nearest different-attribute shape?
+         same_d = [dist(self.shapes[i], self.shapes[j])
+                   for j in range(n)
+                   if j != i and get_attr(self.shapes[j]) == get_attr(self.shapes[i])]
+         diff_d = [dist(self.shapes[i], self.shapes[j])
+                   for j in range(n)
+                   if j != i and get_attr(self.shapes[j]) != get_attr(self.shapes[i])]
          if not diff_d:
-            separation_score = 1.0
-         else:
-            separation_score = min(min(diff_d) / half_diag, 1.0)
+            per_shape.append(1.0)
+            continue
+         min_diff = min(diff_d)
+         min_same = min(same_d) if same_d else 1.0   # singleton: nominal 1px
+         per_shape.append(min_diff / (min_diff + min_same))
 
-         per_shape.append(0.6 * nn_correct + 0.4 * separation_score)
+      nn_score = float(np.mean(per_shape))
 
-      return float(np.mean(per_shape))
-
-   def _compute_rank_corr(self) -> float:
-      """secondary quality signal for tensorboard — mirrors task score for all tasks."""
-      return self._compute_task_score()
-
-   def _compute_score(self) -> float:
-      """alias for callbacks and debug."""
-      return self._compute_task_score()
-
-   def _is_solved(self) -> bool:
-      return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+      return 0.5 * global_score + 0.5 * nn_score
 
    # -------------------------------------------------------------------------
    # attribute helpers
    # -------------------------------------------------------------------------
 
    def _get_attribute_values(self, attribute: str) -> list:
-      """return the attribute value for each shape as a sortable float."""
       if attribute == "size":
          return [s.size for s in self.shapes]
       elif attribute == "color":
          return [COLOR_NAMES.index(s.color_name) for s in self.shapes]
       elif attribute == "shape_type":
          return [SHAPE_TYPE_IDX.get(s.shape_type, 0) for s in self.shapes]
-      else:
-         return list(range(self.n_shapes))   # no attribute — use index order
-
-   # -------------------------------------------------------------------------
-   # obs and goal encoding
-   # -------------------------------------------------------------------------
-
-   def _get_obs(self) -> np.ndarray:
-      active_obs = np.concatenate([self.shapes[i].as_obs()
-                                   for i in range(self.n_shapes)])
-      n_padding  = MAX_SHAPES - self.n_shapes
-      padding    = np.zeros(n_padding * OBS_VALUES_PER_SHAPE, dtype=np.float32)
-      history    = np.array([
-         self.last_shape_idx / max(self.n_shapes - 1, 1),
-         min(self.steps_on_shape / 10.0, 2.0),
-         self.last_action_dx,
-         self.last_action_dy,
-      ], dtype=np.float32)
-      return np.concatenate(
-         [active_obs, padding, self._goal_encoding, history]
-      ).astype(np.float32)
-
-   def set_goal_encoding(self, encoding: np.ndarray):
-      assert encoding.shape == (GOAL_ENCODING_DIM,), (
-         f"expected ({GOAL_ENCODING_DIM},), got {encoding.shape}")
-      self._goal_encoding = encoding.astype(np.float32)
+      return list(range(self.n_shapes))
 
    # -------------------------------------------------------------------------
    # rendering
@@ -642,20 +789,55 @@ class ShapeEnv(gym.Env):
       for shape in self.shapes:
          shape.draw(self.window, self.font)
 
-      score  = self._compute_score()
-      rank   = self._compute_rank_corr()
-      goal   = self.goal
-      task   = goal["task"]
-      hud = (f"task: {task} | attr: {goal['attribute']} | "
-             f"axis: {goal['axis']} | dir: {goal['direction']}   "
-             f"progress: {score:.2%}   rank/cohesion: {rank:+.2f}   "
-             f"step: {self.steps}")
-      self.window.blit(self.font.render(hud, True, (200, 200, 200)), (10, 10))
+      self._draw_cursor()
+
+      score = self._compute_score()
+      goal  = self.goal
+      task  = goal["task"]
+      hud   = (f"task: {task} | attr: {goal.get('attribute','none')} | "
+               f"axis: {goal.get('axis','none')} | "
+               f"region: {goal.get('region','none')}   "
+               f"progress: {score:.2%}   step: {self.steps}")
+      self.window.blit(
+         self.font.render(hud, True, (200, 200, 200)), (10, 10))
 
       if self.render_mode != "human":
          return np.transpose(
             pygame.surfarray.array3d(self.window), axes=(1, 0, 2))
       return None
+
+   def _draw_cursor(self):
+      """
+      draw cursor as a small circle with crosshairs.
+         |
+      - o -
+         |
+      circle is filled when grip is active, outline when not.
+      """
+      cx  = int(self.cx)
+      cy  = int(self.cy)
+      r   = _CURSOR_RADIUS
+      gap = _CURSOR_GAP
+      arm = _CURSOR_ARM
+      col = _CURSOR_COLOR_ON if self.holding else _CURSOR_COLOR
+
+      if self.holding:
+         pygame.draw.circle(self.window, col, (cx, cy), r)
+      else:
+         pygame.draw.circle(self.window, col, (cx, cy), r, 1)
+
+      # up
+      pygame.draw.line(self.window, col,
+                       (cx, cy - r - gap), (cx, cy - r - gap - arm))
+      # down
+      pygame.draw.line(self.window, col,
+                       (cx, cy + r + gap), (cx, cy + r + gap + arm))
+      # left
+      pygame.draw.line(self.window, col,
+                       (cx - r - gap, cy), (cx - r - gap - arm, cy))
+      # right
+      pygame.draw.line(self.window, col,
+                       (cx + r + gap, cy), (cx + r + gap + arm, cy))
 
 
 # ---------------------------------------------------------------------------
