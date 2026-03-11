@@ -82,10 +82,19 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
                     curriculum=None) -> CallbackList:
    """
    build the callback stack.
-   always includes EvalCallback and ShapeTaskCallback.
-   adds CurriculumCallback when curriculum is active.
+
+   EvalCallback       — SB3's built-in best-model saver (uses a static env,
+                        fine because it only saves checkpoints, doesn't gate
+                        curriculum advancement).
+   ShapeTaskCallback  — curriculum-aware eval; re-samples a fresh env from
+                        the current stage at every evaluation so it always
+                        reports metrics for the task being trained now.
+   CurriculumCallback — per-task solve rates that gate curriculum advancement.
+                        only added when curriculum is active.
    """
-   def _make_eval_env():
+   # EvalCallback still needs one env up front — it's only used for checkpoint
+   # saving so it's OK that it stays on stage-0 task.
+   def _make_static_eval_env():
       if curriculum is not None:
          prompt = curriculum.sample_prompt()
          n_shp  = curriculum.sample_n_shapes()
@@ -102,7 +111,7 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
       return Monitor(env)
 
    eval_callback = EvalCallback(
-      _make_eval_env(),
+      _make_static_eval_env(),
       best_model_save_path=save_path,
       log_path="./logs/",
       eval_freq=max(5000 // n_envs, 1),
@@ -110,8 +119,12 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
       verbose=1,
    )
 
+   # FIX: pass curriculum + goal_encoder so ShapeTaskCallback can re-sample
+   # a fresh env from the current stage at every eval, rather than being
+   # frozen on the stage-0 env that was constructed at callback build time.
    task_callback = ShapeTaskCallback(
-      eval_env=_make_eval_env(),
+      curriculum=curriculum,
+      goal_encoder=goal_encoder,
       eval_freq=5000,
       n_eval_episodes=10,
       verbose=1,
@@ -160,6 +173,10 @@ def train(
 
    start_stage: skip directly to this curriculum stage (useful for
    resuming or ablating individual stages).
+
+   NOTE: if you have a stale ./logs/oracle_demos.npz from a previous run,
+   delete it or pass --force-demos so BC trains on fresh demonstrations
+   matched to the current task pool.
    """
    from bc_train import (
       GoalEncoder, BicameralNetwork, BicameralPolicy,

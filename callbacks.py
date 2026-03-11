@@ -5,11 +5,14 @@ custom SB3 callbacks for tracking task-specific training progress and
 managing curriculum advancement.
 
 ShapeTaskCallback:
-    periodically evaluates the policy and logs averaged task metrics.
+    periodically evaluates the policy on the CURRENT curriculum stage.
+    re-samples a fresh eval env from the curriculum at every evaluation
+    so it always measures the task the agent is actually training on.
     metrics logged under the "task/" TensorBoard prefix:
         task/mean_score      — mean per-task score (0-1)
         task/solve_rate      — fraction of eval episodes solved
         task/mean_ep_length  — average steps per episode
+        task/current_stage   — curriculum stage index at eval time
 
 CurriculumCallback:
     runs per-task evaluation every eval_freq steps and reports per-task
@@ -18,8 +21,10 @@ CurriculumCallback:
     also logs n_shapes range and active task count as curriculum/ metrics.
 """
 
+import random
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
 from config import GOAL_ENCODING_DIM
@@ -27,22 +32,55 @@ from config import GOAL_ENCODING_DIM
 
 class ShapeTaskCallback(BaseCallback):
    """
-   periodically evaluates the current policy and logs averaged task metrics.
+   periodically evaluates the current policy on the CURRENT curriculum stage.
+
+   FIX: the original version captured a single eval env at construction time
+   and never updated it, so after the curriculum advanced from stage 0 (reach)
+   the callback kept reporting reach solve rates even while PPO trained
+   touch/drag.  this version re-samples a fresh env from the curriculum
+   (or from TASK_POOL when curriculum=None) at every evaluation.
 
    args:
-      eval_env:        a Monitor-wrapped ShapeEnv for evaluation.
+      curriculum:      CurriculumManager instance, or None for no curriculum.
+      goal_encoder:    GoalEncoder used to compute goal embeddings.
       eval_freq:       how often (in training timesteps) to run eval.
       n_eval_episodes: number of episodes to average over.
       verbose:         0 = silent, 1 = print metrics each eval.
    """
 
-   def __init__(self, eval_env, eval_freq: int = 5000,
-                n_eval_episodes: int = 10, verbose: int = 1):
+   def __init__(self, curriculum, goal_encoder,
+                eval_freq: int = 5000,
+                n_eval_episodes: int = 10,
+                verbose: int = 1):
       super().__init__(verbose)
-      self.eval_env        = eval_env
+      self.curriculum      = curriculum
+      self.goal_encoder    = goal_encoder
       self.eval_freq       = eval_freq
       self.n_eval_episodes = n_eval_episodes
       self._last_eval_step = 0
+
+   def _make_eval_env(self):
+      """build a fresh Monitor-wrapped ShapeEnv for the current stage."""
+      import torch
+      from llm_goal_parser import parse_goal, get_embedding
+      from config import TASK_POOL
+
+      if self.curriculum is not None:
+         prompt = self.curriculum.sample_prompt()
+         n_shp  = self.curriculum.sample_n_shapes()
+      else:
+         prompt = random.choice(TASK_POOL)
+         n_shp  = None
+
+      goal    = parse_goal(prompt)
+      raw_emb = get_embedding(prompt)
+      with torch.no_grad():
+         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+         encoding = self.goal_encoder(emb_t).squeeze(0).numpy()
+
+      env = ShapeEnv(n_shapes=n_shp, goal=goal)
+      env.set_goal_encoding(encoding)
+      return Monitor(env)
 
    def _on_step(self) -> bool:
       if self.num_timesteps - self._last_eval_step < self.eval_freq:
@@ -51,8 +89,11 @@ class ShapeTaskCallback(BaseCallback):
       metrics = self._run_eval()
       self._log_metrics(metrics)
       if self.verbose >= 1:
+         stage = (self.curriculum.stage_idx
+                  if self.curriculum is not None else -1)
          print(
-            f"[task eval @ {self.num_timesteps:>8,d} steps] "
+            f"[task eval @ {self.num_timesteps:>8,d} steps]  "
+            f"stage={stage}  "
             f"score: {metrics['mean_score']:.3f}  "
             f"rank/cohesion: {metrics['rank_corr']:+.3f}  "
             f"solve_rate: {metrics['solve_rate']:.0%}  "
@@ -63,24 +104,31 @@ class ShapeTaskCallback(BaseCallback):
    def _run_eval(self) -> dict:
       scores, rank_corrs, ep_lengths, solved = [], [], [], []
       for _ in range(self.n_eval_episodes):
-         obs, _     = self.eval_env.reset()
+         # fresh env each episode so every episode reflects current stage
+         eval_env   = self._make_eval_env()
+         obs, _     = eval_env.reset()
          done       = False
          length     = 0
          terminated = False
          while not done:
             action, _ = self.model.predict(obs, deterministic=True)
-            obs, _, terminated, truncated, info = self.eval_env.step(action)
+            obs, _, terminated, truncated, info = eval_env.step(action)
             done    = terminated or truncated
             length += 1
          scores.append(info.get("score",     0.0))
          rank_corrs.append(info.get("rank_corr", 0.0))
          ep_lengths.append(length)
          solved.append(float(terminated))
+         eval_env.close()
+
+      stage = (self.curriculum.stage_idx
+               if self.curriculum is not None else -1)
       return {
          "mean_score":     float(np.mean(scores)),
          "rank_corr":      float(np.mean(rank_corrs)),
          "solve_rate":     float(np.mean(solved)),
          "mean_ep_length": float(np.mean(ep_lengths)),
+         "current_stage":  float(stage),
       }
 
    def _log_metrics(self, metrics: dict):
@@ -144,7 +192,6 @@ class CurriculumCallback(BaseCallback):
       """
       import torch
       from llm_goal_parser import parse_goal, get_embedding
-      from stable_baselines3.common.monitor import Monitor
       from curriculum import _PROMPT_POOL
 
       per_task_sr = {}
@@ -152,7 +199,6 @@ class CurriculumCallback(BaseCallback):
       for task in self.curriculum.active_tasks:
          solved = []
          for _ in range(self.n_eval_episodes):
-            import random
             prompt  = random.choice(_PROMPT_POOL[task])
             goal    = parse_goal(prompt)
             raw_emb = get_embedding(prompt)

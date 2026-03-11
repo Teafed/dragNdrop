@@ -39,6 +39,16 @@ behavior cloning trainer for the shape manipulation agent.
    build_ppo_from_bc() creates a CustomActorCriticPolicy that wraps the
    bicameral network inside SB3's actor-critic framework. this lets us
    keep SB3's PPO training loop while using our custom network.
+
+   transplant 1: copy BicameralNetwork weights into _BicameralExtractor.net
+                 inside the PPO policy. this is a direct state_dict copy
+                 since the architectures match exactly.
+
+   transplant 2: compose BC's two-stage action_head (512->256->3) into
+                 SB3's single-stage action_net (512->3) using linear
+                 weight composition: W_eff = W2 @ W1, b_eff = W2 @ b1 + b2.
+                 this is a linear approximation that ignores the intermediate
+                 Tanh but gives a much better init direction than random.
 """
 
 import os
@@ -133,6 +143,7 @@ class BicameralNetwork(nn.Module):
       self.attn_scale = hidden ** -0.5
 
       # action head: combined (left + right) -> action
+      # input dim is hidden*2 (= 512 for hidden=256)
       self.action_head = nn.Sequential(
          nn.Linear(hidden * 2, hidden),
          nn.Tanh(),
@@ -152,25 +163,20 @@ class BicameralNetwork(nn.Module):
       right_feat = self.right_encoder(right_in)  # (batch, hidden)
 
       # cross-attention: right queries left
-      # add sequence dim of 1 for F.scaled_dot_product_attention
       q = self.attn_q(right_feat).unsqueeze(1)   # (batch, 1, hidden)
       k = self.attn_k(left_feat).unsqueeze(1)    # (batch, 1, hidden)
       v = self.attn_v(left_feat).unsqueeze(1)    # (batch, 1, hidden)
 
-      # scaled dot-product attention
-      scores   = torch.bmm(q, k.transpose(1, 2)) * self.attn_scale  # (batch, 1, 1)
+      scores   = torch.bmm(q, k.transpose(1, 2)) * self.attn_scale
       weights  = F.softmax(scores, dim=-1)
-      attended = torch.bmm(weights, v).squeeze(1)   # (batch, hidden)
+      attended = torch.bmm(weights, v).squeeze(1)
 
-      # residual: attended right + original right
-      right_out = right_feat + attended   # (batch, hidden)
+      right_out = right_feat + attended
 
-      # concat and decode to action
-      combined = torch.cat([left_feat, right_out], dim=-1)   # (batch, hidden*2)
+      combined = torch.cat([left_feat, right_out], dim=-1)
       return self.action_head(combined)
 
    def features_dim(self) -> int:
-      """combined feature dimension before action head — used by SB3 wrapper."""
       return self.hidden * 2
 
 
@@ -181,24 +187,18 @@ class BicameralNetwork(nn.Module):
 class BicameralPolicy(ActorCriticPolicy):
    """
    SB3 ActorCriticPolicy that wraps BicameralNetwork.
-
-   SB3's PPO requires an ActorCriticPolicy. this subclass replaces the
-   default MLP extractor with BicameralNetwork while keeping SB3's
-   value head and action distribution unchanged.
    """
 
    def __init__(self, observation_space, action_space, lr_schedule,
                 **kwargs):
-      # disable SB3's default net_arch so we can use our own network
       kwargs.pop("net_arch", None)
       super().__init__(
          observation_space, action_space, lr_schedule,
-         net_arch=[],   # empty — we override mlp_extractor below
+         net_arch=[],
          **kwargs,
       )
 
    def _build_mlp_extractor(self):
-      """replace SB3's mlp_extractor with BicameralNetwork."""
       self.mlp_extractor = _BicameralExtractor(
          observation_space=self.observation_space,
          hidden=POLICY_HIDDEN_SIZE,
@@ -214,8 +214,8 @@ class _BicameralExtractor(nn.Module):
    def __init__(self, observation_space, hidden: int = POLICY_HIDDEN_SIZE):
       super().__init__()
       self.net             = BicameralNetwork(action_dim=3, hidden=hidden)
-      self.latent_dim_pi   = hidden * 2   # policy feature dim
-      self.latent_dim_vf   = hidden * 2   # value feature dim (shared)
+      self.latent_dim_pi   = hidden * 2
+      self.latent_dim_vf   = hidden * 2
 
    def forward(self, obs: torch.Tensor):
       left_in  = obs[:, _LEFT_SLICE]
@@ -233,7 +233,7 @@ class _BicameralExtractor(nn.Module):
       right_out = right_feat + attended
 
       features = torch.cat([left_feat, right_out], dim=-1)
-      return features, features   # (policy_features, value_features)
+      return features, features
 
    def forward_actor(self, obs: torch.Tensor) -> torch.Tensor:
       features, _ = self.forward(obs)
@@ -258,10 +258,6 @@ def train_bc(
 ) -> tuple:
    """
    train a BicameralNetwork and GoalEncoder on (obs, action) pairs via MSE.
-
-   loss breakdown:
-      grip loss:  MSE on action[:, 2]  — whether to grip
-      dxy loss:   MSE on action[:, 0:2] — cursor movement
 
    returns:
       (BicameralNetwork, GoalEncoder) — both on cpu, eval mode.
@@ -300,7 +296,7 @@ def train_bc(
 
       for obs_batch, act_batch in loader:
          pred       = network(obs_batch)
-         per_output = loss_fn(pred, act_batch)   # (batch, 3)
+         per_output = loss_fn(pred, act_batch)
          loss       = per_output.mean()
 
          optimizer.zero_grad()
@@ -309,8 +305,8 @@ def train_bc(
          optimizer.step()
 
          epoch_loss      += loss.item()
-         epoch_loss_grip += per_output[:, 2].mean().item()   # grip
-         epoch_loss_dxy  += per_output[:, 0:2].mean().item() # dx, dy
+         epoch_loss_grip += per_output[:, 2].mean().item()
+         epoch_loss_dxy  += per_output[:, 0:2].mean().item()
          n_batches       += 1
 
       scheduler.step()
@@ -348,15 +344,30 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    """
    create a PPO model using BicameralPolicy and copy BC network weights in.
 
-   because BicameralPolicy uses a custom mlp_extractor, the weight copy
-   targets _BicameralExtractor.net (which is a BicameralNetwork instance)
-   rather than SB3's default policy_net layers.
+   transplant 1: copy BicameralNetwork weights into _BicameralExtractor.net
+                 via direct state_dict copy (architectures match).
+
+   transplant 2: compose BC's two-stage action_head (hidden*2 -> hidden -> 3)
+                 into SB3's single-stage action_net (hidden*2 -> 3) using
+                 linear weight composition:
+                     W_eff = W2 @ W1
+                     b_eff = W2 @ b1 + b2
+                 this ignores the intermediate Tanh nonlinearity but gives a
+                 far better initialisation direction than random weights.
    """
    if goal is None:
+      # use a neutral default that is valid for all tasks — the real goal
+      # encoding is always set via set_goal_encoding() in the env factory,
+      # so this dict is only used when vec_env is None (rare / debug path).
       goal = {
-         "task": "arrange_in_sequence", "axis": "x",
-         "direction": "ascending", "attribute": "size",
-         "region": "none", "bounded": False,
+         "task":         "arrange_in_sequence",
+         "axis":         "x",
+         "direction":    "ascending",
+         "attribute":    "size",
+         "region":       "none",
+         "bounded":      False,
+         "target_color": "none",
+         "target_type":  "none",
       }
 
    env = vec_env if vec_env is not None else Monitor(
@@ -377,13 +388,37 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
       tensorboard_log="./logs/tensorboard/",
    )
 
+   # --- transplant 1: bicameral extractor weights ---
    try:
       target_net = model.policy.mlp_extractor.net
       with torch.no_grad():
          target_net.load_state_dict(bc_network.state_dict())
-      print("  bicameral BC weights transplanted into PPO policy.")
+      print("  [transplant 1] bicameral BC weights copied into PPO extractor.")
    except Exception as e:
-      print(f"  weight transplant failed ({e}) — PPO starts from random init.")
+      print(f"  [transplant 1] failed ({e}) — extractor starts from random init.")
+
+   # --- transplant 2: compose action_head into SB3 action_net ---
+   # BC action_head layout:  Linear(hidden*2, hidden) -> Tanh -> Linear(hidden, 3) -> Tanh
+   # SB3 action_net layout:  Linear(hidden*2, 3)
+   # We compose the two linear layers to get an effective (hidden*2 -> 3) mapping.
+   try:
+      with torch.no_grad():
+         W1 = bc_network.action_head[0].weight   # (hidden,   hidden*2)
+         b1 = bc_network.action_head[0].bias     # (hidden,)
+         W2 = bc_network.action_head[2].weight   # (3,        hidden)
+         b2 = bc_network.action_head[2].bias     # (3,)
+
+         # linear composition (ignores intermediate Tanh — linear approximation)
+         W_eff = W2 @ W1   # (3, hidden*2)
+         b_eff = W2 @ b1 + b2   # (3,)
+
+         sb3_action_net = model.policy.action_net
+         sb3_action_net.weight.copy_(W_eff)
+         sb3_action_net.bias.copy_(b_eff)
+      print("  [transplant 2] composed BC action_head into PPO action_net "
+            f"({W_eff.shape[1]}->{W_eff.shape[0]}).")
+   except Exception as e:
+      print(f"  [transplant 2] failed ({e}) — action_net starts from random init.")
 
    return model
 
