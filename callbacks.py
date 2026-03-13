@@ -21,6 +21,7 @@ CurriculumCallback:
     also logs n_shapes range and active task count as curriculum/ metrics.
 """
 
+import os
 import random
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback

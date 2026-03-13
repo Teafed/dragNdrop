@@ -298,8 +298,17 @@ class ShapeEnv(gym.Env):
       rank_reward   = rank_delta * 2.0
 
       # --- oscillation penalty ---
+      # only apply for arrangement tasks — for reach/touch/drag the agent
+      # is doing fine-grained positioning near a target, and small score
+      # oscillations from cursor jitter near GRIP_RADIUS are expected.
+      # penalising them on starter tasks discourages the exploration needed
+      # to find the exact grip window.
+      _osc_tasks = ("arrange_in_sequence", "arrange_in_line",
+                    "arrange_in_region",   "arrange_in_groups")
       oscillation_penalty = (
-         -0.06 if self.prev_score_delta > 0.01 and score_delta < -0.01
+         -0.06
+         if (self.goal.get("task") in _osc_tasks
+             and self.prev_score_delta > 0.01 and score_delta < -0.01)
          else 0.0)
 
       # --- grip-on-target bonus ---

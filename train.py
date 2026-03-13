@@ -162,7 +162,7 @@ def train(
    use_oracle:     bool = True,
    use_curriculum: bool = True,
    start_stage:    int  = 0,
-   resume_model:   bool = False,
+   resume_model:   str  = None,
 ):
    """
    train the goal-conditioned agent.
