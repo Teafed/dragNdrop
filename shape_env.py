@@ -63,7 +63,9 @@ MARGIN       = SHAPE_RADIUS * 2
 
 SCORE_SOLVE_THRESHOLD = 0.85
 STEP_PENALTY          = -0.02
-COMPLETION_BONUS      = 25.0
+COMPLETION_BONUS      = 50.0  # was 25.0 — solving must be worth more than timing out.
+                               # a stuck agent loses ~30 over 500 steps; bonus was 25,
+                               # meaning solve was barely better than giving up. now 50.
 MOVEMENT_THRESHOLD    = 0.5   # pixels — below this cursor = not moving
 
 COLORS = {
@@ -278,8 +280,12 @@ class ShapeEnv(gym.Env):
          else 0.0)
 
       # --- inactivity penalty ---
+      # was -0.04, raised to -0.10 so doing nothing is more costly than
+      # trying and failing. at -0.04 a stuck agent loses ~20 over 500 steps,
+      # less than the risk of oscillation from thrashing. at -0.10 the cost
+      # of inaction (~50) clearly exceeds the cost of trying.
       inactivity_penalty = (
-         -0.04 if cursor_moved < MOVEMENT_THRESHOLD else 0.0)
+         -0.10 if cursor_moved < MOVEMENT_THRESHOLD else 0.0)
 
       # --- task score delta ---
       new_score    = self._compute_task_score()
@@ -296,13 +302,25 @@ class ShapeEnv(gym.Env):
          -0.06 if self.prev_score_delta > 0.01 and score_delta < -0.01
          else 0.0)
 
+      # --- grip-on-target bonus ---
+      # reward gripping the target shape regardless of where it moves.
+      # without this, touch/drag have zero reward signal until the shape
+      # actually reaches its destination — the prerequisite behavior (grip)
+      # is invisible to the reward function. small bonus so it does not
+      # dominate the task score signal.
+      task = self.goal.get("task", "reach")
+      grip_bonus = 0.0
+      if task in ("touch", "drag") and self.holding:
+         if self.grabbed_idx == self.target_idx:
+            grip_bonus = 0.10
+
       # bookkeeping
       self.prev_score_delta = score_delta
       self.prev_score       = new_score
       self.prev_rank_corr   = new_rank_corr
 
       reward = (score_reward + rank_reward + oscillation_penalty
-                + wall_penalty + inactivity_penalty + STEP_PENALTY)
+                + wall_penalty + inactivity_penalty + grip_bonus + STEP_PENALTY)
 
       terminated = self._is_solved()
       if terminated:
@@ -377,12 +395,25 @@ class ShapeEnv(gym.Env):
 
       color_indices = rng.integers(0, len(COLOR_NAMES), size=self.n_shapes)
       if task == "arrange_in_groups" and attribute == "color" and self.n_shapes >= 2:
-         if len(set(color_indices.tolist())) == self.n_shapes:
+         # need at least 2 distinct colors (so the task is non-trivial) and at
+         # least 2 shapes sharing a color (so grouping is learnable, not just
+         # "spread everything out"). all-same is the degenerate case the old
+         # code missed — it only guarded against all-different.
+         n_colors = len(COLOR_NAMES)
+         if len(set(color_indices.tolist())) < 2:
+            # all same — force shape[1] to a different color
+            color_indices[1] = (int(color_indices[0]) + 1) % n_colors
+         if len(set(color_indices.tolist())) == self.n_shapes and self.n_shapes > 2:
+            # all different — force shape[1] to share shape[0]'s color
             color_indices[1] = color_indices[0]
 
       type_indices = rng.integers(0, N_SHAPE_TYPES, size=self.n_shapes)
       if task == "arrange_in_groups" and attribute == "shape_type" and self.n_shapes >= 2:
-         if len(set(type_indices.tolist())) == self.n_shapes:
+         if len(set(type_indices.tolist())) < 2:
+            # all same — force shape[1] to a different type
+            type_indices[1] = (int(type_indices[0]) + 1) % N_SHAPE_TYPES
+         if len(set(type_indices.tolist())) == self.n_shapes and self.n_shapes > 2:
+            # all different — force shape[1] to share shape[0]'s type
             type_indices[1] = type_indices[0]
       elif self.n_shapes >= 2 and len(set(type_indices.tolist())) < 2:
          type_indices[1] = (int(type_indices[0]) + 1) % N_SHAPE_TYPES
@@ -554,9 +585,15 @@ class ShapeEnv(gym.Env):
       """
       score for reach: how close is the cursor to the target shape?
 
-      uses a short reference distance (half the canvas width) rather than
-      the full diagonal so the score stays well below IDLE_THRESHOLD until
-      the cursor is actually close. solved (score=1.0) when within GRIP_RADIUS.
+      uses a two-zone linear function so the reward gradient is continuous
+      all the way into GRIP_RADIUS:
+        - outside 2*GRIP_RADIUS: linear 0.0 -> 0.7 as dist shrinks from
+          ref_dist (half canvas) to 2*GRIP_RADIUS
+        - inside  2*GRIP_RADIUS: linear 0.7 -> 1.0 as dist shrinks to 0,
+          so the agent always has gradient signal when approaching.
+
+      previous version capped at 0.75 which left a dead zone just outside
+      GRIP_RADIUS — no gradient to push the cursor the final few pixels.
       """
       if not self.shapes:
          return 0.0
@@ -564,42 +601,87 @@ class ShapeEnv(gym.Env):
       dist   = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
       if dist <= GRIP_RADIUS:
          return 1.0
-      # reference: half canvas width — cursor needs to be genuinely close
-      # before the score approaches the solve threshold
-      ref_dist  = WINDOW_W / 2.0
-      proximity = 1.0 - min(dist / ref_dist, 1.0)
-      # cap below IDLE_THRESHOLD (0.78) so the oracle never idles before
-      # the cursor actually enters GRIP_RADIUS and score jumps to 1.0
-      return float(min(proximity, 0.75))
+      ref_dist    = WINDOW_W / 2.0
+      near_thresh = GRIP_RADIUS * 2.0
+      if dist <= near_thresh:
+         # linear 0.7 -> 1.0 as dist goes from near_thresh -> 0
+         # (1.0 is only returned when dist <= GRIP_RADIUS above)
+         t = (near_thresh - dist) / near_thresh
+         return float(0.7 + 0.29 * t)
+      # linear 0.0 -> 0.7 as dist goes from ref_dist -> near_thresh
+      t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
+      return float(0.7 * t)
 
    def _score_touch(self) -> float:
       """
       score for touch: grip must be active while overlapping the target shape.
-      score = 0.5 * proximity + 0.5 * grip_on_target.
       solved when holding and overlapping target.
+
+      score uses the same two-zone proximity shape as reach (0->0.7 far,
+      0.7->0.99 near), so the agent has gradient signal all the way in.
+      the grip jump to 1.0 only fires when actually over the target AND
+      holding — no discontinuous gap in the score range.
+
+      old version: 0.5*proximity + 0.5*grip_on produced scores in [0, 0.5]
+      without grip and a jump to 1.0 with grip. the range (0.5, 1.0) was
+      unreachable, so there was no gradient signal connecting proximity to
+      the grip action. the agent learned to hover at ~0.5 and stop.
       """
       if not self.shapes:
          return 0.0
-      target   = self.shapes[self.target_idx]
-      dist     = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
-      max_dist = np.sqrt(WINDOW_W ** 2 + WINDOW_H ** 2)
-      proximity = 1.0 - min(dist / max_dist, 1.0)
-      over_target = dist <= GRIP_RADIUS
-      grip_on     = float(self.holding and over_target)
-      if self.holding and over_target:
+      target      = self.shapes[self.target_idx]
+      dist        = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      if self.holding and dist <= GRIP_RADIUS:
          return 1.0
-      return float(0.5 * proximity + 0.5 * grip_on)
+      # same two-zone proximity as reach — continuous gradient to the goal
+      ref_dist    = WINDOW_W / 2.0
+      near_thresh = GRIP_RADIUS * 2.0
+      if dist <= near_thresh:
+         t = (near_thresh - dist) / near_thresh
+         return float(0.7 + 0.29 * t)
+      t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
+      return float(0.7 * t)
 
    def _score_drag(self) -> float:
       """
       score for drag: grip target shape and move it into the target region.
-      reuses _per_shape_region_score for consistency with arrange_in_region.
       solved when score >= SCORE_SOLVE_THRESHOLD.
+
+      two-phase score to provide gradient signal for both prerequisites:
+
+      phase 1 — not holding target: score cursor proximity to the shape,
+         using same two-zone function as reach/touch (0->0.99). this guides
+         the agent to navigate to the shape and grip it. without this, the
+         only signal is shape position, which is flat until grip happens.
+
+      phase 2 — holding target: score shape proximity to the region boundary
+         via _per_shape_region_score, scaled to [0.4, 1.0] so the transition
+         from phase 1 (max ~0.99) doesn't produce a negative reward jump when
+         the agent first grips. 0.4 is the floor so the agent doesn't drop
+         below phase 1 score just by gripping.
       """
       if not self.shapes:
          return 0.0
+      target = self.shapes[self.target_idx]
       region = self.goal.get("region", "left")
-      return self._per_shape_region_score(self.shapes[self.target_idx], region)
+
+      if self.holding and self.grabbed_idx == self.target_idx:
+         # phase 2: shape is moving — score its position toward the region.
+         # scale _per_shape_region_score (0->1) into (0.4->1.0) so gripping
+         # never produces a reward cliff vs phase 1.
+         region_score = self._per_shape_region_score(target, region)
+         return float(0.4 + 0.6 * region_score)
+
+      # phase 1: not holding — score cursor proximity to target shape.
+      # same two-zone function as reach so the agent has gradient all the way in.
+      dist        = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      ref_dist    = WINDOW_W / 2.0
+      near_thresh = GRIP_RADIUS * 2.0
+      if dist <= near_thresh:
+         t = (near_thresh - dist) / near_thresh
+         return float(0.7 + 0.29 * t)
+      t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
+      return float(0.7 * t)
 
    # -------------------------------------------------------------------------
    # wave 3 score functions
@@ -730,7 +812,11 @@ class ShapeEnv(gym.Env):
                inter_dists.append(d)
 
       if not inter_dists:
-         return 1.0   # only one group — trivially solved
+         # all shapes share the same attribute value — only one group exists.
+         # spawn logic should prevent this for arrange_in_groups, but if it
+         # somehow occurs (n_shapes=1, or all same after retries) return 0.5
+         # as a neutral score rather than 1.0 which would falsely signal solved.
+         return 0.5
 
       intra_mean   = float(np.mean(intra_dists)) if intra_dists else 1.0
       inter_mean   = float(np.mean(inter_dists))

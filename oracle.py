@@ -625,26 +625,27 @@ class OraclePolicy:
 # demonstration collection
 # ---------------------------------------------------------------------------
 
-DEMO_SAVE_PATH = "./logs/oracle_demos.npz"
-
 
 def collect_demonstrations(
-   n_episodes: int   = 500,
-   noise_std:  float = NOISE_STD,
-   verbose:    bool  = True,
-   save_path:  str   = DEMO_SAVE_PATH,
-   force:      bool  = False,
+   n_episodes:   int   = 500,
+   noise_std:    float = NOISE_STD,
+   verbose:      bool  = True,
+   goal_encoder        = None,
 ) -> dict:
    """
    run the oracle across TASK_POOL and collect (obs, action) pairs plus
    high-level annotations for future HBC training.
 
-   if save_path exists and force=False, loads from disk instead of
-   re-collecting. set force=True to always re-collect.
+   goal_encoder: a GoalEncoder instance to use for encoding prompts into
+   the obs goal slice. if None, a fresh GoalEncoder() is constructed —
+   but since GoalEncoder now uses a fixed seed, both paths produce
+   identical encodings. passing the instance from train.py is preferred
+   for clarity.
 
    dataset keys:
       "observations":  np.ndarray (N, obs_dim)
       "actions":       np.ndarray (N, 3)   [dx, dy, grip]
+      "tasks":         np.ndarray (N,)     task name per transition
       "hl_shape_idx":  np.ndarray (N,)     high-level: which shape was targeted
       "hl_target_x":   np.ndarray (N,)     high-level: target x in pixels
       "hl_target_y":   np.ndarray (N,)     high-level: target y in pixels
@@ -653,23 +654,15 @@ def collect_demonstrations(
    import torch
    from bc_train import GoalEncoder
 
-   # --- load from disk if available ---
-   if not force and os.path.exists(save_path):
-      if verbose:
-         print(f"\n--- loading oracle demos from {save_path} ---")
-      data = np.load(save_path)
-      dataset = {k: data[k] for k in data.files}
-      if verbose:
-         print(f"  loaded {len(dataset['observations']):,} transitions")
-      return dataset
-
-   goal_encoder = GoalEncoder()
+   if goal_encoder is None:
+      goal_encoder = GoalEncoder()
    goal_encoder.eval()
    rng = np.random.default_rng()
 
-   all_obs        = []
-   all_actions    = []
-   all_hl_shape   = []
+   all_obs         = []
+   all_actions     = []
+   all_tasks       = []
+   all_hl_shape    = []
    all_hl_target_x = []
    all_hl_target_y = []
    n_solved       = 0
@@ -699,6 +692,7 @@ def collect_demonstrations(
       ep_hl_shape = []
       ep_hl_tx    = []
       ep_hl_ty    = []
+      task_name   = goal["task"]
       done        = False
 
       while not done:
@@ -722,6 +716,7 @@ def collect_demonstrations(
          n_solved += 1
          all_obs.extend(ep_obs)
          all_actions.extend(ep_actions)
+         all_tasks.extend([task_name] * len(ep_obs))
          all_hl_shape.extend(ep_hl_shape)
          all_hl_target_x.extend(ep_hl_tx)
          all_hl_target_y.extend(ep_hl_ty)
@@ -733,11 +728,12 @@ def collect_demonstrations(
          print(f"  episode {ep:4d}/{n_episodes}  solve rate: {sr:.1f}%")
 
    dataset = {
-      "observations": np.array(all_obs,         dtype=np.float32),
-      "actions":      np.array(all_actions,      dtype=np.float32),
-      "hl_shape_idx": np.array(all_hl_shape,     dtype=np.int32),
-      "hl_target_x":  np.array(all_hl_target_x,  dtype=np.float32),
-      "hl_target_y":  np.array(all_hl_target_y,  dtype=np.float32),
+      "observations": np.array(all_obs,          dtype=np.float32),
+      "actions":      np.array(all_actions,       dtype=np.float32),
+      "tasks":        np.array(all_tasks,         dtype=object),
+      "hl_shape_idx": np.array(all_hl_shape,      dtype=np.int32),
+      "hl_target_x":  np.array(all_hl_target_x,   dtype=np.float32),
+      "hl_target_y":  np.array(all_hl_target_y,   dtype=np.float32),
    }
 
    if verbose:
@@ -748,11 +744,6 @@ def collect_demonstrations(
       if n_solved > 0:
          print(f"  mean ep length    : {len(all_obs)/n_solved:.1f}")
 
-   # save to disk for reuse
-   if save_path:
-      os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-      np.savez(save_path, **dataset)
-      if verbose:
-         print(f"  saved to {save_path}")
+   return dataset
 
    return dataset

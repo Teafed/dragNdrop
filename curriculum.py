@@ -9,13 +9,14 @@ progression is performance-gated (advance when the gate task hits a
 solve rate threshold) with a step ceiling so training doesn't stall.
 
 stages:
-   0  reach only              n_shapes 1     gate 80%  ceiling  50k
-   1  touch only              n_shapes 1     gate 80%  ceiling  50k
-   2  drag only               n_shapes 1     gate 70%  ceiling  75k
+   0  reach only              n_shapes 1     gate 50%  ceiling  30k
+   1  touch only              n_shapes 1     gate 50%  ceiling  40k
+   2  drag only               n_shapes 1     gate 40%  ceiling  60k
    3  sequence only           n_shapes 2-3   gate 60%  ceiling 150k
    4  + arrange_in_region     n_shapes 2-3   gate 60%  ceiling 150k
    5  + arrange_in_line       n_shapes 2-4   gate 60%  ceiling 200k
-   6  all tasks               n_shapes 2-6   no gate   remaining steps
+   6  + groups (fewer shapes) n_shapes 2-3   gate 40%  ceiling 200k
+   7  all tasks               n_shapes 2-6   no gate   remaining steps
 
 within each stage, active tasks are sampled with equal probability
 regardless of how many TASK_POOL prompts map to each task.
@@ -41,14 +42,20 @@ from llm_goal_parser import parse_goal
 
 _STAGES = [
    # --- starter stages: cursor skill building ---
+   # gate thresholds are intentionally permissive (50-60%) — these are
+   # cursor skill stages, not mastery checkpoints. advancing early is better
+   # than stalling here; the agent can still improve on reach/touch while
+   # training later stages.
+   # step ceilings are tighter than original so the curriculum actually
+   # moves through starter stages within a reasonable run length.
    {
       "name":         "stage 0 — reach",
       "tasks":        ["reach"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "reach",
-      "gate_sr":      0.80,
-      "step_ceiling": 50_000,
+      "gate_sr":      0.50,   # was 0.80 — advance as soon as agent is reliably reaching
+      "step_ceiling": 30_000, # was 50k — don't spend more than this on reach alone
    },
    {
       "name":         "stage 1 — touch",
@@ -56,8 +63,8 @@ _STAGES = [
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "touch",
-      "gate_sr":      0.80,
-      "step_ceiling": 50_000,
+      "gate_sr":      0.50,   # was 0.80
+      "step_ceiling": 40_000, # was 50k — touch needs a bit more time than reach
    },
    {
       "name":         "stage 2 — drag",
@@ -65,8 +72,8 @@ _STAGES = [
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "drag",
-      "gate_sr":      0.70,
-      "step_ceiling": 75_000,
+      "gate_sr":      0.40,   # was 0.70 — drag is harder, accept lower threshold
+      "step_ceiling": 60_000, # was 75k
    },
    # --- wave 3 stages: multi-shape arrangement ---
    {
@@ -98,7 +105,17 @@ _STAGES = [
       "step_ceiling": 200_000,
    },
    {
-      "name":         "stage 6 — all tasks",
+      "name":         "stage 6 — + groups (fewer shapes)",
+      "tasks":        ["arrange_in_sequence", "arrange_in_region",
+                       "arrange_in_line", "arrange_in_groups"],
+      "n_shapes_min": 2,
+      "n_shapes_max": 3,   # fewer shapes — groups is hard, ramp slowly
+      "gate_task":    "arrange_in_groups",
+      "gate_sr":      0.40,
+      "step_ceiling": 200_000,
+   },
+   {
+      "name":         "stage 7 — all tasks",
       "tasks":        SUPPORTED_TASKS,
       "n_shapes_min": 2,
       "n_shapes_max": 6,

@@ -3,6 +3,14 @@
 # single source of truth for architecture dimensions.
 
 # ---------------------------------------------------------------------------
+# goal embedding
+# ---------------------------------------------------------------------------
+
+EMBEDDING_MODEL   = "all-MiniLM-L6-v2"
+EMBEDDING_DIM     = 384
+GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
+
+# ---------------------------------------------------------------------------
 # observation space
 # ---------------------------------------------------------------------------
 
@@ -25,7 +33,7 @@ FOCAL_SHAPE_SIZE     = OBS_VALUES_PER_SHAPE * 2   # grabbed + nearest (5 + 5)
 
 LEFT_STREAM_DIM      = CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE + MAX_SHAPES * OBS_VALUES_PER_SHAPE
 # = 4 + 10 + 30 = 44
-RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + 64   # shapes + goal = 94
+RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM   # shapes + goal = 94
 
 # ---------------------------------------------------------------------------
 # shape types
@@ -48,6 +56,7 @@ GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
 # ---------------------------------------------------------------------------
 
 POLICY_HIDDEN_SIZE = 256   # hidden layer width for PPO and BC MLPs
+N_ENVS             = 4     # parallel envs for PPO rollout collection
 
 # ---------------------------------------------------------------------------
 # cursor physics

@@ -21,9 +21,6 @@ training modes:
 
    start from a specific curriculum stage:
       python train.py --start-stage 3
-
-   force re-collection of oracle demos:
-      python train.py --force-demos
 """
 
 import argparse
@@ -38,8 +35,8 @@ from stable_baselines3.common.env_util import make_vec_env
 
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal, get_embedding
-from callbacks import ShapeTaskCallback, CurriculumCallback
-from config import TASK_POOL, MAX_SHAPES, POLICY_HIDDEN_SIZE, get_obs_size
+from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCallback
+from config import TASK_POOL, MAX_SHAPES, POLICY_HIDDEN_SIZE, N_ENVS, get_obs_size
 
 
 # ---------------------------------------------------------------------------
@@ -130,17 +127,25 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
       verbose=1,
    )
 
-   callback_list = [eval_callback, task_callback]
+   callback_list        = [eval_callback, task_callback]
+   curriculum_callback  = None
 
    if curriculum is not None:
       curriculum_callback = CurriculumCallback(
          curriculum=curriculum,
          goal_encoder=goal_encoder,
-         eval_freq=10_000,
-         n_eval_episodes=20,
+         eval_freq=5_000,    # was 10k — check more often so gate fires promptly
+         n_eval_episodes=30, # was 20 — more episodes = less noisy gate measurement
          verbose=1,
+         save_path=save_path,  # saves stageN_checkpoint.zip on each advance
+      )
+      summary_callback = TrainingSummaryCallback(
+         curriculum_cb=curriculum_callback,
+         task_cb=task_callback,
+         summary_freq=50_000,
       )
       callback_list.append(curriculum_callback)
+      callback_list.append(summary_callback)
 
    return CallbackList(callback_list)
 
@@ -157,7 +162,7 @@ def train(
    use_oracle:     bool = True,
    use_curriculum: bool = True,
    start_stage:    int  = 0,
-   force_demos:    bool = False,
+   resume_model:   bool = False,
 ):
    """
    train the goal-conditioned agent.
@@ -173,10 +178,6 @@ def train(
 
    start_stage: skip directly to this curriculum stage (useful for
    resuming or ablating individual stages).
-
-   NOTE: if you have a stale ./logs/oracle_demos.npz from a previous run,
-   delete it or pass --force-demos so BC trains on fresh demonstrations
-   matched to the current task pool.
    """
    from bc_train import (
       GoalEncoder, BicameralNetwork, BicameralPolicy,
@@ -195,59 +196,65 @@ def train(
       print("\n[curriculum] disabled — training on all tasks from step 0")
 
    if use_oracle:
-      if curriculum is not None:
-         print(f"\n--- collecting {bc_episodes} oracle demonstrations "
-               f"(stage {curriculum.stage_idx}: {curriculum.active_tasks}, "
-               f"n_shapes {curriculum.n_shapes_range[0]}-"
-               f"{curriculum.n_shapes_range[1]}) ---")
-      else:
-         print(f"\n--- collecting {bc_episodes} oracle demonstrations "
-               f"across all {len(TASK_POOL)} task pool prompts ---")
+      # demos are collected across the full task pool regardless of curriculum
+      # stage — bc warms up all tasks, then ppo fine-tunes with curriculum.
+      print(f"\n--- collecting {bc_episodes} oracle demonstrations "
+            f"across all {len(TASK_POOL)} task pool prompts ---")
 
       dataset = collect_demonstrations(
          n_episodes=bc_episodes,
+         goal_encoder=goal_encoder,
          verbose=True,
-         force=force_demos,
       )
 
       device = "cuda" if torch.cuda.is_available() else "cpu"
-      bc_network, goal_encoder = train_bc(
+      bc_network = train_bc(
          dataset=dataset,
          save_path=save_path,
          epochs=bc_epochs,
          device=device,
       )
-      goal_encoder.eval()
 
-      n_envs  = 4
+      n_envs  = N_ENVS
       vec_env = make_vec_env(
          make_goal_conditioned_env(goal_encoder, curriculum), n_envs=n_envs)
 
-      print("\n--- initialising PPO from BC weights (BicameralPolicy) ---")
-      model = build_ppo_from_bc(bc_network, n_shapes=MAX_SHAPES, vec_env=vec_env)
+      if resume_model is not None:
+         print(f"\n--- resuming from checkpoint: {resume_model} ---")
+         model = PPO.load(resume_model, env=vec_env)
+      else:
+         print("\n--- initialising PPO from BC weights (BicameralPolicy) ---")
+         model = build_ppo_from_bc(bc_network, n_shapes=MAX_SHAPES, vec_env=vec_env)
 
    else:
-      goal_encoder.eval()
-      n_envs  = 4
+      n_envs  = N_ENVS
       vec_env = make_vec_env(
          make_goal_conditioned_env(goal_encoder, curriculum), n_envs=n_envs)
 
-      model = PPO(
-         BicameralPolicy,
-         vec_env,
-         learning_rate=3e-4,
-         n_steps=2048,
-         batch_size=128,
-         n_epochs=10,
-         gamma=0.99,
-         gae_lambda=0.95,
-         clip_range=0.2,
-         ent_coef=0.05,
-         vf_coef=0.5,
-         max_grad_norm=0.5,
-         verbose=1,
-         tensorboard_log="./logs/tensorboard/",
-      )
+      if resume_model is not None:
+         print(f"\n--- resuming from checkpoint: {resume_model} ---")
+         model = PPO.load(resume_model, env=vec_env)
+      else:
+         model = PPO(
+            BicameralPolicy,
+            vec_env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.05,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            verbose=1,
+            tensorboard_log="./logs/tensorboard/",
+         )
+
+   # goal encoder is fixed (random projection, not trained) — set eval mode
+   # once here regardless of which branch was taken above.
+   goal_encoder.eval()
 
    callbacks = build_callbacks(goal_encoder, save_path, n_envs, curriculum)
 
@@ -297,8 +304,14 @@ if __name__ == "__main__":
       help="BC training epochs (default: 30)",
    )
    parser.add_argument(
-      "--force-demos", action="store_true",
-      help="force re-collection of oracle demos even if cached",
+      "--resume", type=str, default=None,
+      help=(
+         "path to a saved model checkpoint to resume from (no .zip suffix needed). "
+         "combine with --start-stage to resume at the right curriculum stage and "
+         "--no-oracle to skip the bc phase. "
+         "example: python train.py --resume ./models/shape_agent/stage_02_checkpoint "
+         "--start-stage 3 --no-oracle"
+      ),
    )
    args = parser.parse_args()
 
@@ -310,5 +323,5 @@ if __name__ == "__main__":
       use_oracle=not args.no_oracle,
       use_curriculum=not args.no_curriculum,
       start_stage=args.start_stage,
-      force_demos=args.force_demos,
+      resume_model=args.resume,
    )

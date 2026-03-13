@@ -5,20 +5,20 @@ diagnostic script — run this before training or when something breaks.
 
 tests:
    1. env steps move cursor and shapes respond to grip (basic sanity)
-   2. rewards vary across episodes (reward function health)
-   3. all tasks initialise and step without error (starter + wave 3)
+   2. rewards vary across episodes — score functions respond to shape movement
+   3. all tasks initialise and step without error (flat rewards expected here)
    4. goal encoder produces correct output shape
    5. trained model outperforms random (if --model provided)
-   6. pygame renders cursor correctly (skip with --skip-render)
+   6. oracle visual check — watch oracle solve each task (--oracle --render)
    7. oracle per-task solve rate (--oracle flag)
    8. BC loss curve (--oracle flag)
-   9. oracle visual check (--oracle flag, skip with --skip-render)
+   9. per-task BC loss breakdown (--oracle flag)
 
 usage:
-   python debug.py --skip-render
-   python debug.py --oracle --skip-render
-   python debug.py --model models/shape_agent/best_model --skip-render
-   python debug.py                     # includes all render tests
+   python debug.py                         # core tests only, no render
+   python debug.py --oracle                # + oracle solve rates + BC loss
+   python debug.py --oracle --render       # + oracle visual check
+   python debug.py --model models/shape_agent/best_model
 """
 
 import argparse
@@ -127,6 +127,11 @@ def test_random_rewards(n_shapes: int = 2) -> bool:
    wave 3 tasks require grip-and-drag to produce score changes — pure
    random cursor movement never grips so reward stays flat at STEP_PENALTY.
    this test moves cursor to a shape, grips, then drags randomly.
+
+   reward ranges will differ across tasks — that's expected. what matters
+   is that each range is clearly above zero, confirming the score function
+   responds to shape movement. a flat range (~0.0) means the score function
+   for that task is broken or unresponsive.
    """
    print(f"=== test 2: reward variance (grip-and-drag actions) ===")
    all_ok = True
@@ -137,14 +142,16 @@ def test_random_rewards(n_shapes: int = 2) -> bool:
       ("arrange_in_region",   n_shapes),
       ("arrange_in_groups",   n_shapes),
    ]
-   rng = np.random.default_rng(0)
-
    for task, n_shp in test_cases:
       goal    = _default_goal(task)
       env     = ShapeEnv(n_shapes=n_shp, goal=goal)
       rewards = []
+      # use a fresh unseeded rng per task — fixed seed 0 can produce unlucky
+      # spawns where all shapes start inside the target region, giving flat
+      # reward regardless of dragging. 10 episodes averages this out.
+      rng = np.random.default_rng()
 
-      for _ in range(5):
+      for _ in range(10):
          obs, _    = env.reset()
          ep_reward = 0.0
 
@@ -183,6 +190,13 @@ def test_random_rewards(n_shapes: int = 2) -> bool:
 # ---------------------------------------------------------------------------
 
 def test_all_tasks() -> bool:
+   """
+   check that all tasks initialise and step without throwing an error.
+   uses random actions — flat rewards of -0.020 (just the step penalty)
+   are expected and correct for most tasks, since random actions rarely
+   grip and drag shapes. this test is only checking for crashes, not
+   that rewards are meaningful.
+   """
    print("=== test 3: all tasks initialise and step without error ===")
    tasks = [
       ("reach",               1),
@@ -339,53 +353,7 @@ def test_trained_model(model_path: str, n_shapes: int = 2):
 
 
 # ---------------------------------------------------------------------------
-# test 6: pygame render with cursor
-# ---------------------------------------------------------------------------
-
-def test_render():
-   print("=== test 6: pygame render with cursor ===")
-   try:
-      import pygame
-      goal   = _default_goal("arrange_in_region")
-      env    = ShapeEnv(n_shapes=2, goal=goal, render_mode="human")
-      obs, _ = env.reset()
-
-      print("  pygame window should appear — running 120 frames then closing")
-      clock   = pygame.time.Clock()
-      running = True
-
-      for i in range(120):
-         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-               running = False
-         if not running:
-            break
-
-         action = env.action_space.sample()
-         obs, reward, terminated, truncated, _ = env.step(action)
-         env.render()
-
-         if env.window is not None:
-            pygame.display.flip()
-         clock.tick(60)
-
-         if i % 40 == 0:
-            print(f"  frame {i:3d}: cx={env.cx:.0f} cy={env.cy:.0f}  "
-                  f"holding={env.holding}  grabbed={env.grabbed_idx}  "
-                  f"reward={reward:.4f}")
-
-         if terminated or truncated:
-            obs, _ = env.reset()
-
-      env.close()
-      print("  render test passed")
-   except Exception as e:
-      print(f"  !! render error: {e}")
-   print()
-
-
-# ---------------------------------------------------------------------------
-# test 7: oracle per-task solve rate
+# test 6: oracle visual check (replaces old random-cursor render test)
 # ---------------------------------------------------------------------------
 
 def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
@@ -483,7 +451,6 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
          n_episodes=n_episodes,
          noise_std=0.06,
          verbose=False,
-         force=True,   # always fresh for the diagnostic
       )
       n_trans = len(dataset["observations"])
       print(f"  collected {n_trans:,} transitions")
@@ -501,7 +468,11 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
             device=device,
          )
 
-      print("  if loss reached below ~0.05 and was decreasing, BC is healthy.")
+      print("  note: this is a quick diagnostic run (80 episodes, 10 epochs).")
+      print("  loss will be higher than a full training run — that's expected.")
+      print("  look for: loss decreasing steadily across epochs (not plateauing")
+      print("  after epoch 2), grip loss dropping below ~0.25, dxy below ~0.30.")
+      print("  a plateau at high loss usually means too little data or lr too high.")
       ok = True
 
    except Exception as e:
@@ -517,7 +488,7 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
 # ---------------------------------------------------------------------------
 
 def test_oracle_render():
-   print("=== test 9: oracle visual check ===")
+   print("=== test 6: oracle visual check ===")
    try:
       import pygame, torch
       from oracle import OraclePolicy
@@ -610,18 +581,146 @@ def test_oracle_render():
 
 
 # ---------------------------------------------------------------------------
+# test 9: per-task BC loss breakdown
+# ---------------------------------------------------------------------------
+
+def test_bc_loss_per_task(n_episodes: int = 80) -> bool:
+   """
+   collect oracle demos, train a quick BC pass, then evaluate MSE loss
+   broken down by task. helps identify whether BC failure is uniform or
+   concentrated on specific tasks (usually a data starvation issue).
+
+   a healthy per-task loss should be below ~0.05. anything above 0.15
+   on a specific task means the network hasn't learned that task at all.
+   """
+   print(f"=== test 9: per-task BC loss breakdown ({n_episodes} episodes) ===")
+   try:
+      import torch
+      import torch.nn.functional as F
+      import tempfile
+      from bc_train import BicameralNetwork, train_bc
+      from oracle import collect_demonstrations
+      from config import SUPPORTED_TASKS
+
+      print("  collecting oracle demos...")
+      dataset = collect_demonstrations(
+         n_episodes=n_episodes,
+         noise_std=0.06,
+         verbose=False,
+      )
+
+      n_trans = len(dataset["observations"])
+      print(f"  collected {n_trans:,} transitions")
+      if n_trans == 0:
+         print("  !! no transitions — oracle may be broken")
+         return False
+
+      # check that the dataset has a 'tasks' field (one entry per transition)
+      if "tasks" not in dataset:
+         print("  !! dataset has no 'tasks' key — cannot break down by task.")
+         print("     add task labels to collect_demonstrations() in oracle.py")
+         print("     to enable this test. skipping.")
+         return False
+
+      device = "cuda" if torch.cuda.is_available() else "cpu"
+
+      with tempfile.TemporaryDirectory() as tmp:
+         network = train_bc(
+            dataset=dataset,
+            save_path=tmp,
+            epochs=10,
+            batch_size=256,
+            device=device,
+         )
+
+      network = network.to(device)
+      network.eval()
+
+      obs_t  = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
+      act_t  = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
+      tasks  = dataset["tasks"]   # list of task name strings, one per transition
+
+      print()
+      print(f"  {'task':<25}  {'n':>6}  {'loss':>8}  status")
+      print(f"  {'-'*25}  {'-'*6}  {'-'*8}  ------")
+
+      all_ok = True
+
+      with torch.no_grad():
+         for task in SUPPORTED_TASKS:
+            # mask for this task's transitions
+            mask = [i for i, t in enumerate(tasks) if t == task]
+            if not mask:
+               print(f"  {task:<25}  {'0':>6}  {'n/a':>8}  !! no samples")
+               all_ok = False
+               continue
+
+            idx       = torch.tensor(mask, dtype=torch.long)
+            task_obs  = obs_t[idx]
+            task_act  = act_t[idx]
+            pred      = network(task_obs)
+
+            # match train_bc loss: MSE for dx/dy, BCE for grip.
+            # grip labels are ±1.0 from oracle; convert to 0/1 for BCE.
+            # using MSE on raw logits vs ±1.0 produces nonsense values here.
+            loss_dxy  = F.mse_loss(pred[:, 0:2], task_act[:, 0:2]).item()
+            grip_tgt  = (task_act[:, 2] > 0.0).float()
+            loss_grip = F.binary_cross_entropy_with_logits(
+               pred[:, 2], grip_tgt).item()
+            loss      = loss_dxy + 0.5 * loss_grip
+
+            # flag tasks with suspiciously high loss.
+            # these are in-sample losses after 10 diagnostic epochs, so they
+            # will naturally be higher than a full training run. thresholds:
+            #   dxy > 0.50 — network hasn't learned movement for this task
+            #   grip > 0.50 — network hasn't learned grip for this task
+            #   combined > 0.70 — overall learning has stalled on this task
+            # grip BCE near ln(2)≈0.693 means predicting ~0.5 for all steps.
+            # dxy MSE near 0.5 means similar (no learning).
+            warn_dxy  = loss_dxy  > 0.50
+            warn_grip = loss_grip > 0.50
+            warn_all  = loss      > 0.70
+            ok        = not (warn_dxy or warn_grip or warn_all)
+            status    = "ok" if ok else "!! HIGH"
+            if not ok:
+               all_ok = False
+
+            print(f"  {task:<25}  {len(mask):>6}  {loss:>8.4f}  {status}"
+                  f"  (dxy={loss_dxy:.4f}  grip={loss_grip:.4f})")
+
+      print()
+      if not all_ok:
+         print("  tasks marked HIGH have dxy>0.50, grip>0.50, or combined>0.70.")
+         print("  these are in-sample diagnostic losses — a full training run")
+         print("  (more episodes, more epochs) should bring them down further.")
+         print("  if a task is HIGH after a full run, check: data starvation")
+         print("  (too few samples), oracle solve rate (test 7), or whether the")
+         print("  task requires longer action sequences than others.")
+      else:
+         print("  all per-task losses look healthy.")
+
+   except Exception as e:
+      print(f"  !! FAILED: {e}")
+      all_ok = False
+
+   print()
+   return all_ok
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
    parser = argparse.ArgumentParser(
       description="diagnose the shape manipulation environment")
-   parser.add_argument("--model",          type=str, default=None)
-   parser.add_argument("--skip-render",    action="store_true")
-   parser.add_argument("--n-shapes",       type=int, default=3)
-   parser.add_argument("--oracle",         action="store_true",
+   parser.add_argument("--model",           type=str, default=None)
+   parser.add_argument("--render",          action="store_true",
+                       help="enable pygame render tests (tests 6, and 6 in --oracle mode)")
+   parser.add_argument("--n-shapes",        type=int, default=3)
+   parser.add_argument("--oracle",          action="store_true",
                        help="run oracle diagnostics (tests 7-9)")
-   parser.add_argument("--oracle-episodes",type=int, default=20)
+   parser.add_argument("--oracle-episodes", type=int, default=20)
    args = parser.parse_args()
 
    ok1 = test_env_steps(n_shapes=min(args.n_shapes, 2))
@@ -629,34 +728,46 @@ if __name__ == "__main__":
    ok3 = test_all_tasks()
    ok4 = test_goal_encoder()
 
+   ok5 = None
    if args.model:
+      ok5 = True
       test_trained_model(args.model, n_shapes=args.n_shapes)
-
-   if not args.skip_render:
-      test_render()
    else:
-      print("=== test 6: skipped (--skip-render) ===\n")
+      print("=== test 5: skipped (no --model provided) ===\n")
 
-   ok7 = ok8 = None
+   ok7 = ok8 = ok6 = ok9 = None
    if args.oracle:
       ok7 = test_oracle_per_task(n_episodes_per_task=args.oracle_episodes)
       ok8 = test_bc_loss()
-      if not args.skip_render:
+      if args.render:
          test_oracle_render()
+         ok6 = True
       else:
-         print("=== test 9: skipped (--skip-render) ===\n")
+         print("=== test 6: skipped (no --render flag) ===\n")
+      ok9 = test_bc_loss_per_task(n_episodes=args.oracle_episodes)
+   else:
+      print("=== tests 6-9: skipped (no --oracle flag) ===\n")
 
    print("=== summary ===")
+   _SKIP = "skip"
    for label, result in [
-      ("env cursor mechanics", ok1),
-      ("rewards vary",         ok2),
-      ("all tasks work",       ok3),
-      ("goal encoder ok",      ok4),
-      ("oracle solve rates",   ok7),
-      ("BC loss healthy",      ok8),
+      ("test 1  env mechanics  ", ok1),
+      ("test 2  reward variance", ok2),
+      ("test 3  all tasks ok   ", ok3),
+      ("test 4  goal encoder   ", ok4),
+      ("test 5  trained model  ", ok5),
+      ("test 6  oracle render  ", ok6),
+      ("test 7  oracle solve   ", ok7),
+      ("test 8  BC loss curve  ", ok8),
+      ("test 9  BC per-task    ", ok9),
    ]:
-      if result is not None:
-         print(f"  {label:<22} : {'ok' if result else 'FAIL'}")
+      if result is True:
+         status = "ok"
+      elif result is False:
+         status = "FAIL"
+      else:
+         status = "skipped"
+      print(f"  {label} : {status}")
 
    print()
    core = [ok1, ok2, ok3, ok4]

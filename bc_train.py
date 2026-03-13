@@ -24,9 +24,9 @@ behavior cloning trainer for the shape manipulation agent.
       single-head attention, lightweight (no positional encoding needed).
 
    action head:
-      combined left+right output -> [dx, dy, grip]
-      dx, dy:  MSE loss during BC
-      grip:    treated as continuous during BC (also MSE), threshold at runtime
+      movement head: (left + right) -> [dx, dy]  — MSE loss, Tanh output
+      grip head:     (left + right) -> grip logit — BCE loss, no Tanh.
+      at runtime the grip logit is thresholded at 0.0 to produce ±1.0.
 
 --- BC training details ---
    loss = MSE on all three action outputs (dx, dy, grip together).
@@ -44,11 +44,10 @@ behavior cloning trainer for the shape manipulation agent.
                  inside the PPO policy. this is a direct state_dict copy
                  since the architectures match exactly.
 
-   transplant 2: compose BC's two-stage action_head (512->256->3) into
-                 SB3's single-stage action_net (512->3) using linear
-                 weight composition: W_eff = W2 @ W1, b_eff = W2 @ b1 + b2.
-                 this is a linear approximation that ignores the intermediate
-                 Tanh but gives a much better init direction than random.
+   transplant 2: compose BC's split heads (move_head: hidden*2->hidden->2,
+                 grip_head: hidden*2->hidden//2->1) into SB3's single
+                 action_net (hidden*2->3) by composing each head's linear
+                 layers independently and stacking the results.
 """
 
 import os
@@ -79,10 +78,22 @@ _RIGHT_SLICE = slice(14, 108)   # all shapes + goal encoding
 # goal encoder MLP
 # ---------------------------------------------------------------------------
 
+# fixed seed for GoalEncoder weight init. this ensures the same prompt always
+# produces the same 64-dim encoding across demo collection, BC training, and
+# PPO — regardless of when or where GoalEncoder() is constructed.
+# the encoder is not trained; it is a fixed random projection of the MiniLM
+# sentence embedding. change this constant only if you retrain from scratch.
+_GOAL_ENCODER_SEED = 42
+
+
 class GoalEncoder(nn.Module):
    """
    projects raw EMBEDDING_DIM sentence embeddings down to GOAL_ENCODING_DIM.
    sits between get_embedding() and the policy input.
+
+   weights are fixed at construction using _GOAL_ENCODER_SEED — the encoder
+   is never trained. this guarantees the same prompt always maps to the same
+   64-dim vector across all runs, processes, and call sites.
    """
 
    def __init__(self):
@@ -93,6 +104,14 @@ class GoalEncoder(nn.Module):
          nn.Linear(128, GOAL_ENCODING_DIM),
          nn.Tanh(),
       )
+      # apply fixed seed init immediately after construction.
+      # fork_rng() ensures this doesn't disturb the global RNG state.
+      with torch.random.fork_rng():
+         torch.manual_seed(_GOAL_ENCODER_SEED)
+         for layer in self.net:
+            if isinstance(layer, nn.Linear):
+               nn.init.xavier_uniform_(layer.weight)
+               nn.init.zeros_(layer.bias)
 
    def forward(self, x: torch.Tensor) -> torch.Tensor:
       return self.net(x)
@@ -142,19 +161,29 @@ class BicameralNetwork(nn.Module):
       self.attn_v = nn.Linear(hidden, hidden, bias=False)
       self.attn_scale = hidden ** -0.5
 
-      # action head: combined (left + right) -> action
-      # input dim is hidden*2 (= 512 for hidden=256)
-      self.action_head = nn.Sequential(
+      # movement head: combined features -> [dx, dy], squashed to [-1, 1]
+      self.move_head = nn.Sequential(
          nn.Linear(hidden * 2, hidden),
          nn.Tanh(),
-         nn.Linear(hidden, action_dim),
+         nn.Linear(hidden, 2),
          nn.Tanh(),
+      )
+
+      # grip head: combined features -> grip logit (unbounded, no Tanh).
+      # BCE loss during BC training; threshold at 0.0 at runtime.
+      # no Tanh here — BCE expects raw logits, not squashed values.
+      self.grip_head = nn.Sequential(
+         nn.Linear(hidden * 2, hidden // 2),
+         nn.Tanh(),
+         nn.Linear(hidden // 2, 1),
       )
 
    def forward(self, obs: torch.Tensor) -> torch.Tensor:
       """
       obs: (batch, 108)
-      returns: (batch, action_dim) in [-1, 1]
+      returns: (batch, 3) — [dx, dy] in [-1, 1], grip as raw logit.
+      during BC: grip column fed to BCE loss directly.
+      at runtime (PPO / inference): threshold grip logit at 0.0.
       """
       left_in  = obs[:, _LEFT_SLICE]    # (batch, 44)
       right_in = obs[:, _RIGHT_SLICE]   # (batch, 94)
@@ -173,11 +202,25 @@ class BicameralNetwork(nn.Module):
 
       right_out = right_feat + attended
 
-      combined = torch.cat([left_feat, right_out], dim=-1)
-      return self.action_head(combined)
+      combined  = torch.cat([left_feat, right_out], dim=-1)
+      move      = self.move_head(combined)             # (batch, 2)  in [-1, 1]
+      grip      = self.grip_head(combined)             # (batch, 1)  raw logit
+      return torch.cat([move, grip], dim=-1)           # (batch, 3)
 
    def features_dim(self) -> int:
       return self.hidden * 2
+
+   def predict(self, obs: torch.Tensor) -> torch.Tensor:
+      """
+      inference-mode forward: returns actions with grip thresholded to ±1.0.
+      use this anywhere outside of BC training (demo, debug, manual eval).
+      during BC training, use forward() directly so BCE gets the raw logit.
+      """
+      out  = self.forward(obs)                          # (batch, 3)
+      grip = torch.where(out[:, 2:3] > 0.0,
+                         torch.ones_like(out[:, 2:3]),
+                         -torch.ones_like(out[:, 2:3]))
+      return torch.cat([out[:, 0:2], grip], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -253,25 +296,50 @@ def train_bc(
    save_path:  str,
    epochs:     int   = 30,
    batch_size: int   = 256,
-   lr:         float = 1e-3,
+   lr:         float = 3e-4,
    device:     str   = "cpu",
+   verbose:    bool  = True,
 ) -> tuple:
    """
-   train a BicameralNetwork and GoalEncoder on (obs, action) pairs via MSE.
+   train a BicameralNetwork and GoalEncoder on (obs, action) pairs.
+
+   loss:
+      move loss:  MSE on action[:, 0:2]  (dx, dy) — continuous movement
+      grip loss:  BCE on action[:, 2]    (grip)   — binary on/off signal
+      total     = move_loss + 0.5 * grip_loss
+
+   grip is treated as binary (oracle outputs ±1.0) so BCE is correct here.
+   MSE on grip would let the network hedge toward 0.0 and never commit —
+   BCE penalises confident wrong predictions exponentially, forcing the
+   network to actually learn grip timing.
 
    returns:
-      (BicameralNetwork, GoalEncoder) — both on cpu, eval mode.
+      BicameralNetwork — on cpu, eval mode.
+      the GoalEncoder is owned by the caller; train_bc does not touch it.
    """
    obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
    act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
 
-   network      = BicameralNetwork().to(device)
-   goal_encoder = GoalEncoder().to(device)
+   # compute grip class weight from dataset balance.
+   # oracle spends most transitions navigating (grip off), so grip-on labels
+   # are a minority. without reweighting, BCE minimises loss by predicting
+   # "always off" — which produces catastrophically high loss on grip-on steps.
+   # pos_weight = n_off / n_on tells BCE to treat each grip-on sample as if
+   # it were pos_weight samples, balancing the gradient contribution.
+   grip_labels = (act_t[:, 2] > 0.0)
+   n_on        = grip_labels.sum().item()
+   n_off       = (~grip_labels).sum().item()
+   pos_weight  = torch.tensor(
+      [n_off / max(n_on, 1)], dtype=torch.float32).to(device)
+   if verbose:
+      print(f"\n  grip balance: {n_on:,} on / {n_off:,} off  "
+            f"(pos_weight={pos_weight.item():.2f})")
+
+   network = BicameralNetwork().to(device)
 
    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
       optimizer, T_max=epochs, eta_min=1e-5)
-   loss_fn = nn.MSELoss(reduction="none")
 
    loader = DataLoader(
       TensorDataset(obs_t, act_t),
@@ -279,14 +347,16 @@ def train_bc(
       shuffle=True,
    )
 
-   print(f"\n--- behavior cloning (bicameral network) ---")
-   print(f"  obs dim     : {obs_t.shape[1]}  (left={LEFT_STREAM_DIM} right={RIGHT_STREAM_DIM})")
-   print(f"  action dim  : {act_t.shape[1]}  [dx, dy, grip]")
-   print(f"  samples     : {len(obs_t):,}")
-   print(f"  epochs      : {epochs}")
-   print(f"  batch size  : {batch_size}")
-   print(f"  lr          : {lr} (cosine decay to 1e-5)")
-   print(f"  device      : {device}\n")
+   if verbose:
+      print(f"\n--- behavior cloning (bicameral network) ---")
+      print(f"  obs dim     : {obs_t.shape[1]}  (left={LEFT_STREAM_DIM} right={RIGHT_STREAM_DIM})")
+      print(f"  action dim  : {act_t.shape[1]}  [dx, dy, grip]")
+      print(f"  samples     : {len(obs_t):,}")
+      print(f"  epochs      : {epochs}")
+      print(f"  batch size  : {batch_size}")
+      print(f"  lr          : {lr} (cosine decay to 1e-5)")
+      print(f"  loss        : MSE(dx,dy) + 0.5 * BCE(grip, weighted)")
+      print(f"  device      : {device}\n")
 
    for epoch in range(1, epochs + 1):
       epoch_loss      = 0.0
@@ -295,9 +365,20 @@ def train_bc(
       n_batches       = 0
 
       for obs_batch, act_batch in loader:
-         pred       = network(obs_batch)
-         per_output = loss_fn(pred, act_batch)
-         loss       = per_output.mean()
+         pred = network(obs_batch)   # (batch, 3): [dx, dy, grip_logit]
+
+         # movement loss — MSE on continuous dx, dy
+         loss_dxy  = F.mse_loss(pred[:, 0:2], act_batch[:, 0:2])
+
+         # grip loss — weighted BCE on binary grip signal.
+         # oracle grip is ±1.0; convert to 0/1 labels for BCE.
+         # pos_weight corrects for class imbalance (grip-off majority).
+         grip_logit = pred[:, 2]
+         grip_tgt   = (act_batch[:, 2] > 0.0).float()
+         loss_grip  = F.binary_cross_entropy_with_logits(
+            grip_logit, grip_tgt, pos_weight=pos_weight)
+
+         loss = loss_dxy + 0.5 * loss_grip
 
          optimizer.zero_grad()
          loss.backward()
@@ -305,8 +386,8 @@ def train_bc(
          optimizer.step()
 
          epoch_loss      += loss.item()
-         epoch_loss_grip += per_output[:, 2].mean().item()
-         epoch_loss_dxy  += per_output[:, 0:2].mean().item()
+         epoch_loss_grip += loss_grip.item()
+         epoch_loss_dxy  += loss_dxy.item()
          n_batches       += 1
 
       scheduler.step()
@@ -316,21 +397,21 @@ def train_bc(
       avg_dxy_loss  = epoch_loss_dxy  / max(n_batches, 1)
       cur_lr        = scheduler.get_last_lr()[0]
 
-      if epoch % max(epochs // 5, 1) == 0 or epoch == 1:
+      if verbose and (epoch % max(epochs // 5, 1) == 0 or epoch == 1):
          print(f"  epoch {epoch:3d}/{epochs} | "
                f"loss: {avg_loss:.4f}  "
                f"(grip: {avg_grip_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
                f"lr: {cur_lr:.2e}")
 
-   os.makedirs(save_path, exist_ok=True)
-   weights_path = os.path.join(save_path, "bc_weights.pt")
-   encoder_path = os.path.join(save_path, "goal_encoder.pt")
-   torch.save(network.state_dict(),      weights_path)
-   torch.save(goal_encoder.state_dict(), encoder_path)
-   print(f"\n  bicameral weights saved to  {weights_path}")
-   print(f"  goal encoder saved to       {encoder_path}")
+   if save_path is not None:
+      os.makedirs(save_path, exist_ok=True)
+      weights_path = os.path.join(save_path, "bc_weights.pt")
+      torch.save(network.state_dict(), weights_path)
+      if verbose:
+         print(f"\n  bicameral weights saved to  {weights_path}")
+         print(f"  goal encoder: fixed seed {_GOAL_ENCODER_SEED}, no checkpoint needed")
 
-   return network.cpu(), goal_encoder.cpu()
+   return network.cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -340,20 +421,19 @@ def train_bc(
 def build_ppo_from_bc(bc_network: BicameralNetwork,
                       n_shapes: int,
                       vec_env=None,
-                      goal: dict = None) -> PPO:
+                      goal: dict = None,
+                      ent_coef: float = 0.02,  # sweep winner was 0.01 but 0.02 keeps more exploration
+                      lr_ppo:   float = 1e-4) -> PPO:  # sweep winner confirmed
    """
    create a PPO model using BicameralPolicy and copy BC network weights in.
 
    transplant 1: copy BicameralNetwork weights into _BicameralExtractor.net
                  via direct state_dict copy (architectures match).
 
-   transplant 2: compose BC's two-stage action_head (hidden*2 -> hidden -> 3)
-                 into SB3's single-stage action_net (hidden*2 -> 3) using
-                 linear weight composition:
-                     W_eff = W2 @ W1
-                     b_eff = W2 @ b1 + b2
-                 this ignores the intermediate Tanh nonlinearity but gives a
-                 far better initialisation direction than random weights.
+   transplant 2: compose BC's split heads (move_head, grip_head) into
+                 SB3's single action_net (hidden*2 -> 3) by composing
+                 each head's two linear layers independently, then
+                 stacking move (rows 0:2) and grip (row 2) together.
    """
    if goal is None:
       # use a neutral default that is valid for all tasks — the real goal
@@ -376,14 +456,16 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    model = PPO(
       BicameralPolicy,
       env,
-      learning_rate=3e-5,
+      learning_rate=lr_ppo,
       n_steps=2048,
       batch_size=128,
       n_epochs=10,
       gamma=0.99,
       gae_lambda=0.95,
       clip_range=0.2,
-      ent_coef=0.005,
+      # ent_coef and lr_ppo are params — defaults are 0.02 and 3e-5.
+      # sweep.py varies these; train.py uses defaults.
+      ent_coef=ent_coef,
       verbose=0,
       tensorboard_log="./logs/tensorboard/",
    )
@@ -397,25 +479,39 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    except Exception as e:
       print(f"  [transplant 1] failed ({e}) — extractor starts from random init.")
 
-   # --- transplant 2: compose action_head into SB3 action_net ---
-   # BC action_head layout:  Linear(hidden*2, hidden) -> Tanh -> Linear(hidden, 3) -> Tanh
-   # SB3 action_net layout:  Linear(hidden*2, 3)
-   # We compose the two linear layers to get an effective (hidden*2 -> 3) mapping.
+   # --- transplant 2: compose split action heads into SB3 action_net ---
+   # BC layout:   move_head: Linear(hidden*2, hidden) -> Tanh -> Linear(hidden, 2)
+   #              grip_head: Linear(hidden*2, hidden//2) -> Tanh -> Linear(hidden//2, 1)
+   # SB3 layout:  action_net: Linear(hidden*2, 3)  (rows 0:2 = move, row 2 = grip)
+   # compose each head's two linear layers independently, then stack into action_net.
+   # the intermediate Tanh is ignored — linear composition is an approximation but
+   # still gives a far better initialisation direction than random weights.
    try:
       with torch.no_grad():
-         W1 = bc_network.action_head[0].weight   # (hidden,   hidden*2)
-         b1 = bc_network.action_head[0].bias     # (hidden,)
-         W2 = bc_network.action_head[2].weight   # (3,        hidden)
-         b2 = bc_network.action_head[2].bias     # (3,)
+         # movement head composition: (hidden*2 -> hidden -> 2)
+         mW1   = bc_network.move_head[0].weight   # (hidden,    hidden*2)
+         mb1   = bc_network.move_head[0].bias     # (hidden,)
+         mW2   = bc_network.move_head[2].weight   # (2,         hidden)
+         mb2   = bc_network.move_head[2].bias     # (2,)
+         W_move = mW2 @ mW1                       # (2, hidden*2)
+         b_move = mW2 @ mb1 + mb2                 # (2,)
 
-         # linear composition (ignores intermediate Tanh — linear approximation)
-         W_eff = W2 @ W1   # (3, hidden*2)
-         b_eff = W2 @ b1 + b2   # (3,)
+         # grip head composition: (hidden*2 -> hidden//2 -> 1)
+         gW1   = bc_network.grip_head[0].weight   # (hidden//2, hidden*2)
+         gb1   = bc_network.grip_head[0].bias     # (hidden//2,)
+         gW2   = bc_network.grip_head[2].weight   # (1,         hidden//2)
+         gb2   = bc_network.grip_head[2].bias     # (1,)
+         W_grip = gW2 @ gW1                       # (1, hidden*2)
+         b_grip = gW2 @ gb1 + gb2                 # (1,)
+
+         # stack into (3, hidden*2) to match SB3's action_net
+         W_eff = torch.cat([W_move, W_grip], dim=0)   # (3, hidden*2)
+         b_eff = torch.cat([b_move, b_grip], dim=0)   # (3,)
 
          sb3_action_net = model.policy.action_net
          sb3_action_net.weight.copy_(W_eff)
          sb3_action_net.bias.copy_(b_eff)
-      print("  [transplant 2] composed BC action_head into PPO action_net "
+      print("  [transplant 2] composed BC move+grip heads into PPO action_net "
             f"({W_eff.shape[1]}->{W_eff.shape[0]}).")
    except Exception as e:
       print(f"  [transplant 2] failed ({e}) — action_net starts from random init.")
@@ -438,19 +534,16 @@ if __name__ == "__main__":
    parser.add_argument("--epochs",    type=int,   default=30)
    parser.add_argument("--save",      type=str,   default="./models/bc_agent")
    parser.add_argument("--noise",     type=float, default=0.06)
-   parser.add_argument("--force",     action="store_true",
-                       help="force re-collection of oracle demos")
    args = parser.parse_args()
 
    dataset = collect_demonstrations(
       n_episodes=args.episodes,
       noise_std=args.noise,
       verbose=True,
-      force=args.force,
    )
 
    device  = "cuda" if torch.cuda.is_available() else "cpu"
-   network, goal_encoder = train_bc(
+   network = train_bc(
       dataset=dataset,
       save_path=args.save,
       epochs=args.epochs,

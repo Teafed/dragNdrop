@@ -63,6 +63,13 @@ python debug.py --oracle --skip-render # includes oracle solve rates + BC loss
 python debug.py --oracle-episodes 40 --skip-render
 ```
 
+**run short hyperparameter trials**
+```bash
+python sweep.py                        # default 50k steps
+python sweep.py --steps 30000
+python sweep.py --out logs/sweep1      # custom output prefix
+```
+
 **tensorboard:**
 ```bash
 tensorboard --logdir logs/tensorboard
