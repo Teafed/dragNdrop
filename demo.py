@@ -5,18 +5,13 @@ standalone demo — loads a trained model and runs it live in a pygame window.
 owns all pygame initialisation itself rather than relying on the env's lazy
 init, which avoids the "video system not initialized" error.
 
-the goal encoder is loaded from the same directory as the model. if it's not
-found, the encoding defaults to zeros (goal-blind policy — useful for sanity
-checking that the model moves shapes at all).
-
 usage:
-    python demo.py --model models/shape_agent/best_model
-    python demo.py --model models/shape_agent/best_model --prompt "sort shapes smallest to largest"
-    python demo.py --model models/shape_agent/best_model --prompt "group shapes by color"
-    python demo.py --model models/shape_agent/best_model --prompt "move all shapes to the left side"
-    python demo.py --oracle --prompt "arrange shapes in a horizontal line evenly spaced"
-    python demo.py --oracle --sequential
-    python demo.py --random
+   python demo.py --model models/shape_agent/best_model
+   python demo.py --model models/shape_agent/best_model --prompt "sort shapes smallest to largest"
+   python demo.py --oracle --prompt "arrange shapes in a horizontal line evenly spaced"
+   python demo.py --oracle --sequential
+   python demo.py --random
+   python demo.py --model models/shape_agent/best_model --headless --episodes 200
 """
 
 import argparse
@@ -32,358 +27,468 @@ from llm_goal_parser import parse_goal, get_embedding
 from config import GOAL_ENCODING_DIM, TASK_POOL
 
 
+# ---------------------------------------------------------------------------
+# goal encoder helpers
+# ---------------------------------------------------------------------------
+
 def load_goal_encoder(model_path: str):
-    """
-    try to load the goal encoder saved alongside the model.
-    returns a GoalEncoder instance (random init if file not found).
-    """
-    from bc_train import GoalEncoder
-
-    encoder_path = os.path.join(os.path.dirname(model_path), "goal_encoder.pt")
-    encoder      = GoalEncoder()
-
-    if os.path.exists(encoder_path):
-        encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
-        print(f"goal encoder loaded from {encoder_path}")
-    else:
-        print(f"no goal encoder found at {encoder_path} — using zero encoding")
-
-    encoder.eval()
-    return encoder
+   """
+   try to load the goal encoder saved alongside the model.
+   returns a GoalEncoder instance (random init if file not found).
+   """
+   from bc_train import GoalEncoder
+   encoder_path = os.path.join(os.path.dirname(model_path), "goal_encoder.pt")
+   encoder      = GoalEncoder()
+   if os.path.exists(encoder_path):
+      encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
+      print(f"goal encoder loaded from {encoder_path}")
+   else:
+      print(f"no goal encoder found at {encoder_path} — using zero encoding")
+   encoder.eval()
+   return encoder
 
 
 def encode_goal(goal_encoder, prompt: str) -> np.ndarray:
-    """project a prompt string to a GOAL_ENCODING_DIM vector."""
-    raw_emb = get_embedding(prompt)
-    with torch.no_grad():
-        emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-        encoding = goal_encoder(emb_t).squeeze(0).numpy()
-    return encoding
+   """project a prompt string to a GOAL_ENCODING_DIM vector."""
+   raw_emb = get_embedding(prompt)
+   with torch.no_grad():
+      emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
+      encoding = goal_encoder(emb_t).squeeze(0).numpy()
+   return encoding
 
 
-def draw_env(surface, env, font):
-   """draw current env state onto an existing pygame surface."""
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+LEGEND_LINES = [
+   "Q      quit",
+   "N      next episode",
+   "SPC    pause / unpause",
+   "S      step (one step; pauses first)",
+   "D      dump state",
+   "SHFT+D episode summary",
+]
+
+
+def draw_scene(surface, env, font, episode, steps, prompt,
+               agent_label, paused, phase=None):
+   """
+   draw full frame — shared by all agent types.
+
+   layout:
+      top row:    task / progress / rank / prompt
+      top-right:  key legend
+      bottom bar: agent label, episode, step, phase, solved/pause indicator
+   """
    surface.fill(BG_COLOR)
 
    for shape in env.shapes:
       shape.draw(surface, font)
 
-   # draw cursor — borrow env's own draw method by temporarily
-   # pointing its window at our surface
-   _prev_window   = env.window
-   env.window     = surface
+   # highlight the target shape for reach/touch/drag tasks so the viewer
+   # can tell which shape the agent is supposed to interact with
+   task = env.goal.get("task", "")
+   if task in ("reach", "touch", "drag") and env.shapes:
+      t = env.shapes[env.target_idx]
+      pygame.draw.circle(
+         surface, (255, 220, 60),
+         (int(t.x), int(t.y)), int(t.radius) + 6, 2)
+
+   # draw cursor via env's own method
+   _prev      = env.window
+   env.window = surface
    env._draw_cursor()
-   env.window     = _prev_window
+   env.window = _prev
 
-   task     = env.goal.get("task", "arrange_in_sequence")
-   score    = env._compute_score()
-   rank     = env._compute_rank_corr()
-   goal_str = (f"task: {task}   progress: {score:.2%}   "
-               f"rank/cohesion: {rank:+.2f}")
-   surface.blit(font.render(goal_str, True, (200, 200, 200)), (10, 10))
+   # top-left HUD: task info
+   score   = env._compute_score()
+   rank    = env._compute_rank_corr()
+   hud_str = (f"task: {task}   progress: {score:.2%}   "
+              f"rank/cohesion: {rank:+.2f}")
+   surface.blit(font.render(hud_str, True, (200, 200, 200)), (10, 10))
 
+   # prompt on second line — truncate if very long
+   prompt_display = prompt if len(prompt) <= 80 else prompt[:77] + "..."
+   surface.blit(
+      font.render(f"prompt: {prompt_display}", True, (160, 200, 160)),
+      (10, 26))
 
-def run_oracle_demo(sequential: bool, prompt: str = None):
-    """
-    watch the oracle solve episodes.
+   # top-right legend
+   for i, line in enumerate(LEGEND_LINES):
+      surface.blit(
+         font.render(line, True, (140, 140, 140)),
+         (WINDOW_W - 200, 28 + i * 14))
 
-    --prompt:     use this prompt for every episode (oracle stays on one task).
-    --sequential: cycle through TASK_POOL in order, ignoring --prompt.
-    default:      random task each episode.
-    """
-    from oracle import OraclePolicy, IDLE_THRESHOLD
-    import torch
-    from bc_train import GoalEncoder
-
-    pygame.init()
-    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-    pygame.display.set_caption("shape manipulation — oracle demo")
-    clock  = pygame.time.Clock()
-    font   = pygame.font.SysFont("monospace", 12)
-
-    goal_encoder = GoalEncoder()
-    goal_encoder.eval()
-
-    task_pool   = list(TASK_POOL)
-    task_cursor = 0
-
-    def next_prompt():
-        nonlocal task_cursor
-        if prompt is not None and not sequential:
-            return prompt
-        if sequential:
-            p           = task_pool[task_cursor % len(task_pool)]
-            task_cursor += 1
-            return p
-        return random.choice(task_pool)
-
-    cur_prompt = next_prompt()
-    goal       = parse_goal(cur_prompt)
-    raw_emb    = get_embedding(cur_prompt)
-    with torch.no_grad():
-        emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-        encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
-    env    = ShapeEnv(goal=goal, render_mode=None)
-    env.set_goal_encoding(encoding)
-    oracle = OraclePolicy(env, noise_std=0.0)
-    obs, _ = env.reset()
-
-    episode      = 1
-    steps        = 0
-    total_reward = 0.0
-    paused       = False
-    print(f"episode {episode} — {cur_prompt}  (Q quit  N next  SPACE pause  D dump state)")
-
-    # keybind legend — rendered once per frame in top-right corner
-    legend_lines = [
-        "Q  quit",
-        "N  next episode",
-        "SPC  pause / unpause",
-        "D  dump state to console",
-    ]
-
-    def draw_legend(surface, font):
-        x = WINDOW_W - 160
-        for i, line in enumerate(legend_lines):
-            surface.blit(font.render(line, True, (140, 140, 140)), (x, 28 + i * 14))
-
-    def dump_state(env, oracle, step, score):
-        print(f"\n--- state dump  ep {episode}  step {step} ---")
-        print(f"  task        : {env.goal.get('task')}  score={score:.4f}  "
-              f"idle_threshold={IDLE_THRESHOLD:.2f}")
-        print(f"  oracle      : phase={oracle.phase}  "
-              f"committed_shape={oracle.committed_shape}  "
-              f"committed_target={oracle.committed_target}")
-        if hasattr(oracle, '_group_zones') and oracle._group_zones:
-            print(f"  group zones : {oracle._group_zones}")
-        print(f"  cursor      : ({env.cx:.1f}, {env.cy:.1f})  "
-              f"holding={env.holding}  grabbed_idx={env.grabbed_idx}")
-        for i, s in enumerate(env.shapes):
-            attr = getattr(s, 'color_name', '?')
-            print(f"  shape {i}     : ({s.x:.1f}, {s.y:.1f})  "
-                  f"color={attr}  size={s.size:.1f}  type={s.shape_type}")
-        print()
-
-    running = True
-    while running:
-        skip = False
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_q:
-                    running = False
-                if event.key == pygame.K_n:
-                    skip = True
-                if event.key == pygame.K_SPACE:
-                    paused = not paused
-                    print(f"[demo] {'paused' if paused else 'resumed'}  "
-                          f"ep {episode}  step {steps}")
-                if event.key == pygame.K_d:
-                    dump_state(env, oracle, steps, env._compute_score())
-
-        if not running:
-            break
-
-        if not paused and not skip:
-            action                                   = oracle.act(obs)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            steps        += 1
-        else:
-            # still need info for the HUD when paused
-            terminated = truncated = False
-            info       = {"score": env._compute_score(), "task": env.goal.get("task")}
-
-        draw_env(window, env, font)
-        draw_legend(window, font)
-
-        # bottom bar: oracle phase + idle indicator
-        score       = env._compute_score()
-        idle_now    = score >= IDLE_THRESHOLD
-        phase_str   = oracle.phase or "none"
-        status_str  = "SOLVED!" if (not paused and terminated) else ""
-        pause_str   = "  [PAUSED]" if paused else ""
-        bottom_line = (
-            f"ORACLE  ep {episode}  step {steps}  "
-            f"score {score:.3f}  phase={phase_str}  "
-            f"{'IDLE ' if idle_now else ''}"
-            f"{status_str}{pause_str}"
-        )
-        window.blit(
-            font.render(bottom_line, True,
-                        (255, 220, 80) if paused else (100, 220, 180)),
-            (10, WINDOW_H - 24)
-        )
-        pygame.display.flip()
-        clock.tick(FPS)
-
-        if not paused and (terminated or truncated or skip):
-            status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
-            print(f"episode {episode} {status} — "
-                  f"steps: {steps}  reward: {total_reward:.2f}  "
-                  f"score: {info['score']:.3f}  task: {cur_prompt}")
-
-            cur_prompt = next_prompt()
-            goal       = parse_goal(cur_prompt)
-            raw_emb    = get_embedding(cur_prompt)
-            with torch.no_grad():
-                emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-                encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
-            env.goal = goal
-            env.set_goal_encoding(encoding)
-            oracle   = OraclePolicy(env, noise_std=0.0)
-            obs, _   = env.reset()
-
-            episode     += 1
-            steps        = 0
-            total_reward = 0.0
-            paused       = False
-            print(f"episode {episode} — {cur_prompt}")
-
-    pygame.quit()
-    print("oracle demo closed")
+   # bottom bar
+   solved_str = "  SOLVED!" if env._is_solved() else ""
+   pause_str  = "  [PAUSED]" if paused else ""
+   phase_str  = f"  phase={phase}" if phase is not None else ""
+   bottom     = (f"{agent_label}  ep {episode}  step {steps}  "
+                 f"score {score:.3f}{phase_str}{solved_str}{pause_str}")
+   color      = (255, 220, 80) if paused else (100, 220, 180)
+   surface.blit(font.render(bottom, True, color), (10, WINDOW_H - 24))
 
 
-def run_demo(model_path: str, prompt: str, use_random: bool, multi_task: bool):
+# ---------------------------------------------------------------------------
+# state and episode summary dumps
+# ---------------------------------------------------------------------------
 
-    pygame.init()
-    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-    pygame.display.set_caption("shape manipulation — demo")
-    clock  = pygame.time.Clock()
-    font   = pygame.font.SysFont("monospace", 12)
+def dump_state(env, step, episode, extra=None):
+   """print current env state — bound to D key."""
+   score = env._compute_score()
+   print(f"\n--- state dump  ep {episode}  step {step} ---")
+   print(f"  task    : {env.goal.get('task')}  score={score:.4f}")
+   if extra:
+      print(f"  {extra}")
+   print(f"  cursor  : ({env.cx:.1f}, {env.cy:.1f})  "
+         f"holding={env.holding}  grabbed_idx={env.grabbed_idx}")
+   for i, s in enumerate(env.shapes):
+      marker = " <-- target" if i == env.target_idx else ""
+      print(f"  shape {i} : ({s.x:.1f}, {s.y:.1f})  "
+            f"color={getattr(s,'color_name','?')}  "
+            f"size={s.size:.1f}  type={s.shape_type}{marker}")
+   print()
 
-    if use_random:
-        goal_encoder = None
-        model        = None
-        print("running random agent (no model loaded)")
-    else:
-        goal_encoder = load_goal_encoder(model_path)
-        try:
-            from stable_baselines3 import PPO
-            model = PPO.load(model_path)
-            print(f"model loaded from {model_path}")
-        except Exception as e:
-            print(f"could not load model: {e}")
-            pygame.quit()
-            sys.exit(1)
 
-    def sample_episode_goal():
-        """sample a prompt, parse it, and compute its encoding."""
-        p        = random.choice(TASK_POOL) if multi_task else prompt
-        g        = parse_goal(p)
-        if goal_encoder is not None:
-            enc = encode_goal(goal_encoder, p)
-        else:
-            enc = np.zeros(GOAL_ENCODING_DIM, dtype=np.float32)
-        return p, g, enc
+def dump_episode_summary(history: list):
+   """
+   print a summary of all completed episodes — bound to Shift+D.
 
-    cur_prompt, goal, encoding = sample_episode_goal()
-    print(f"goal: {goal}")
+   history: list of dicts with keys: episode, prompt, steps, reward,
+            score, solved, task.
+   """
+   if not history:
+      print("\n[no completed episodes yet]")
+      return
 
-    env = ShapeEnv(goal=goal, render_mode=None)
-    env.set_goal_encoding(encoding)
-    obs, _ = env.reset()
+   n        = len(history)
+   solved   = [e for e in history if e["solved"]]
+   solve_r  = len(solved) / n
 
-    total_reward = 0.0
-    steps        = 0
-    episode      = 1
-    print(f"\nepisode {episode} — {cur_prompt}")
-    print("close window or press Q to quit\n")
+   # per-task breakdown
+   by_task  = {}
+   for e in history:
+      t = e["task"]
+      by_task.setdefault(t, []).append(e)
 
-    running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
-                running = False
+   print(f"\n{'='*60}")
+   print(f"  episode summary  ({n} episodes)")
+   print(f"{'='*60}")
+   print(f"  overall solve rate : {solve_r:.0%}  ({len(solved)}/{n})")
+   print(f"  mean steps         : {np.mean([e['steps'] for e in history]):.1f}")
+   print(f"  mean final score   : {np.mean([e['score'] for e in history]):.3f}")
+   print(f"  mean reward        : {np.mean([e['reward'] for e in history]):.2f}")
+   if by_task:
+      print(f"  per-task solve rates:")
+      for task, eps in sorted(by_task.items()):
+         sr  = np.mean([e["solved"] for e in eps])
+         bar = "█" * int(sr * 20)
+         print(f"    {task:<25} {sr:5.0%}  {bar}  (n={len(eps)})")
+   print(f"{'='*60}\n")
 
-        if not running:
-            break
 
-        if model is not None:
+# ---------------------------------------------------------------------------
+# episode / goal helpers
+# ---------------------------------------------------------------------------
+
+def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None):
+   """sample a new prompt (if multi_task or sequential), parse, encode."""
+   if sequential_pool is not None:
+      p = sequential_pool.pop(0)
+      sequential_pool.append(p)   # rotate
+   elif multi_task:
+      p = random.choice(TASK_POOL)
+   else:
+      p = prompt
+   g   = parse_goal(p)
+   enc = (encode_goal(goal_encoder, p) if goal_encoder is not None
+          else np.zeros(GOAL_ENCODING_DIM, dtype=np.float32))
+   return p, g, enc
+
+
+# ---------------------------------------------------------------------------
+# headless diagnostic runner
+# ---------------------------------------------------------------------------
+
+def run_headless(model_path: str, prompt: str, multi_task: bool,
+                 n_episodes: int, verbose: bool):
+   """
+   run n_episodes with no GUI and print a performance summary.
+   useful for getting solve rates and score distributions outside of training.
+
+   example:
+      python demo.py --model models/shape_agent/best_model --headless --episodes 200
+   """
+   goal_encoder = load_goal_encoder(model_path)
+   from stable_baselines3 import PPO
+   model = PPO.load(model_path)
+   print(f"model loaded: {model_path}")
+   print(f"running {n_episodes} episodes (headless)...\n")
+
+   history = []
+   for ep in range(1, n_episodes + 1):
+      p, g, enc = make_episode(goal_encoder, prompt, multi_task)
+      env       = ShapeEnv(goal=g, render_mode=None)
+      env.set_goal_encoding(enc)
+      obs, _    = env.reset()
+
+      total_reward = 0.0
+      steps        = 0
+      terminated   = truncated = False
+
+      while not (terminated or truncated):
+         action, _ = model.predict(obs, deterministic=True)
+         obs, reward, terminated, truncated, _ = env.step(action)
+         total_reward += reward
+         steps        += 1
+
+      final_score = env._compute_score()
+      history.append({
+         "episode": ep,
+         "prompt":  p,
+         "task":    g.get("task", "?"),
+         "steps":   steps,
+         "reward":  total_reward,
+         "score":   final_score,
+         "solved":  terminated,
+      })
+      env.close()
+
+      if verbose or ep % max(n_episodes // 10, 1) == 0:
+         status = "SOLVED" if terminated else "timed out"
+         print(f"  ep {ep:4d}  {status:<10}  "
+               f"steps={steps:4d}  score={final_score:.3f}  {p}")
+
+   dump_episode_summary(history)
+
+
+# ---------------------------------------------------------------------------
+# unified interactive loop
+# ---------------------------------------------------------------------------
+
+def run_demo(model_path, prompt, use_random, multi_task,
+             use_oracle, sequential):
+   """
+   single render loop for all interactive agent types (model, oracle, random).
+   the only difference is how `action` is computed each step.
+   """
+   pygame.init()
+   window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+   pygame.display.set_caption("shape manipulation — demo")
+   clock  = pygame.time.Clock()
+   font   = pygame.font.SysFont("monospace", 12)
+
+   # --- load agent ---
+   if use_oracle:
+      from oracle import OraclePolicy
+      from bc_train import GoalEncoder
+      goal_encoder = GoalEncoder()
+      goal_encoder.eval()
+      model        = None
+      agent_label  = "ORACLE"
+      print("running oracle agent")
+   elif use_random:
+      goal_encoder = None
+      model        = None
+      agent_label  = "RANDOM"
+      print("running random agent")
+   else:
+      goal_encoder = load_goal_encoder(model_path)
+      try:
+         from stable_baselines3 import PPO
+         model = PPO.load(model_path)
+         print(f"model loaded from {model_path}")
+      except Exception as e:
+         print(f"could not load model: {e}")
+         pygame.quit()
+         sys.exit(1)
+      agent_label = "MODEL"
+
+   # sequential pool for oracle --sequential mode
+   seq_pool = list(TASK_POOL) if (use_oracle and sequential) else None
+
+   # --- first episode ---
+   cur_prompt, goal, encoding = make_episode(
+      goal_encoder, prompt, multi_task, seq_pool)
+   env    = ShapeEnv(goal=goal, render_mode=None)
+   env.set_goal_encoding(encoding)
+   oracle = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
+             if use_oracle else None)
+   obs, _ = env.reset()
+
+   episode      = 1
+   steps        = 0
+   total_reward = 0.0
+   paused       = False
+   step_once    = False   # set by S key — advance exactly one step
+   history      = []      # completed episode records for Shift+D
+
+   print(f"\nepisode {episode} — {cur_prompt}")
+   print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
+
+   running = True
+   while running:
+      skip = False
+
+      for event in pygame.event.get():
+         if event.type == pygame.QUIT:
+            running = False
+         if event.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+
+            if event.key == pygame.K_q:
+               running = False
+
+            elif event.key == pygame.K_n:
+               skip = True
+
+            elif event.key == pygame.K_SPACE:
+               paused = not paused
+               print(f"[demo] {'paused' if paused else 'resumed'}  "
+                     f"ep {episode}  step {steps}")
+
+            elif event.key == pygame.K_s:
+               # pause if not already, then advance one step
+               if not paused:
+                  paused = True
+               step_once = True
+
+            elif event.key == pygame.K_d:
+               if mods & pygame.KMOD_SHIFT:
+                  dump_episode_summary(history)
+               else:
+                  extra = None
+                  if oracle is not None:
+                     extra = (f"oracle: phase={oracle.phase}  "
+                              f"committed_shape={oracle.committed_shape}  "
+                              f"committed_target={oracle.committed_target}")
+                  dump_state(env, steps, episode, extra)
+
+      if not running:
+         break
+
+      terminated = truncated = False
+      should_step = (not paused) or step_once
+
+      if should_step and not skip:
+         if use_oracle:
+            action = oracle.act(obs)
+         elif model is not None:
             action, _ = model.predict(obs, deterministic=True)
-        else:
+         else:
             action = env.action_space.sample()
 
-        obs, reward, terminated, truncated, _ = env.step(action)
-        total_reward += reward
-        steps        += 1
+         obs, reward, terminated, truncated, _ = env.step(action)
+         total_reward += reward
+         steps        += 1
+         step_once     = False
 
-        draw_env(window, env, font)
+      phase = oracle.phase if oracle is not None else None
+      draw_scene(window, env, font,
+                 episode, steps, cur_prompt,
+                 agent_label, paused, phase)
+      pygame.display.flip()
+      clock.tick(FPS)
 
-        shape_idx = int(np.clip(
-            round((action[0] + 1.0) / 2.0 * (env.n_shapes - 1)),
-            0, env.n_shapes - 1
-        ))
-        s = env.shapes[shape_idx]
-        pygame.draw.circle(window, (255, 255, 255),
-                           (int(s.x), int(s.y)), s.radius + 4, 2)
+      if should_step and (terminated or truncated or skip):
+         status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
+         final_score = env._compute_score()
+         # skipped episodes excluded — they reflect user input, not agent performance
+         if not skip:
+            history.append({
+               "episode": episode,
+               "prompt":  cur_prompt,
+               "task":    goal.get("task", "?"),
+               "steps":   steps,
+               "reward":  total_reward,
+               "score":   final_score,
+               "solved":  terminated,
+            })
+         print(f"episode {episode} {status} — "
+               f"steps: {steps}  reward: {total_reward:.2f}  "
+               f"score: {final_score:.3f}  task: {cur_prompt}")
 
-        status_str = "SOLVED!" if terminated else ""
-        step_label = font.render(
-            f"ep {episode}  step {steps}  n_shapes {env.n_shapes}  "
-            f"{cur_prompt}  {status_str}",
-            True, (180, 180, 100)
-        )
-        window.blit(step_label, (10, WINDOW_H - 24))
+         cur_prompt, goal, encoding = make_episode(
+            goal_encoder, prompt, multi_task, seq_pool)
+         env.goal = goal
+         env.set_goal_encoding(encoding)
+         oracle   = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
+                     if use_oracle else None)
+         obs, _   = env.reset()
 
-        pygame.display.flip()
-        clock.tick(FPS)
+         episode     += 1
+         steps        = 0
+         total_reward = 0.0
+         paused       = False
+         print(f"episode {episode} — {cur_prompt}")
 
-        if terminated or truncated:
-            status = "SOLVED" if terminated else "timed out"
-            print(f"episode {episode} {status} — "
-                  f"steps: {steps}  reward: {total_reward:.3f}  "
-                  f"n_shapes: {env.n_shapes}  task: {cur_prompt}")
+   pygame.quit()
+   print("demo closed")
+   if history:
+      dump_episode_summary(history)
 
-            # sample new task and reset env for next episode
-            cur_prompt, goal, encoding = sample_episode_goal()
-            env.goal = goal
-            env.set_goal_encoding(encoding)
-            obs, _       = env.reset()
-            total_reward = 0.0
-            steps        = 0
-            episode     += 1
-            print(f"episode {episode} — {cur_prompt}")
 
-    pygame.quit()
-    print("demo closed")
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="run a trained agent or oracle demo")
-    parser.add_argument(
-        "--model", type=str, default="models/shape_agent/best_model",
-        help="path to saved SB3 model (without .zip extension)",
-    )
-    parser.add_argument(
-        "--prompt", type=str,
-        default="sort shapes from smallest to largest left to right",
-        help="natural language goal prompt",
-    )
-    parser.add_argument(
-        "--random", action="store_true",
-        help="use a random agent instead of a trained model",
-    )
-    parser.add_argument(
-        "--multi-task", action="store_true",
-        help="sample a random task from TASK_POOL each episode",
-    )
-    parser.add_argument(
-        "--oracle", action="store_true",
-        help="watch the oracle instead of a trained model",
-    )
-    parser.add_argument(
-        "--sequential", action="store_true",
-        help="cycle through TASK_POOL in order (use with --oracle or --multi-task)",
-    )
-    args = parser.parse_args()
+   parser = argparse.ArgumentParser(
+      description="run a trained agent or oracle demo")
+   parser.add_argument(
+      "--model", type=str, default="models/shape_agent/best_model",
+      help="path to saved SB3 model (without .zip extension)",
+   )
+   parser.add_argument(
+      "--prompt", type=str,
+      default="sort shapes from smallest to largest left to right",
+      help="natural language goal prompt",
+   )
+   parser.add_argument(
+      "--random", action="store_true",
+      help="use a random agent instead of a trained model",
+   )
+   parser.add_argument(
+      "--multi-task", action="store_true",
+      help="sample a random task from TASK_POOL each episode",
+   )
+   parser.add_argument(
+      "--oracle", action="store_true",
+      help="watch the oracle instead of a trained model",
+   )
+   parser.add_argument(
+      "--sequential", action="store_true",
+      help="cycle through TASK_POOL in order (use with --oracle)",
+   )
+   parser.add_argument(
+      "--headless", action="store_true",
+      help="run without GUI and print a performance summary",
+   )
+   parser.add_argument(
+      "--episodes", type=int, default=100,
+      help="number of episodes for --headless mode (default: 100)",
+   )
+   parser.add_argument(
+      "--verbose", action="store_true",
+      help="print every episode result in --headless mode",
+   )
+   args = parser.parse_args()
 
-    if args.oracle:
-        run_oracle_demo(sequential=args.sequential, prompt=args.prompt)
-    else:
-        run_demo(args.model, args.prompt, args.random, args.multi_task)
+   if args.headless:
+      run_headless(
+         model_path=args.model,
+         prompt=args.prompt,
+         multi_task=args.multi_task,
+         n_episodes=args.episodes,
+         verbose=args.verbose,
+      )
+   else:
+      run_demo(
+         model_path=args.model,
+         prompt=args.prompt,
+         use_random=args.random,
+         multi_task=args.multi_task,
+         use_oracle=args.oracle,
+         sequential=args.sequential,
+      )
