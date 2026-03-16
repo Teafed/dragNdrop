@@ -12,11 +12,12 @@ stages:
    0  reach only              n_shapes 1     gate 50%  ceiling  30k
    1  touch only              n_shapes 1     gate 50%  ceiling  40k
    2  drag only               n_shapes 1     gate 40%  ceiling  60k
-   3  sequence only           n_shapes 2-3   gate 60%  ceiling 150k
-   4  + arrange_in_region     n_shapes 2-3   gate 60%  ceiling 150k
-   5  + arrange_in_line       n_shapes 2-4   gate 60%  ceiling 200k
-   6  + groups (fewer shapes) n_shapes 2-3   gate 40%  ceiling 200k
-   7  all tasks               n_shapes 2-6   no gate   remaining steps
+   # --- WAVE 3 STAGES DISABLED FOR STARTER TASK DEBUGGING ---
+   # 3  sequence only           n_shapes 2-3   gate 60%  ceiling 150k
+   # 4  + arrange_in_region     n_shapes 2-3   gate 60%  ceiling 150k
+   # 5  + arrange_in_line       n_shapes 2-4   gate 60%  ceiling 200k
+   # 6  + groups (fewer shapes) n_shapes 2-3   gate 40%  ceiling 200k
+   # 7  all tasks               n_shapes 2-6   no gate   remaining steps
 
 within each stage, active tasks are sampled with equal probability
 regardless of how many TASK_POOL prompts map to each task.
@@ -75,51 +76,68 @@ _STAGES = [
       "gate_sr":      0.40,   # was 0.70 — drag is harder, accept lower threshold
       "step_ceiling": 60_000, # was 75k
    },
-   # --- wave 3 stages: multi-shape arrangement ---
+
+   # --- WAVE 3 STAGES: commented out for starter task debugging ---
+   # Uncomment these blocks (and remove the final-stage override below)
+   # once reach/touch/drag are solving reliably.
+
+   # {
+   #    "name":         "stage 3 — sequence",
+   #    "tasks":        ["arrange_in_sequence"],
+   #    "n_shapes_min": 2,
+   #    "n_shapes_max": 3,
+   #    "gate_task":    "arrange_in_sequence",
+   #    "gate_sr":      0.60,
+   #    "step_ceiling": 150_000,
+   # },
+   # {
+   #    "name":         "stage 4 — + region",
+   #    "tasks":        ["arrange_in_sequence", "arrange_in_region"],
+   #    "n_shapes_min": 2,
+   #    "n_shapes_max": 3,
+   #    "gate_task":    "arrange_in_region",
+   #    "gate_sr":      0.60,
+   #    "step_ceiling": 150_000,
+   # },
+   # {
+   #    "name":         "stage 5 — + line",
+   #    "tasks":        ["arrange_in_sequence", "arrange_in_region",
+   #                     "arrange_in_line"],
+   #    "n_shapes_min": 2,
+   #    "n_shapes_max": 4,
+   #    "gate_task":    "arrange_in_line",
+   #    "gate_sr":      0.60,
+   #    "step_ceiling": 200_000,
+   # },
+   # {
+   #    "name":         "stage 6 — + groups (fewer shapes)",
+   #    "tasks":        ["arrange_in_sequence", "arrange_in_region",
+   #                     "arrange_in_line", "arrange_in_groups"],
+   #    "n_shapes_min": 2,
+   #    "n_shapes_max": 3,   # fewer shapes — groups is hard, ramp slowly
+   #    "gate_task":    "arrange_in_groups",
+   #    "gate_sr":      0.40,
+   #    "step_ceiling": 200_000,
+   # },
+   # {
+   #    "name":         "stage 7 — all tasks",
+   #    "tasks":        SUPPORTED_TASKS,
+   #    "n_shapes_min": 2,
+   #    "n_shapes_max": 6,
+   #    "gate_task":    None,   # no gate — stay here for remaining steps
+   #    "gate_sr":      None,
+   #    "step_ceiling": None,
+   # },
+
+   # NOTE: stage 2 (drag) is currently the FINAL stage. it has no gate_task=None
+   # so we add a terminal "stay here" stage that mirrors the old stage 7 behaviour
+   # but only for the three starter tasks. Remove this once wave 3 is re-enabled.
    {
-      "name":         "stage 3 — sequence",
-      "tasks":        ["arrange_in_sequence"],
-      "n_shapes_min": 2,
-      "n_shapes_max": 3,
-      "gate_task":    "arrange_in_sequence",
-      "gate_sr":      0.60,
-      "step_ceiling": 150_000,
-   },
-   {
-      "name":         "stage 4 — + region",
-      "tasks":        ["arrange_in_sequence", "arrange_in_region"],
-      "n_shapes_min": 2,
-      "n_shapes_max": 3,
-      "gate_task":    "arrange_in_region",
-      "gate_sr":      0.60,
-      "step_ceiling": 150_000,
-   },
-   {
-      "name":         "stage 5 — + line",
-      "tasks":        ["arrange_in_sequence", "arrange_in_region",
-                       "arrange_in_line"],
-      "n_shapes_min": 2,
-      "n_shapes_max": 4,
-      "gate_task":    "arrange_in_line",
-      "gate_sr":      0.60,
-      "step_ceiling": 200_000,
-   },
-   {
-      "name":         "stage 6 — + groups (fewer shapes)",
-      "tasks":        ["arrange_in_sequence", "arrange_in_region",
-                       "arrange_in_line", "arrange_in_groups"],
-      "n_shapes_min": 2,
-      "n_shapes_max": 3,   # fewer shapes — groups is hard, ramp slowly
-      "gate_task":    "arrange_in_groups",
-      "gate_sr":      0.40,
-      "step_ceiling": 200_000,
-   },
-   {
-      "name":         "stage 7 — all tasks",
-      "tasks":        SUPPORTED_TASKS,
-      "n_shapes_min": 2,
-      "n_shapes_max": 6,
-      "gate_task":    None,   # no gate — stay here for remaining steps
+      "name":         "stage 3 — starter tasks (final)",
+      "tasks":        ["reach", "touch", "drag"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 1,
+      "gate_task":    None,   # no gate — stay here for remaining budget
       "gate_sr":      None,
       "step_ceiling": None,
    },
@@ -133,17 +151,73 @@ _FALLBACKS = {
    "reach":               "move the cursor to the shape",
    "touch":               "click on the shape",
    "drag":                "drag the shape to the left side",
+   # wave 3 fallbacks kept here for when they're re-enabled
    "arrange_in_sequence": "sort shapes from smallest to largest left to right",
    "arrange_in_line":     "arrange shapes in a horizontal line evenly spaced",
    "arrange_in_region":   "move all shapes to the left side",
    "arrange_in_groups":   "group shapes by color",
 }
 
+# Starter-task-only prompt pool for the disabled-wave-3 phase.
+# Only prompts for reach / touch / drag are active; the others are still
+# defined (so nothing else in the codebase breaks) but won't be sampled
+# during training because none of the active stages reference them.
+_STARTER_TASK_POOL = [
+   # reach
+   "move the cursor to the shape",
+   "move the cursor to the yellow shape",
+   "move the cursor to the triangle",
+   # touch
+   "click on the shape",
+   "click on the red shape",
+   "click on the square",
+   # drag
+   "drag the shape to the left side",
+   "drag the shape to the right side",
+   "drag the shape to the top",
+   "drag the shape to the bottom",
+]
+
+# Wave 3 prompts — still defined, just not sampled during this debug phase.
+# Uncomment the TASK_POOL import line in _build_prompt_pool() to restore them.
+_WAVE3_PROMPT_POOL = [
+   # arrange_in_sequence
+   "sort shapes from smallest to largest left to right",
+   "sort shapes from largest to smallest left to right",
+   "sort shapes from smallest to largest top to bottom",
+   "sort shapes from largest to smallest top to bottom",
+   # arrange_in_line
+   "arrange shapes in a horizontal line evenly spaced",
+   "arrange shapes in a vertical line evenly spaced",
+   "arrange shapes in a horizontal line sorted smallest to largest",
+   "arrange shapes in a vertical line sorted largest to smallest",
+   # arrange_in_region
+   "move all shapes to the left side",
+   "move all shapes to the right side",
+   "move all shapes to the top",
+   "move all shapes to the bottom",
+   # arrange_in_groups
+   "group shapes by color",
+   "put shapes of the same color close together",
+   "group shapes by type",
+   "put shapes of the same type close together",
+   "group the circles squares and triangles separately",
+]
+
 
 def _build_prompt_pool() -> dict:
-   """return {task_name: [prompt, ...]} by parsing TASK_POOL once at import."""
+   """
+   return {task_name: [prompt, ...]} by parsing the active prompt pool.
+
+   CHANGED: uses _STARTER_TASK_POOL instead of TASK_POOL so wave 3 prompts
+   don't pollute the pool while those stages are disabled. Swap back to
+   TASK_POOL (from config) once wave 3 stages are re-enabled.
+   """
+   # To restore wave 3: replace _STARTER_TASK_POOL with TASK_POOL below.
+   active_pool = _STARTER_TASK_POOL
+
    pool = {t: [] for t in SUPPORTED_TASKS}
-   for prompt in TASK_POOL:
+   for prompt in active_pool:
       try:
          goal = parse_goal(prompt)
          task = goal["task"]

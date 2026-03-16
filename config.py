@@ -44,14 +44,6 @@ N_SHAPE_TYPES  = len(SHAPE_TYPES)
 SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
 
 # ---------------------------------------------------------------------------
-# goal embedding
-# ---------------------------------------------------------------------------
-
-EMBEDDING_MODEL   = "all-MiniLM-L6-v2"
-EMBEDDING_DIM     = 384
-GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
-
-# ---------------------------------------------------------------------------
 # policy architecture
 # ---------------------------------------------------------------------------
 
@@ -86,30 +78,23 @@ def get_obs_size() -> int:
            + GOAL_ENCODING_DIM)
 
 # ---------------------------------------------------------------------------
-# task framework — wave 4
+# task framework
+#
+# WAVE 3 TASKS DISABLED FOR STARTER TASK DEBUGGING.
+# To re-enable: uncomment the wave 3 entries in SUPPORTED_TASKS and TASK_POOL,
+# then restore the wave 3 stages in curriculum.py.
 # ---------------------------------------------------------------------------
-#
-# starter tasks (cursor skill building):
-#   reach      move cursor within GRIP_RADIUS of target shape
-#   touch      activate grip while overlapping target shape
-#   drag       grip shape and move it into a target region
-#
-# wave 3 tasks (2x2x2 cube):
-#   arrange_in_sequence  one target space, unbounded, ordered
-#   arrange_in_line      one target space, bounded, ordered/unordered
-#   arrange_in_region    one target space, bounded, unordered
-#   arrange_in_groups    many target spaces, bounded, unordered
 
 SUPPORTED_TASKS = [
-   # starter tasks
+   # starter tasks — ACTIVE
    "reach",
    "touch",
    "drag",
-   # wave 3 tasks
-   "arrange_in_sequence",
-   "arrange_in_line",
-   "arrange_in_region",
-   "arrange_in_groups",
+   # wave 3 tasks — DISABLED (comment back in when ready)
+   # "arrange_in_sequence",
+   # "arrange_in_line",
+   # "arrange_in_region",
+   # "arrange_in_groups",
 ]
 
 # ---------------------------------------------------------------------------
@@ -117,7 +102,7 @@ SUPPORTED_TASKS = [
 # ---------------------------------------------------------------------------
 
 TASK_POOL = [
-   # starter tasks
+   # --- starter tasks (ACTIVE) ---
    "move the cursor to the shape",
    "move the cursor to the yellow shape",
    "move the cursor to the triangle",
@@ -129,28 +114,29 @@ TASK_POOL = [
    "drag the shape to the top",
    "drag the shape to the bottom",
 
+   # --- wave 3 tasks (DISABLED — uncomment to restore) ---
    # arrange_in_sequence
-   "sort shapes from smallest to largest left to right",
-   "sort shapes from largest to smallest left to right",
-   "sort shapes from smallest to largest top to bottom",
-   "sort shapes from largest to smallest top to bottom",
+   # "sort shapes from smallest to largest left to right",
+   # "sort shapes from largest to smallest left to right",
+   # "sort shapes from smallest to largest top to bottom",
+   # "sort shapes from largest to smallest top to bottom",
 
    # arrange_in_line
-   "arrange shapes in a horizontal line evenly spaced",
-   "arrange shapes in a vertical line evenly spaced",
-   "arrange shapes in a horizontal line sorted smallest to largest",
-   "arrange shapes in a vertical line sorted largest to smallest",
+   # "arrange shapes in a horizontal line evenly spaced",
+   # "arrange shapes in a vertical line evenly spaced",
+   # "arrange shapes in a horizontal line sorted smallest to largest",
+   # "arrange shapes in a vertical line sorted largest to smallest",
 
    # arrange_in_region
-   "move all shapes to the left side",
-   "move all shapes to the right side",
-   "move all shapes to the top",
-   "move all shapes to the bottom",
+   # "move all shapes to the left side",
+   # "move all shapes to the right side",
+   # "move all shapes to the top",
+   # "move all shapes to the bottom",
 
    # arrange_in_groups
-   "group shapes by color",
-   "put shapes of the same color close together",
-   "group shapes by type",
-   "put shapes of the same type close together",
-   "group the circles squares and triangles separately",
+   # "group shapes by color",
+   # "put shapes of the same color close together",
+   # "group shapes by type",
+   # "put shapes of the same type close together",
+   # "group the circles squares and triangles separately",
 ]

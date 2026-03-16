@@ -9,6 +9,15 @@ prompt via a sentence embedding model.
 
 ---
 
+## current status
+
+**Wave 3 tasks are temporarily disabled while debugging starter task learning.**
+Training currently runs only on `reach`, `touch`, and `drag` (1 shape, cursor
+skill building). Once these solve reliably, wave 3 stages can be re-enabled by
+uncommenting the relevant blocks in `config.py` and `curriculum.py`.
+
+---
+
 ## install
 
 ```bash
@@ -20,54 +29,56 @@ pip install gymnasium stable-baselines3 pygame numpy torch \
 
 ## quickstart
 
-**watch the oracle solve tasks (no training needed):**
+**watch the oracle solve starter tasks (no training needed):**
 ```bash
-python demo.py --oracle --prompt "move all shapes to the left side"
-python demo.py --oracle --prompt "arrange shapes in horizontal line"
-python demo.py --oracle --prompt "group shapes by color"
-python demo.py --oracle --sequential   # cycle through all task pool prompts
+python demo.py --oracle --prompt "move the cursor to the shape"
+python demo.py --oracle --prompt "click on the shape"
+python demo.py --oracle --prompt "drag the shape to the left side"
+python demo.py --oracle --sequential   # cycle through active task pool prompts
 ```
 
-**demo keybinds:**
+**reach-task diagnostic demo (isolated, one shape only):**
+```bash
+python demo_reach.py --oracle                                  # oracle on reach (sanity check)
+python demo_reach.py --model models/shape_agent/best_model    # trained agent on reach
+python demo_reach.py --random                                  # random baseline
+python demo_reach.py --oracle --headless --episodes 200       # stats only, no window
+```
+
+**demo keybinds (both demo.py and demo_reach.py):**
 ```
 space    pause / unpause
 n        skip to next episode
+r        reset current episode  (demo_reach.py only)
 d        dump full env + oracle state to console
+s        step one frame (auto-pauses)
 q        quit
 ```
 
 **full training pipeline (oracle warm-start → BC → PPO):**
 ```bash
 python train.py
-python train.py --timesteps 800000 --bc-episodes 500 --bc-epochs 30 # same as default
+python train.py --timesteps 400000 --bc-episodes 500 --bc-epochs 30
 python train.py --force-demos          # re-collect oracle demos even if cached
-python train.py --start-stage 3        # skip straight to curriculum stage 3 tasks
 ```
 
 **skip oracle warm-start:**
 ```bash
 python train.py --no-oracle
-python train.py --no-curriculum        # all tasks from step 0
+python train.py --no-curriculum        # all active tasks from step 0
 ```
 
 **watch a trained agent:**
 ```bash
 python demo.py --model models/shape_agent/best_model
-python demo.py --model models/shape_agent/best_model --prompt "group shapes by color"
+python demo_reach.py --model models/shape_agent/best_model    # reach only
 ```
 
 **run diagnostics:**
 ```bash
 python debug.py
-python debug.py --oracle --skip-render # includes oracle solve rates + BC loss
-python debug.py --oracle-episodes 40 --skip-render
-```
-
-**run short hyperparameter trials**
-```bash
-python sweep.py                        # default 50k steps
-python sweep.py --steps 30000
-python sweep.py --out logs/sweep1      # custom output prefix
+python debug.py --oracle               # + oracle solve rates + BC loss
+python debug.py --oracle-episodes 40
 ```
 
 **tensorboard:**
@@ -81,15 +92,18 @@ tensorboard --logdir logs/tensorboard
 
 ```
 config.py           — shared constants: canvas size, obs dims, task lists
+                      (wave 3 tasks currently commented out)
 shape_env.py        — gymnasium environment: cursor, shapes, obs/action spaces, rewards
 llm_goal_parser.py  — rule-based goal parser (task, axis, direction, attribute, region)
 oracle.py           — scripted expert policy + demo collection for BC warm-start
 bc_train.py         — behavior cloning trainer + bicameral network definition
-curriculum.py       — staged curriculum manager (7 stages, performance-gated)
+curriculum.py       — staged curriculum manager (starter stages only while debugging)
 train.py            — training entry point (oracle BC warm-start → PPO fine-tune)
 callbacks.py        — SB3 callbacks: per-task solve rates, curriculum advancement
 demo.py             — pygame demo: oracle or trained model, pause/dump controls
+demo_reach.py       — reach-only diagnostic demo with dist/score HUD and grip ring
 debug.py            — diagnostic script: env sanity, oracle solve rates, BC loss curve
+sweep.py            — lightweight hyperparameter sweep over short training trials
 ```
 
 ---
@@ -148,20 +162,25 @@ overlap on [14-43] is intentional.
 ```
 [dx, dy, grip]   all continuous in [-1, 1]
 
-dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (25px)
+dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (15px)
 grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
           <= GRIP_THRESHOLD       -> release held shape
 ```
 
 ---
 
-## supported tasks
+## active tasks
+
+| task   | description                             | example prompt                   |
+|--------|-----------------------------------------|----------------------------------|
+| reach  | move cursor within grip radius of shape | "move the cursor to the shape"   |
+| touch  | activate grip while overlapping shape   | "click on the shape"             |
+| drag   | grip and drag shape into a target region| "drag the shape to the left side"|
+
+### disabled tasks (wave 3 — re-enable once starter tasks solve)
 
 | task                  | description                              | example prompt                              |
 |-----------------------|------------------------------------------|---------------------------------------------|
-| reach                 | move cursor within grip radius of shape  | "move the cursor to the shape"              |
-| touch                 | activate grip while overlapping shape    | "click on the shape"                        |
-| drag                  | grip and drag shape into a target region | "drag the shape to the left side"           |
 | arrange_in_sequence   | order shapes along axis by attribute     | "sort shapes smallest to largest"           |
 | arrange_in_line       | place shapes in an evenly spaced line    | "arrange shapes in a horizontal line"       |
 | arrange_in_region     | move all shapes into a canvas region     | "move all shapes to the left side"          |
@@ -169,24 +188,42 @@ grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
 
 ---
 
-## curriculum (7 stages)
+## curriculum (active stages)
 
-Training builds from cursor fundamentals up to full multi-shape tasks:
+Training builds cursor fundamentals before unlocking multi-shape tasks.
+Wave 3 stages are commented out in `curriculum.py` until starter tasks
+solve reliably.
+
+| stage | tasks active              | n_shapes | gate | step ceiling |
+|-------|---------------------------|----------|------|--------------|
+| 0     | reach                     | 1        | 50%  | 30k          |
+| 1     | touch                     | 1        | 50%  | 40k          |
+| 2     | drag                      | 1        | 40%  | 60k          |
+| 3     | reach + touch + drag      | 1        | —    | remaining    |
+
+### disabled stages (wave 3)
 
 | stage | tasks active                  | n_shapes | gate | step ceiling |
 |-------|-------------------------------|----------|------|--------------|
-| 0     | reach                         | 1        | 80%  | 50k          |
-| 1     | touch                         | 1        | 80%  | 50k          |
-| 2     | drag                          | 1        | 70%  | 75k          |
 | 3     | arrange_in_sequence           | 2-3      | 60%  | 150k         |
 | 4     | + arrange_in_region           | 2-3      | 60%  | 150k         |
 | 5     | + arrange_in_line             | 2-4      | 60%  | 200k         |
-| 6     | all tasks                     | 2-6      | --   | remaining    |
+| 6     | + arrange_in_groups           | 2-3      | 40%  | 200k         |
+| 7     | all tasks                     | 2-6      | —    | remaining    |
 
 Advancement is performance-gated on the newest task's solve rate,
 with a step ceiling so training never stalls on a hard stage.
 
-To skip ahead: `python train.py --start-stage 3`
+---
+
+## re-enabling wave 3
+
+When starter tasks are solving reliably:
+
+1. **`config.py`** — uncomment the wave 3 entries in `SUPPORTED_TASKS` and `TASK_POOL`.
+2. **`curriculum.py`** — uncomment stages 3–7, remove the temporary "starter tasks (final)" stage,
+   and change `_build_prompt_pool()` to use `TASK_POOL` instead of `_STARTER_TASK_POOL`.
+3. Adjust `--timesteps` in `train.py` (800k+ recommended for the full curriculum).
 
 ---
 
@@ -195,15 +232,15 @@ To skip ahead: `python train.py --start-stage 3`
 Training from scratch is slow because the agent must simultaneously discover
 cursor mechanics and task semantics. The oracle warm-start decouples these:
 
-1. oracle - scripted policy using navigate-then-drag sub-phases:
-   navigate -> grip_on -> drag -> grip_off. solves all tasks analytically.
-   demos saved to logs/oracle_demos.npz and reused across runs.
+1. **oracle** — scripted policy using navigate-then-drag sub-phases:
+   navigate → grip_on → drag → grip_off. solves all tasks analytically.
+   demos saved to `logs/oracle_demos.npz` and reused across runs.
 
-2. behavior cloning - supervised imitation of oracle demos trains the
+2. **behavior cloning** — supervised imitation of oracle demos trains the
    bicameral network. gives the policy a strong cursor-control prior before
    any RL signal is seen.
 
-3. PPO fine-tune - refines the BC policy through environment interaction,
+3. **PPO fine-tune** — refines the BC policy through environment interaction,
    handling spawn variance the deterministic oracle navigates perfectly.
 
 ---
@@ -211,48 +248,54 @@ cursor mechanics and task semantics. The oracle warm-start decouples these:
 ## reward design
 
 ```
-step reward  = score_delta x REWARD_SCALE
-             + STEP_PENALTY (-0.02 per step)
-             + COMPLETION_BONUS (+25.0 on solve)
-
-score_delta  = current_score - previous_score
-               (positive when shapes move toward goal, negative otherwise)
+step reward  = score_delta x 10.0
+             + rank_delta  x  2.0
+             + STEP_PENALTY        (-0.02 per step)
+             + inactivity_penalty  (-0.10 when cursor barely moves)
+             + wall_penalty        (-0.05 when cursor hits margin)
+             + grip_bonus          (+0.10 when holding target, touch/drag only)
+             + COMPLETION_BONUS    (+50.0 on solve)
 ```
 
 Score functions per task:
-- reach / touch / drag: proximity or grip-activation score in [0, 1]
-- arrange_in_sequence: spearman rank correlation of positions vs attribute values
-- arrange_in_line: 0.6 x gap evenness + 0.4 x perpendicular spread score
-- arrange_in_region: mean per-shape region penetration score
-- arrange_in_groups: 0.5 x global inter/intra distance ratio
-                   + 0.5 x per-shape nearest-neighbor isolation score
+- **reach**: two-zone proximity to target — continuous gradient from half-canvas distance all the way into GRIP_RADIUS.
+- **touch**: same two-zone proximity as reach, jumps to 1.0 only when holding AND overlapping.
+- **drag**: phase 1 = cursor proximity to shape (guides navigation + grip); phase 2 = shape proximity to region boundary (guides dragging).
 
 ---
 
 ## oracle design
 
-The oracle uses a zone-planning approach per task:
+The oracle uses a navigate-then-drag loop per task:
 
-- sequence / line: assigns each shape to an ideal slot via greedy
-  nearest-available-slot. priority is proportional to pixel distance from
-  ideal position, so the most-displaced shape is always tackled first.
+- **reach**: navigate cursor until within GRIP_RADIUS of target. No grip needed.
+- **touch**: navigate to target, activate grip (GRIP_ON phase), release.
+- **drag**: navigate to target, grip, drag to a point 30–120px past the region boundary, release.
 
-- region: targets a random depth 30-120px past the boundary so shapes
-  land comfortably inside, not just over the threshold.
+Sub-phases per committed shape: `NAVIGATE → GRIP_ON → DRAG → GRIP_OFF → DONE`.
 
-- groups: pre-assigns each unique attribute value to a canvas zone using
-  greedy maximin (each new group gets the zone furthest from all existing
-  groups). new attribute values discovered mid-episode get the next
-  farthest unoccupied zone.
+---
+
+## reach diagnostic demo (demo_reach.py)
+
+`demo_reach.py` hard-locks the environment to the reach task with one shape.
+Two extra rings are drawn around the target:
+
+- **yellow ring** — visual highlight of the target shape
+- **blue ring** — exact `GRIP_RADIUS` boundary (cursor centre must enter this to score 1.0)
+
+The HUD shows `dist_px` (raw pixel distance), `score` (0–1), `holding`, and
+oracle `phase` every frame — the key signals for diagnosing whether the agent
+is closing distance, oscillating, or ignoring the target entirely.
 
 ---
 
 ## adding new tasks
 
-1. add score function \_score_<task>() in shape_env.py
-2. add branch in _compute_task_score() to call it
-3. add task name to SUPPORTED_TASKS and TASK_POOL in config.py
-4. add goal parsing in llm_goal_parser.py
-5. add oracle priority function \_priorities_<task>() in oracle.py
-6. add oracle target computation in _compute_target() in oracle.py
-7. add a curriculum stage in curriculum.py if needed
+1. add score function `_score_<task>()` in `shape_env.py`
+2. add branch in `_compute_task_score()` to call it
+3. add task name to `SUPPORTED_TASKS` and `TASK_POOL` in `config.py`
+4. add goal parsing in `llm_goal_parser.py`
+5. add oracle priority function `_priorities_<task>()` in `oracle.py`
+6. add oracle target computation in `_compute_target()` in `oracle.py`
+7. add a curriculum stage in `curriculum.py` if needed
