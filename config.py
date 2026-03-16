@@ -42,6 +42,7 @@ RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM   #
 SHAPE_TYPES    = ["circle", "square", "triangle"]
 N_SHAPE_TYPES  = len(SHAPE_TYPES)
 SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
+COLOR_NAMES_GOAL = ["red", "green", "teal", "yellow", "purple"]
 
 # ---------------------------------------------------------------------------
 # policy architecture

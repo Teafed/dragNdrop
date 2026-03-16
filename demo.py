@@ -208,6 +208,96 @@ def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None):
 
 
 # ---------------------------------------------------------------------------
+# saliency analysis
+# ---------------------------------------------------------------------------
+
+# obs region labels for the 108-dim vector
+_OBS_REGIONS = [
+   ("cursor_state",   slice(0,   4),  "cx cy holding grabbed_idx"),
+   ("grabbed_shape",  slice(4,   9),  "grabbed shape features"),
+   ("nearest_shape",  slice(9,   14), "nearest shape features"),
+   ("all_shapes",     slice(14,  44), "all 6 shapes (zero-padded)"),
+   ("goal_struct",    slice(44,  76), "structured goal one-hots"),
+   ("goal_semantic",  slice(76,  108),"MiniLM semantic projection"),
+]
+
+
+def compute_saliency(model, obs_np: np.ndarray) -> dict:
+   """
+   compute |d(action)/d(obs)| for each obs dimension.
+   returns mean absolute gradient per obs region.
+
+   this shows which parts of the observation the policy is actually
+   sensitive to — high gradient = policy is "looking at" that region.
+   near-zero gradient on goal_struct means the structured encoding
+   is being ignored despite being in the obs.
+   """
+   import torch
+   obs_t = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+   obs_t.requires_grad_(True)
+
+   # use the policy's forward pass directly
+   policy = model.policy
+   with torch.enable_grad():
+      actions, _, _ = policy.forward(obs_t)
+      # sum all action dims so we get a scalar to differentiate
+      actions.sum().backward()
+
+   grad = obs_t.grad.squeeze(0).abs().detach().numpy()
+
+   result = {}
+   for name, slc, desc in _OBS_REGIONS:
+      result[name] = {
+         "mean_grad": float(grad[slc].mean()),
+         "max_grad":  float(grad[slc].max()),
+         "desc":      desc,
+      }
+   return result
+
+
+def print_saliency(saliency: dict, prompt: str, detail: bool = False):
+   """
+   print saliency table with a bar chart normalised to the max region.
+   if detail=True, also show per-field breakdown within goal_struct.
+   """
+   from config import (SUPPORTED_TASKS, COLOR_NAMES_GOAL, SHAPE_TYPES)
+
+   max_grad = max(v["mean_grad"] for k, v in saliency.items() if k != "goal_struct_raw") + 1e-8
+   print(f"\n  saliency — {prompt}")
+   print(f"  {'region':<16} {'mean |grad|':>11}  bar")
+   print(f"  {'-'*52}")
+   for name, vals in saliency.items():
+      if name == "goal_struct_raw": continue
+      g   = vals["mean_grad"]
+      bar = "█" * int(g / max_grad * 30)
+      print(f"  {name:<16} {g:>11.5f}  {bar}")
+
+   if detail and "goal_struct_raw" in saliency:
+      # break down goal_struct by field
+      raw = saliency["goal_struct_raw"]   # per-dim gradients (32,)
+      fields = [
+         ("task",      SUPPORTED_TASKS,   7),
+         ("color",     COLOR_NAMES_GOAL + ["none"], 6),
+         ("type",      SHAPE_TYPES + ["none"],       4),
+         ("region",    ["left","right","top","bottom","none"], 5),
+         ("axis",      ["x","y","none"],              3),
+         ("direction", ["asc","desc","none"],          3),
+         ("attribute", ["size","color","none"],        3),
+         ("bounded",   ["bounded"],                    1),
+      ]
+      print(f"\n  goal_struct field breakdown:")
+      offset = 0
+      for fname, labels, ndim in fields:
+         vals_f = raw[offset:offset+ndim]
+         peak_i = int(vals_f.argmax())
+         peak_v = float(vals_f[peak_i])
+         bar    = "█" * int(peak_v / (max_grad + 1e-8) * 30)
+         label  = labels[peak_i] if peak_i < len(labels) else str(peak_i)
+         print(f"    {fname:<12} peak={label:<12} {peak_v:.5f}  {bar}")
+         offset += ndim
+   print()
+
+# ---------------------------------------------------------------------------
 # headless diagnostic runner
 # ---------------------------------------------------------------------------
 
