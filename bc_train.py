@@ -51,7 +51,6 @@ behavior cloning trainer for the shape manipulation agent.
 """
 
 import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -59,14 +58,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
 from config import (
    EMBEDDING_DIM, GOAL_ENCODING_DIM, POLICY_HIDDEN_SIZE,
    LEFT_STREAM_DIM, RIGHT_STREAM_DIM,
-   get_obs_size,
 )
 
 # obs slice indices — must match shape_env._get_obs() layout
@@ -79,10 +76,7 @@ _RIGHT_SLICE = slice(14, 108)   # all shapes + goal encoding
 # ---------------------------------------------------------------------------
 
 # fixed seed for GoalEncoder weight init. this ensures the same prompt always
-# produces the same 64-dim encoding across demo collection, BC training, and
-# PPO — regardless of when or where GoalEncoder() is constructed.
-# the encoder is not trained; it is a fixed random projection of the MiniLM
-# sentence embedding. change this constant only if you retrain from scratch.
+# produces the same 64-dim encoding across demo collection, BC training, and PPO
 _GOAL_ENCODER_SEED = 42
 
 
@@ -133,8 +127,7 @@ class BicameralNetwork(nn.Module):
    used directly for BC training and wrapped inside SB3 for PPO.
    """
 
-   def __init__(self, action_dim: int = 3,
-                hidden: int = POLICY_HIDDEN_SIZE):
+   def __init__(self, hidden: int = POLICY_HIDDEN_SIZE):
       super().__init__()
       self.hidden = hidden
 
@@ -243,7 +236,6 @@ class BicameralPolicy(ActorCriticPolicy):
 
    def _build_mlp_extractor(self):
       self.mlp_extractor = _BicameralExtractor(
-         observation_space=self.observation_space,
          hidden=POLICY_HIDDEN_SIZE,
       )
 
@@ -254,9 +246,9 @@ class _BicameralExtractor(nn.Module):
    SB3 expects mlp_extractor to produce (policy_features, value_features).
    """
 
-   def __init__(self, observation_space, hidden: int = POLICY_HIDDEN_SIZE):
+   def __init__(self, hidden: int = POLICY_HIDDEN_SIZE):
       super().__init__()
-      self.net             = BicameralNetwork(action_dim=3, hidden=hidden)
+      self.net             = BicameralNetwork(hidden=hidden)
       self.latent_dim_pi   = hidden * 2
       self.latent_dim_vf   = hidden * 2
 
@@ -422,8 +414,8 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
                       n_shapes: int,
                       vec_env=None,
                       goal: dict = None,
-                      ent_coef: float = 0.02,  # sweep winner was 0.01 but 0.02 keeps more exploration
-                      lr_ppo:   float = 1e-4) -> PPO:  # sweep winner confirmed
+                      ent_coef: float = 0.02,
+                      lr_ppo:   float = 1e-4) -> PPO:
    """
    create a PPO model using BicameralPolicy and copy BC network weights in.
 
@@ -463,8 +455,6 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
       gamma=0.99,
       gae_lambda=0.95,
       clip_range=0.2,
-      # ent_coef and lr_ppo are params — defaults are 0.02 and 3e-5.
-      # sweep.py varies these; train.py uses defaults.
       ent_coef=ent_coef,
       verbose=0,
       tensorboard_log="./logs/tensorboard/",

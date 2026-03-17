@@ -28,18 +28,12 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
-from config import GOAL_ENCODING_DIM
+from prompt_gen import PromptGenerator
 
 
 class ShapeTaskCallback(BaseCallback):
    """
    periodically evaluates the current policy on the CURRENT curriculum stage.
-
-   FIX: the original version captured a single eval env at construction time
-   and never updated it, so after the curriculum advanced from stage 0 (reach)
-   the callback kept reporting reach solve rates even while PPO trained
-   touch/drag.  this version re-samples a fresh env from the curriculum
-   (or from TASK_POOL when curriculum=None) at every evaluation.
 
    args:
       curriculum:      CurriculumManager instance, or None for no curriculum.
@@ -60,19 +54,18 @@ class ShapeTaskCallback(BaseCallback):
       self.n_eval_episodes = n_eval_episodes
       self._last_eval_step = 0
       self._last_metrics   = {}   # cached for TrainingSummaryCallback
+      self._gen            = PromptGenerator()
 
    def _make_eval_env(self):
       """build a fresh Monitor-wrapped ShapeEnv for the current stage."""
       import torch
       from llm_goal_parser import parse_goal, get_embedding
-      from prompt_gen import PromptGenerator
-      _gen = PromptGenerator()
 
       if self.curriculum is not None:
          prompt = self.curriculum.sample_prompt()
          n_shp  = self.curriculum.sample_n_shapes()
       else:
-         prompt = _gen.sample()
+         prompt = self._gen.sample()
          n_shp  = None
 
       goal    = parse_goal(prompt)
@@ -222,14 +215,14 @@ class CurriculumCallback(BaseCallback):
       """
       import torch
       from llm_goal_parser import parse_goal, get_embedding
-      from curriculum import _PROMPT_POOL
+      from prompt_gen import sample_prompt
 
       per_task_sr = {}
 
       for task in self.curriculum.active_tasks:
          solved = []
          for _ in range(self.n_eval_episodes):
-            prompt  = random.choice(_PROMPT_POOL[task])
+            prompt = sample_prompt(task)
             goal    = parse_goal(prompt)
             raw_emb = get_embedding(prompt)
             with torch.no_grad():

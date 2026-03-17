@@ -143,96 +143,6 @@ _STAGES = [
    },
 ]
 
-# ---------------------------------------------------------------------------
-# prompt pool — keyed by task name
-# ---------------------------------------------------------------------------
-
-_FALLBACKS = {
-   "reach":               "move the cursor to the shape",
-   "touch":               "click on the shape",
-   "drag":                "drag the shape to the left side",
-   # wave 3 fallbacks kept here for when they're re-enabled
-   "arrange_in_sequence": "sort shapes from smallest to largest left to right",
-   "arrange_in_line":     "arrange shapes in a horizontal line evenly spaced",
-   "arrange_in_region":   "move all shapes to the left side",
-   "arrange_in_groups":   "group shapes by color",
-}
-
-# Starter-task-only prompt pool for the disabled-wave-3 phase.
-# Only prompts for reach / touch / drag are active; the others are still
-# defined (so nothing else in the codebase breaks) but won't be sampled
-# during training because none of the active stages reference them.
-_STARTER_TASK_POOL = [
-   # reach
-   "move the cursor to the shape",
-   "move the cursor to the yellow shape",
-   "move the cursor to the triangle",
-   # touch
-   "click on the shape",
-   "click on the red shape",
-   "click on the square",
-   # drag
-   "drag the shape to the left side",
-   "drag the shape to the right side",
-   "drag the shape to the top",
-   "drag the shape to the bottom",
-]
-
-# Wave 3 prompts — still defined, just not sampled during this debug phase.
-# Uncomment the TASK_POOL import line in _build_prompt_pool() to restore them.
-_WAVE3_PROMPT_POOL = [
-   # arrange_in_sequence
-   "sort shapes from smallest to largest left to right",
-   "sort shapes from largest to smallest left to right",
-   "sort shapes from smallest to largest top to bottom",
-   "sort shapes from largest to smallest top to bottom",
-   # arrange_in_line
-   "arrange shapes in a horizontal line evenly spaced",
-   "arrange shapes in a vertical line evenly spaced",
-   "arrange shapes in a horizontal line sorted smallest to largest",
-   "arrange shapes in a vertical line sorted largest to smallest",
-   # arrange_in_region
-   "move all shapes to the left side",
-   "move all shapes to the right side",
-   "move all shapes to the top",
-   "move all shapes to the bottom",
-   # arrange_in_groups
-   "group shapes by color",
-   "put shapes of the same color close together",
-   "group shapes by type",
-   "put shapes of the same type close together",
-   "group the circles squares and triangles separately",
-]
-
-
-def _build_prompt_pool() -> dict:
-   """
-   return {task_name: [prompt, ...]} by parsing the active prompt pool.
-
-   CHANGED: uses _STARTER_TASK_POOL instead of TASK_POOL so wave 3 prompts
-   don't pollute the pool while those stages are disabled. Swap back to
-   TASK_POOL (from config) once wave 3 stages are re-enabled.
-   """
-   # To restore wave 3: replace _STARTER_TASK_POOL with TASK_POOL below.
-   active_pool = _STARTER_TASK_POOL
-
-   pool = {t: [] for t in SUPPORTED_TASKS}
-   for prompt in active_pool:
-      try:
-         goal = parse_goal(prompt)
-         task = goal["task"]
-         if task in pool:
-            pool[task].append(prompt)
-      except Exception:
-         pass
-   for task, prompts in pool.items():
-      if not prompts:
-         pool[task] = [_FALLBACKS[task]]
-   return pool
-
-
-_PROMPT_POOL = _build_prompt_pool()
-
 
 # ---------------------------------------------------------------------------
 # CurriculumManager
@@ -276,12 +186,10 @@ class CurriculumManager:
    def sample_prompt(self) -> str:
       """
       sample a prompt from the current stage's active tasks.
-      task-balanced: each active task gets equal probability regardless
-      of how many prompts map to it in TASK_POOL.
       """
-      task   = random.choice(self.active_tasks)
-      prompt = random.choice(_PROMPT_POOL[task])
-      return prompt
+      from prompt_gen import sample_prompt
+      task = random.choice(self.active_tasks)
+      return sample_prompt(task)
 
    def sample_n_shapes(self, rng=None) -> int:
       """sample n_shapes uniformly within the current stage's range."""

@@ -14,9 +14,6 @@ wave 3 task framework — four tasks from the 2x2x2 cube:
     arrange_in_groups    shapes partitioned by attribute into subregions
 """
 
-import json
-import os
-import re
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -54,95 +51,10 @@ SUPPORTED_TASKS = [
 def parse_goal(prompt: str) -> dict:
    """
    parse a natural language prompt into a validated goal dict.
-   uses the Anthropic API if ANTHROPIC_API_KEY is set, else stub parser.
    """
-   if os.environ.get("ANTHROPIC_API_KEY", ""):
-      try:
-         goal = _llm_parse(prompt)
-         _validate_goal(goal)
-         return goal
-      except Exception as e:
-         print(f"[goal_parser] LLM parse failed ({e}), using stub fallback.")
-
    goal = _stub_parse(prompt.lower())
    _validate_goal(goal)
    return goal
-
-
-# ---------------------------------------------------------------------------
-# LLM backend
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """
-You are a goal parser for a 2D shape manipulation agent.
-Respond ONLY with a single valid JSON object — no markdown, no extra text.
-
-Schema (all fields required):
-{
-  "task":      "<reach | touch | drag | arrange_in_sequence | arrange_in_line | arrange_in_region | arrange_in_groups>",
-  "axis":      "<x | y | none>",
-  "direction": "<ascending | descending | none>",
-  "attribute": "<size | color | shape_type | none>",
-  "region":    "<left | right | top | bottom | none>",
-  "bounded":   <true | false>
-}
-
-Rules:
-- reach: move cursor close to the target shape. all fields none/false.
-- touch: activate grip while overlapping the target shape. all fields none/false.
-- drag: grip the target shape and drag it into a region.
-  region=left/right/top/bottom, all other fields none, bounded=false.
-- arrange_in_sequence: ordered along axis, perpendicular unconstrained.
-  axis=x/y, direction=ascending/descending, attribute=size/color/shape_type,
-  region=none, bounded=false.
-- arrange_in_line: ordered or evenly spaced along axis AND minimising
-  perpendicular spread. axis=x/y, region=none, bounded=true.
-  direction/attribute=none if just spacing, else set for ordered version.
-- arrange_in_region: all shapes in a canvas subregion.
-  axis=none, direction=none, attribute=none, region=left/right/top/bottom,
-  bounded=true.
-- arrange_in_groups: partitioned by attribute, each group in its own subregion.
-  axis=none, direction=none, attribute=color/shape_type, region=none, bounded=true.
-
-Examples:
-  "move the cursor to the shape"
-  -> {"task":"reach","axis":"none","direction":"none","attribute":"none","region":"none","bounded":false}
-  "click on the shape"
-  -> {"task":"touch","axis":"none","direction":"none","attribute":"none","region":"none","bounded":false}
-  "drag the shape to the left side"
-  -> {"task":"drag","axis":"none","direction":"none","attribute":"none","region":"left","bounded":false}
-  "sort shapes smallest to largest left to right"
-  -> {"task":"arrange_in_sequence","axis":"x","direction":"ascending","attribute":"size","region":"none","bounded":false}
-  "arrange shapes in a horizontal line evenly spaced"
-  -> {"task":"arrange_in_line","axis":"x","direction":"none","attribute":"none","region":"none","bounded":true}
-  "arrange shapes in a horizontal line sorted smallest to largest"
-  -> {"task":"arrange_in_line","axis":"x","direction":"ascending","attribute":"size","region":"none","bounded":true}
-  "move all shapes to the left side"
-  -> {"task":"arrange_in_region","axis":"none","direction":"none","attribute":"none","region":"left","bounded":true}
-  "group shapes by color"
-  -> {"task":"arrange_in_groups","axis":"none","direction":"none","attribute":"color","region":"none","bounded":true}
-  "group shapes by type"
-  -> {"task":"arrange_in_groups","axis":"none","direction":"none","attribute":"shape_type","region":"none","bounded":true}
-""".strip()
-
-
-def _llm_parse(prompt: str) -> dict:
-   try:
-      import anthropic
-   except ImportError:
-      raise RuntimeError("anthropic package not installed")
-
-   client  = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-   message = client.messages.create(
-      model="claude-sonnet-4-6",
-      max_tokens=256,
-      system=_SYSTEM_PROMPT,
-      messages=[{"role": "user", "content": prompt}],
-   )
-   raw = message.content[0].text.strip()
-   raw = re.sub(r"^```[a-z]*\n?", "", raw)
-   raw = re.sub(r"\n?```$",       "", raw)
-   return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +276,9 @@ def get_embedding(prompt: str) -> np.ndarray:
          )
       from config import EMBEDDING_MODEL
       print(f"[goal_parser] loading embedding model '{EMBEDDING_MODEL}'...")
+      import logging
+      logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+      logging.getLogger("transformers").setLevel(logging.ERROR)
       _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
       print("[goal_parser] embedding model ready.")
 
