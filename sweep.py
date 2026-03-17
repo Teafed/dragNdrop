@@ -31,10 +31,9 @@ import time
 import numpy as np
 from stable_baselines3.common.env_util import make_vec_env
 
-from config import MAX_SHAPES, N_ENVS, TASK_POOL
+from config import MAX_SHAPES, N_ENVS
 from shape_env import ShapeEnv
 from curriculum import CurriculumManager
-from llm_goal_parser import parse_goal, get_embedding
 
 
 # ---------------------------------------------------------------------------

@@ -498,6 +498,35 @@ class ShapeEnv(gym.Env):
       # shouldn't reach here if _spawn_shapes guaranteed a match, but fall back
       return 0
 
+   def _matching_shape_indices(self) -> list:
+      """
+      return indices of all shapes satisfying the goal's target spec.
+      for starter tasks only — arrangement tasks don't have a target spec.
+
+      if target_color and target_type are both "none"/"any", all shapes match.
+      if only one is specified, shapes matching that attribute all match.
+      if both are specified, only shapes matching both match.
+
+      this is used by _is_solved and _progress_* so that tasks like
+      "click any square" count as solved when the agent reaches any square,
+      not just shape 0.  for specific targets (e.g. "the red square") the
+      spawn logic guarantees exactly one match, so the result is [target_idx].
+      """
+      tc = self.goal.get("target_color", "none")
+      tt = self.goal.get("target_type",  "none")
+      want_color = tc not in ("none", "any")
+      want_type  = tt not in ("none", "any")
+
+      matches = []
+      for i, s in enumerate(self.shapes):
+         color_ok = (not want_color) or (s.color_name == tc)
+         type_ok  = (not want_type)  or (s.shape_type == tt)
+         if color_ok and type_ok:
+            matches.append(i)
+
+      # always return at least one shape (fallback to target_idx)
+      return matches if matches else [self.target_idx]
+
    # -------------------------------------------------------------------------
    # obs and goal encoding
    # -------------------------------------------------------------------------

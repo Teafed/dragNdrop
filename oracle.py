@@ -63,7 +63,7 @@ from shape_env import (
    SCORE_SOLVE_THRESHOLD, REGION_INNER, LINE_SPREAD_THRESHOLD,
 )
 from config import (
-   TASK_POOL, MAX_SHAPES, CURSOR_SPEED, GRIP_RADIUS, GRIP_THRESHOLD,
+   MAX_SHAPES, CURSOR_SPEED, GRIP_RADIUS, GRIP_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------
@@ -625,15 +625,24 @@ class OraclePolicy:
 # demonstration collection
 # ---------------------------------------------------------------------------
 
+def _sample_task(rng, weights: dict):
+   """sample a task name according to weights dict, or None for uniform."""
+   if weights is None:
+      return None
+   tasks = list(weights.keys())
+   probs = np.array([weights[t] for t in tasks], dtype=float)
+   probs /= probs.sum()
+   return tasks[int(rng.choice(len(tasks), p=probs))]
 
 def collect_demonstrations(
    n_episodes:   int   = 500,
    noise_std:    float = NOISE_STD,
    verbose:      bool  = True,
    goal_encoder        = None,
+   task_weights:  dict  = None,
 ) -> dict:
    """
-   run the oracle across TASK_POOL and collect (obs, action) pairs plus
+   run the oracle across tasks and collect (obs, action) pairs plus
    high-level annotations for future HBC training.
 
    goal_encoder: a GoalEncoder instance to use for encoding prompts into
@@ -653,6 +662,8 @@ def collect_demonstrations(
    from llm_goal_parser import parse_goal, get_embedding
    import torch
    from bc_train import GoalEncoder
+   from prompt_gen import PromptGenerator
+   _gen = PromptGenerator()
 
    if goal_encoder is None:
       goal_encoder = GoalEncoder()
@@ -669,10 +680,10 @@ def collect_demonstrations(
 
    if verbose:
       print(f"\n--- collecting {n_episodes} oracle demonstrations "
-            f"across {len(TASK_POOL)} task pool prompts ---")
+            f"across all task prompts ---")
 
    for ep in range(1, n_episodes + 1):
-      prompt = rng.choice(TASK_POOL)
+      prompt = _gen.sample(task=_sample_task(rng, task_weights))
       goal   = parse_goal(prompt)
       n_shp  = int(rng.integers(2, MAX_SHAPES + 1))
 

@@ -34,7 +34,7 @@ usage:
 """
 
 import random
-from config import TASK_POOL, SUPPORTED_TASKS
+from config import SUPPORTED_TASKS
 from llm_goal_parser import parse_goal
 
 # ---------------------------------------------------------------------------

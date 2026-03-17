@@ -16,7 +16,6 @@ usage:
 
 import argparse
 import os
-import random
 import sys
 import numpy as np
 import torch
@@ -24,7 +23,7 @@ import pygame
 
 from shape_env import ShapeEnv, WINDOW_W, WINDOW_H, FPS, BG_COLOR
 from llm_goal_parser import parse_goal, get_embedding
-from config import GOAL_ENCODING_DIM, TASK_POOL
+from config import GOAL_ENCODING_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +62,9 @@ def encode_goal(goal_encoder, prompt: str) -> np.ndarray:
 
 LEGEND_LINES = [
    "Q      quit",
-   "N      next episode",
    "SPC    pause / unpause",
-   "S      step (one step; pauses first)",
+   "N      next episode",
+   "S      step",
    "D      dump state",
    "SHFT+D episode summary",
 ]
@@ -89,11 +88,21 @@ def draw_scene(surface, env, font, episode, steps, prompt,
    # highlight the target shape for reach/touch/drag tasks so the viewer
    # can tell which shape the agent is supposed to interact with
    task = env.goal.get("task", "")
+   tc   = env.goal.get("target_color", "none")
+   tt   = env.goal.get("target_type",  "none")
    if task in ("reach", "touch", "drag") and env.shapes:
-      t = env.shapes[env.target_idx]
-      pygame.draw.circle(
-         surface, (255, 220, 60),
-         (int(t.x), int(t.y)), int(t.radius) + 6, 2)
+      has_any_spec = (tc not in ("none", "any")) or (tt not in ("none", "any"))
+      matching     = env._matching_shape_indices()
+      if has_any_spec:
+         for i in matching:
+            t = env.shapes[i]
+            pygame.draw.circle(surface, (255, 220, 60),
+                               (int(t.x), int(t.y)), int(t.radius) + 6, 2)
+      else:
+         # all shapes valid — show dim ring on all
+         for t in env.shapes:
+            pygame.draw.circle(surface, (120, 120, 80),
+                               (int(t.x), int(t.y)), int(t.radius) + 6, 1)
 
    # draw cursor via env's own method
    _prev      = env.window
@@ -134,17 +143,35 @@ def draw_scene(surface, env, font, episode, steps, prompt,
 # state and episode summary dumps
 # ---------------------------------------------------------------------------
 
-def dump_state(env, step, episode, extra=None):
+def dump_state(env, step, episode, prompt=None, extra=None):
    """print current env state — bound to D key."""
    score = env._compute_score()
    print(f"\n--- state dump  ep {episode}  step {step} ---")
    print(f"  task    : {env.goal.get('task')}  score={score:.4f}")
+   if prompt:
+      print(f"  prompt  : {prompt}")
    if extra:
       print(f"  {extra}")
    print(f"  cursor  : ({env.cx:.1f}, {env.cy:.1f})  "
          f"holding={env.holding}  grabbed_idx={env.grabbed_idx}")
+   task = env.goal.get("task", "")
+   # parse oracle's committed_shape from extra string if available
+   oracle_target = None
+   if extra and "committed_shape=" in extra:
+      try:
+         cs = extra.split("committed_shape=")[1].split()[0].rstrip(",")
+         oracle_target = int(cs) if cs.lstrip("-").isdigit() else None
+      except Exception:
+         pass
    for i, s in enumerate(env.shapes):
-      marker = " <-- target" if i == env.target_idx else ""
+      if task in ("reach", "touch", "drag"):
+         marker = " <-- target" if i == env.target_idx else ""
+      else:
+         # arrangement: show which shape oracle is currently working on
+         if oracle_target is not None and oracle_target >= 0:
+            marker = " <-- oracle" if i == oracle_target else ""
+         else:
+            marker = ""
       print(f"  shape {i} : ({s.x:.1f}, {s.y:.1f})  "
             f"color={getattr(s,'color_name','?')}  "
             f"size={s.size:.1f}  type={s.shape_type}{marker}")
@@ -192,13 +219,16 @@ def dump_episode_summary(history: list):
 # episode / goal helpers
 # ---------------------------------------------------------------------------
 
-def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None):
+def make_episode(goal_encoder, prompt, multi_task,
+                 sequential_pool=None, task_filter=None):   
    """sample a new prompt (if multi_task or sequential), parse, encode."""
    if sequential_pool is not None:
       p = sequential_pool.pop(0)
       sequential_pool.append(p)   # rotate
-   elif multi_task:
-      p = random.choice(TASK_POOL)
+   elif multi_task or task_filter:
+      from prompt_gen import sample_prompt
+      p = sample_prompt(task_filter)   # None = any task
+
    else:
       p = prompt
    g   = parse_goal(p)
@@ -302,7 +332,8 @@ def print_saliency(saliency: dict, prompt: str, detail: bool = False):
 # ---------------------------------------------------------------------------
 
 def run_headless(model_path: str, prompt: str, multi_task: bool,
-                 n_episodes: int, verbose: bool):
+                 n_episodes: int, verbose: bool,
+                 saliency: bool = False, task_filter: str = None):
    """
    run n_episodes with no GUI and print a performance summary.
    useful for getting solve rates and score distributions outside of training.
@@ -318,7 +349,8 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
 
    history = []
    for ep in range(1, n_episodes + 1):
-      p, g, enc = make_episode(goal_encoder, prompt, multi_task)
+      p, g, enc = make_episode(goal_encoder, prompt, multi_task,
+                              task_filter=task_filter)
       env       = ShapeEnv(goal=g, render_mode=None)
       env.set_goal_encoding(enc)
       obs, _    = env.reset()
@@ -358,20 +390,23 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
 # ---------------------------------------------------------------------------
 
 def run_demo(model_path, prompt, use_random, multi_task,
-             use_oracle, sequential):
+             use_oracle, sequential,
+             show_saliency=False, task_filter=None):
    """
    single render loop for all interactive agent types (model, oracle, random).
    the only difference is how `action` is computed each step.
    """
+   from prompt_gen import PromptGenerator
+   _gen = PromptGenerator()
    pygame.init()
+   pygame.key.set_repeat(400, 80)
    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-   pygame.display.set_caption("shape manipulation — demo")
+   pygame.display.set_caption("dragNdrop demo")
    clock  = pygame.time.Clock()
    font   = pygame.font.SysFont("monospace", 12)
 
    # --- load agent ---
    if use_oracle:
-      from oracle import OraclePolicy
       from bc_train import GoalEncoder
       goal_encoder = GoalEncoder()
       goal_encoder.eval()
@@ -395,12 +430,17 @@ def run_demo(model_path, prompt, use_random, multi_task,
          sys.exit(1)
       agent_label = "MODEL"
 
+   _saliency        = show_saliency and (model is not None)
+   if show_saliency and model is None:
+      print("[demo] --saliency requires a trained model (--model). "
+            "saliency is disabled for oracle/random agents.")
+
    # sequential pool for oracle --sequential mode
-   seq_pool = list(TASK_POOL) if (use_oracle and sequential) else None
+   seq_pool = list(_gen.training_pool()) if (use_oracle and sequential) else None
 
    # --- first episode ---
    cur_prompt, goal, encoding = make_episode(
-      goal_encoder, prompt, multi_task, seq_pool)
+      goal_encoder, prompt, multi_task, seq_pool, task_filter)
    env    = ShapeEnv(goal=goal, render_mode=None)
    env.set_goal_encoding(encoding)
    oracle = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
@@ -412,6 +452,8 @@ def run_demo(model_path, prompt, use_random, multi_task,
    total_reward = 0.0
    paused       = False
    step_once    = False   # set by S key — advance exactly one step
+   ep_terminated  = False   # true once env.terminated — persists until reset
+   ep_truncated   = False   # true once env.truncated — persists until reset
    history      = []      # completed episode records for Shift+D
 
    print(f"\nepisode {episode} — {cur_prompt}")
@@ -453,13 +495,19 @@ def run_demo(model_path, prompt, use_random, multi_task,
                      extra = (f"oracle: phase={oracle.phase}  "
                               f"committed_shape={oracle.committed_shape}  "
                               f"committed_target={oracle.committed_target}")
-                  dump_state(env, steps, episode, extra)
+                  dump_state(env, steps, episode, cur_prompt, extra)
+                  if _saliency:
+                     sal = compute_saliency(model, obs)
+                     print_saliency(sal, cur_prompt)
 
       if not running:
          break
 
-      terminated = truncated = False
       should_step = (not paused) or step_once
+
+      # don't step if episode already ended — S should advance to next episode
+      terminated = ep_terminated
+      truncated  = ep_truncated
 
       if should_step and not skip:
          if use_oracle:
@@ -470,10 +518,16 @@ def run_demo(model_path, prompt, use_random, multi_task,
             action = env.action_space.sample()
 
          obs, reward, terminated, truncated, _ = env.step(action)
-         total_reward += reward
-         steps        += 1
-         step_once     = False
+         total_reward  += reward
+         steps         += 1
+         ep_terminated  = terminated
+         ep_truncated   = truncated
+         # auto-print saliency once at step 1 (fresh scene) and every 100 steps
+         if _saliency and (steps == 1 or steps % 100 == 0):
+            sal = compute_saliency(model, obs)
+            print_saliency(sal, cur_prompt)
 
+      step_once = False   # always clear after this frame
       phase = oracle.phase if oracle is not None else None
       draw_scene(window, env, font,
                  episode, steps, cur_prompt,
@@ -481,7 +535,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
       pygame.display.flip()
       clock.tick(FPS)
 
-      if should_step and (terminated or truncated or skip):
+      episode_done = ((not paused and (terminated or truncated))
+                      or skip
+                      or (ep_terminated or ep_truncated))
+      if episode_done:
          status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
          final_score = env._compute_score()
          # skipped episodes excluded — they reflect user input, not agent performance
@@ -498,9 +555,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
          print(f"episode {episode} {status} — "
                f"steps: {steps}  reward: {total_reward:.2f}  "
                f"score: {final_score:.3f}  task: {cur_prompt}")
-
+         
+         stay_paused = paused or skip
          cur_prompt, goal, encoding = make_episode(
-            goal_encoder, prompt, multi_task, seq_pool)
+            goal_encoder, prompt, multi_task, seq_pool, task_filter)
          env.goal = goal
          env.set_goal_encoding(encoding)
          oracle   = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
@@ -510,7 +568,9 @@ def run_demo(model_path, prompt, use_random, multi_task,
          episode     += 1
          steps        = 0
          total_reward = 0.0
-         paused       = False
+         ep_terminated  = False
+         ep_truncated   = False
+         paused         = stay_paused
          print(f"episode {episode} — {cur_prompt}")
 
    pygame.quit()
@@ -563,6 +623,21 @@ if __name__ == "__main__":
       "--verbose", action="store_true",
       help="print every episode result in --headless mode",
    )
+   parser.add_argument(
+      "--task", type=str, default=None,
+      help=(
+         "filter episodes to a specific task (e.g. reach, touch, drag, "
+         "arrange_in_region). uses prompt_gen to sample varied prompts for "
+         "that task. overrides --prompt when set."
+      ),
+   )
+   parser.add_argument(
+      "--saliency", action="store_true",
+      help=(
+         "show obs gradient saliency. in --headless: printed after every episode. "
+         "in interactive: press D to print for current obs."
+      ),
+   )
    args = parser.parse_args()
 
    if args.headless:
@@ -572,6 +647,8 @@ if __name__ == "__main__":
          multi_task=args.multi_task,
          n_episodes=args.episodes,
          verbose=args.verbose,
+         saliency=args.saliency,
+         task_filter=args.task,
       )
    else:
       run_demo(
@@ -581,4 +658,6 @@ if __name__ == "__main__":
          multi_task=args.multi_task,
          use_oracle=args.oracle,
          sequential=args.sequential,
+         show_saliency=args.saliency,
+         task_filter=args.task,
       )

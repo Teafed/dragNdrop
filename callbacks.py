@@ -65,13 +65,14 @@ class ShapeTaskCallback(BaseCallback):
       """build a fresh Monitor-wrapped ShapeEnv for the current stage."""
       import torch
       from llm_goal_parser import parse_goal, get_embedding
-      from config import TASK_POOL
+      from prompt_gen import PromptGenerator
+      _gen = PromptGenerator()
 
       if self.curriculum is not None:
          prompt = self.curriculum.sample_prompt()
          n_shp  = self.curriculum.sample_n_shapes()
       else:
-         prompt = random.choice(TASK_POOL)
+         prompt = _gen.sample()
          n_shp  = None
 
       goal    = parse_goal(prompt)

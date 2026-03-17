@@ -36,7 +36,8 @@ from stable_baselines3.common.env_util import make_vec_env
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal, get_embedding
 from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCallback
-from config import TASK_POOL, MAX_SHAPES, POLICY_HIDDEN_SIZE, N_ENVS, get_obs_size
+from config import MAX_SHAPES, N_ENVS
+from prompt_gen import PromptGenerator
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +50,13 @@ def make_goal_conditioned_env(goal_encoder, curriculum=None, render_mode=None):
    if curriculum is provided, samples task and n_shapes from the current
    stage. otherwise samples uniformly from TASK_POOL with random n_shapes.
    """
+   _gen = PromptGenerator()
    def _init():
       if curriculum is not None:
          prompt = curriculum.sample_prompt()
          n_shp  = curriculum.sample_n_shapes()
       else:
-         prompt = random.choice(TASK_POOL)
+         prompt = _gen.sample()
          n_shp  = None   # ShapeEnv samples randomly up to MAX_SHAPES
 
       goal    = parse_goal(prompt)
@@ -92,11 +94,12 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
    # EvalCallback still needs one env up front — it's only used for checkpoint
    # saving so it's OK that it stays on stage-0 task.
    def _make_static_eval_env():
+      _gen = PromptGenerator()
       if curriculum is not None:
          prompt = curriculum.sample_prompt()
          n_shp  = curriculum.sample_n_shapes()
       else:
-         prompt = random.choice(TASK_POOL)
+         prompt =_gen.sample()
          n_shp  = None
       goal    = parse_goal(prompt)
       raw_emb = get_embedding(prompt)
@@ -199,7 +202,7 @@ def train(
       # demos are collected across the full task pool regardless of curriculum
       # stage — bc warms up all tasks, then ppo fine-tunes with curriculum.
       print(f"\n--- collecting {bc_episodes} oracle demonstrations "
-            f"across all {len(TASK_POOL)} task pool prompts ---")
+            f"across all task pool prompts ---")
 
       dataset = collect_demonstrations(
          n_episodes=bc_episodes,
