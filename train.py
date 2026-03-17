@@ -25,7 +25,6 @@ training modes:
 
 import argparse
 import os
-import random
 import torch
 
 from stable_baselines3 import PPO
@@ -183,7 +182,7 @@ def train(
    resuming or ablating individual stages).
    """
    from bc_train import (
-      GoalEncoder, BicameralNetwork, BicameralPolicy,
+      GoalEncoder, BicameralPolicy,
       train_bc, build_ppo_from_bc,
    )
    from oracle import collect_demonstrations

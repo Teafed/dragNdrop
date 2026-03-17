@@ -333,7 +333,7 @@ def print_saliency(saliency: dict, prompt: str, detail: bool = False):
 
 def run_headless(model_path: str, prompt: str, multi_task: bool,
                  n_episodes: int, verbose: bool,
-                 saliency: bool = False, task_filter: str = None):
+                 task_filter: str = None):
    """
    run n_episodes with no GUI and print a performance summary.
    useful for getting solve rates and score distributions outside of training.

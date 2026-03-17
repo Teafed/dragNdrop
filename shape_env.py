@@ -47,7 +47,6 @@ from config import (
    MAX_SHAPES, OBS_VALUES_PER_SHAPE, GOAL_ENCODING_DIM, get_obs_size,
    SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
    CURSOR_SPEED, GRIP_THRESHOLD, GRIP_RADIUS,
-   CURSOR_STATE_SIZE, FOCAL_SHAPE_SIZE,
 )
 
 # ---------------------------------------------------------------------------
@@ -213,7 +212,7 @@ class ShapeEnv(gym.Env):
    # gymnasium interface
    # -------------------------------------------------------------------------
 
-   def reset(self, seed=None, options=None):
+   def reset(self, seed=None):
       super().reset(seed=seed)
 
       if self._fixed_n_shapes is None:
@@ -297,6 +296,7 @@ class ShapeEnv(gym.Env):
       rank_delta    = new_rank_corr - self.prev_rank_corr
       rank_reward   = rank_delta * 2.0
 
+      # TODO: actually remove this
       # oscillation penalty removed — it discouraged exploratory backtracking
       # which is needed for the agent to find the grip window and recover from
       # wrong-direction moves. the step penalty and inactivity penalty are
@@ -955,19 +955,3 @@ class ShapeEnv(gym.Env):
       pygame.draw.line(self.window, col,
                        (cx + r + gap, cy), (cx + r + gap + arm, cy))
 
-
-# ---------------------------------------------------------------------------
-# utility
-# ---------------------------------------------------------------------------
-
-def _spearman_corr(a: list, b: list) -> float:
-   rank_a  = np.argsort(np.argsort(a)).astype(float)
-   rank_b  = np.argsort(np.argsort(b)).astype(float)
-   ra_mean = rank_a.mean()
-   rb_mean = rank_b.mean()
-   num     = ((rank_a - ra_mean) * (rank_b - rb_mean)).sum()
-   denom   = (np.sqrt(((rank_a - ra_mean) ** 2).sum()) *
-              np.sqrt(((rank_b - rb_mean) ** 2).sum()))
-   if denom == 0:
-      return 0.0
-   return float(num / denom)

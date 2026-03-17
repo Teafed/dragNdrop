@@ -60,9 +60,7 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    run one training trial with the given hyperparams.
    returns a dict of metrics from the end of training.
    """
-   import torch
-   from stable_baselines3 import PPO
-   from bc_train import GoalEncoder, train_bc, build_ppo_from_bc, BicameralPolicy
+   from bc_train import GoalEncoder, train_bc, build_ppo_from_bc
    from oracle import collect_demonstrations
 
    t_start = time.time()
@@ -86,7 +84,6 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    curriculum = CurriculumManager(verbose=False, start_stage=0)
 
    def make_env():
-      import random
       from llm_goal_parser import parse_goal, get_embedding
       import torch
       prompt   = curriculum.sample_prompt()
@@ -129,20 +126,19 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    }
 
 
-def _eval_solve_rates(model, goal_encoder, curriculum,
-                      tasks: list, n_episodes: int) -> dict:
+def _eval_solve_rates(model, goal_encoder, tasks: list,
+                      n_episodes: int) -> dict:
    """eval solve rate for each task; returns {task_sr_reach: 0.6, ...}."""
    import torch
    from llm_goal_parser import parse_goal, get_embedding
-   from curriculum import _PROMPT_POOL
-   import random
+   from prompt_gen import PromptGenerator
    from stable_baselines3.common.monitor import Monitor
-
+   _gen = PromptGenerator()
    results = {}
    for task in tasks:
       solved = []
       for _ in range(n_episodes):
-         prompt  = random.choice(_PROMPT_POOL[task])
+         prompt  = _gen.sample()
          goal    = parse_goal(prompt)
          raw_emb = get_embedding(prompt)
          with torch.no_grad():

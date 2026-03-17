@@ -23,7 +23,7 @@ usage:
 
 import argparse
 import numpy as np
-from shape_env import ShapeEnv, GRIP_RADIUS
+from shape_env import ShapeEnv
 from config import GOAL_ENCODING_DIM, get_obs_size
 
 
@@ -218,7 +218,7 @@ def test_all_tasks() -> bool:
          rewards = []
          for _ in range(10):
             action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, reward, info = env.step(action)
             rewards.append(reward)
 
          obs_ok  = obs.shape[0] == get_obs_size()
@@ -598,7 +598,7 @@ def test_bc_loss_per_task(n_episodes: int = 80) -> bool:
       import torch
       import torch.nn.functional as F
       import tempfile
-      from bc_train import BicameralNetwork, train_bc
+      from bc_train import train_bc
       from oracle import collect_demonstrations
       from config import SUPPORTED_TASKS
 
@@ -749,7 +749,6 @@ if __name__ == "__main__":
       print("=== tests 6-9: skipped (no --oracle flag) ===\n")
 
    print("=== summary ===")
-   _SKIP = "skip"
    for label, result in [
       ("test 1  env mechanics  ", ok1),
       ("test 2  reward variance", ok2),

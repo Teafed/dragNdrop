@@ -34,8 +34,6 @@ usage:
 """
 
 import random
-from config import SUPPORTED_TASKS
-from llm_goal_parser import parse_goal
 
 # ---------------------------------------------------------------------------
 # stage definitions

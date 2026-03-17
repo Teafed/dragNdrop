@@ -55,7 +55,6 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
       target    = centroid of same-attribute shapes + jitter
 """
 
-import os
 import numpy as np
 
 from shape_env import (
@@ -63,7 +62,7 @@ from shape_env import (
    SCORE_SOLVE_THRESHOLD, REGION_INNER, LINE_SPREAD_THRESHOLD,
 )
 from config import (
-   MAX_SHAPES, CURSOR_SPEED, GRIP_RADIUS, GRIP_THRESHOLD,
+   MAX_SHAPES, CURSOR_SPEED, GRIP_RADIUS,
 )
 
 # ---------------------------------------------------------------------------
@@ -277,7 +276,6 @@ class OraclePolicy:
          # unoccupied slot so already-placed shapes aren't moved again
          positions  = np.array([s.x if axis == "x" else s.y
                                  for s in env.shapes])
-         unassigned = list(range(n))
          slot_for   = [-1] * n
          # greedy: repeatedly assign the (shape, slot) pair with minimum dist
          remaining_shapes = list(range(n))
@@ -754,7 +752,5 @@ def collect_demonstrations(
       print(f"  solve rate        : {sr:.1f}%")
       if n_solved > 0:
          print(f"  mean ep length    : {len(all_obs)/n_solved:.1f}")
-
-   return dataset
 
    return dataset
