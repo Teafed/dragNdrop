@@ -35,9 +35,27 @@ from stable_baselines3.common.env_util import make_vec_env
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal, get_embedding
 from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCallback
-from config import MAX_SHAPES, N_ENVS
+from config import MAX_SHAPES, N_ENVS, SUPPORTED_TASKS
 from prompt_gen import PromptGenerator
 
+# ---------------------------------------------------------------------------
+# training config
+# ---------------------------------------------------------------------------
+
+def _save_training_config(save_path: str, curriculum, timesteps: int):
+   """write training_config.json alongside the model files."""
+   import json
+   os.makedirs(save_path, exist_ok=True)
+   n_shapes = curriculum.n_shapes_range[1] if curriculum is not None else MAX_SHAPES
+   tasks    = curriculum.active_tasks      if curriculum is not None else SUPPORTED_TASKS
+   config   = {
+      "n_shapes": n_shapes,
+      "tasks":    tasks,
+   }
+   path = os.path.join(save_path, "training_config.json")
+   with open(path, "w") as f:
+      json.dump(config, f, indent=3)
+   print(f"[train] training config saved to {path}")
 
 # ---------------------------------------------------------------------------
 # goal-conditioned env factory
@@ -197,6 +215,9 @@ def train(
       curriculum = None
       print("\n[curriculum] disabled — training on all tasks from step 0")
 
+   # write config immediately so it exists even if training crashes later
+   _save_training_config(save_path, curriculum, timesteps)
+
    if use_oracle:
       # demos are collected across the full task pool regardless of curriculum
       # stage — bc warms up all tasks, then ppo fine-tunes with curriculum.
@@ -265,7 +286,10 @@ def train(
 
    final_path = os.path.join(save_path, "final_model")
    model.save(final_path)
+   _save_training_config(save_path, curriculum, timesteps)
+
    print(f"\n--- done. model saved to {final_path} ---")
+   
    return model, goal_encoder
 
 

@@ -16,6 +16,7 @@ usage:
 
 import argparse
 import os
+import random
 import sys
 import numpy as np
 import torch
@@ -30,22 +31,32 @@ from config import GOAL_ENCODING_DIM
 # goal encoder helpers
 # ---------------------------------------------------------------------------
 
-def load_goal_encoder(model_path: str):
+def load_model_config(model_path: str) -> dict:
    """
-   try to load the goal encoder saved alongside the model.
-   returns a GoalEncoder instance (random init if file not found).
-   """
-   from bc_train import GoalEncoder
-   encoder_path = os.path.join(os.path.dirname(model_path), "goal_encoder.pt")
-   encoder      = GoalEncoder()
-   if os.path.exists(encoder_path):
-      encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
-      print(f"goal encoder loaded from {encoder_path}")
-   else:
-      print(f"no goal encoder found at {encoder_path} — using zero encoding")
-   encoder.eval()
-   return encoder
+   load training_config.json from alongside the model.
+   returns config dict. falls back to safe defaults with a warning if
+   the file isn't found (e.g. for models trained before this was added).
 
+   note: stage checkpoints (stage_00_checkpoint.zip etc.) don't have their
+   own config — if you load one, the defaults apply and n_shapes may not
+   match what that stage was trained on.
+   """
+   import json
+   from bc_train import GoalEncoder
+   config_path = os.path.join(os.path.dirname(model_path), "training_config.json")
+   if os.path.exists(config_path):
+      with open(config_path) as f:
+         config = json.load(f)
+      print(f"[demo] training config loaded from {config_path}")
+   else:
+      print(f"[demo] no training_config.json found at {config_path} — "
+            f"defaulting to n_shapes=1, tasks=reach/touch/drag")
+      config = {"n_shapes": 1, "tasks": ["reach", "touch", "drag"]}
+   # goal encoder is always fixed seed 42 — no file needed
+   encoder = GoalEncoder()
+   encoder.eval()
+   config["goal_encoder"] = encoder
+   return config
 
 def encode_goal(goal_encoder, prompt: str) -> np.ndarray:
    """project a prompt string to a GOAL_ENCODING_DIM vector."""
@@ -219,22 +230,23 @@ def dump_episode_summary(history: list):
 # episode / goal helpers
 # ---------------------------------------------------------------------------
 
-def make_episode(goal_encoder, prompt, multi_task,
-                 sequential_pool=None, task_filter=None):   
+def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None, 
+                 task_filter=None, n_shapes=None, trained_tasks=None):
    """sample a new prompt (if multi_task or sequential), parse, encode."""
    if sequential_pool is not None:
       p = sequential_pool.pop(0)
-      sequential_pool.append(p)   # rotate
-   elif multi_task or task_filter:
+      sequential_pool.append(p)
+   elif multi_task or task_filter or prompt is None:
       from prompt_gen import sample_prompt
-      p = sample_prompt(task_filter)   # None = any task
-
+      # task_filter overrides, otherwise sample from trained tasks if known
+      task = task_filter or (random.choice(trained_tasks) if trained_tasks else None)
+      p = sample_prompt(task)
    else:
       p = prompt
    g   = parse_goal(p)
    enc = (encode_goal(goal_encoder, p) if goal_encoder is not None
           else np.zeros(GOAL_ENCODING_DIM, dtype=np.float32))
-   return p, g, enc
+   return p, g, enc, n_shapes
 
 
 # ---------------------------------------------------------------------------
@@ -341,17 +353,28 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
    example:
       python demo.py --model models/shape_agent/best_model --headless --episodes 200
    """
-   goal_encoder = load_goal_encoder(model_path)
+   config       = load_model_config(model_path)
+   goal_encoder = config["goal_encoder"]
+   n_shapes     = config["n_shapes"]
+   trained_tasks = config["tasks"]
+
+   if task_filter is not None and task_filter not in trained_tasks:
+      print(f"[demo] warning: --task {task_filter!r} not in trained tasks "
+            f"{trained_tasks} — results may be poor")
+   
    from stable_baselines3 import PPO
    model = PPO.load(model_path)
    print(f"model loaded: {model_path}")
-   print(f"running {n_episodes} episodes (headless)...\n")
+   print(f"running {n_episodes} episodes (headless)  "
+         f"n_shapes={n_shapes}  tasks={trained_tasks}\n")
 
    history = []
    for ep in range(1, n_episodes + 1):
-      p, g, enc = make_episode(goal_encoder, prompt, multi_task,
-                              task_filter=task_filter)
-      env       = ShapeEnv(goal=g, render_mode=None)
+      p, g, enc, n_shp = make_episode(goal_encoder, prompt, multi_task,
+                                      task_filter=task_filter,
+                                      n_shapes=n_shapes,
+                                      trained_tasks=trained_tasks)
+      env    = ShapeEnv(goal=g, n_shapes=n_shp, render_mode=None)
       env.set_goal_encoding(enc)
       obs, _    = env.reset()
 
@@ -396,6 +419,23 @@ def run_demo(model_path, prompt, use_random, multi_task,
    single render loop for all interactive agent types (model, oracle, random).
    the only difference is how `action` is computed each step.
    """
+   # load config first so n_shapes and task guard are available
+   # oracle/random paths still construct GoalEncoder the same way
+   if not use_oracle and not use_random:
+      config        = load_model_config(model_path)
+      goal_encoder  = config["goal_encoder"]
+      n_shapes      = config["n_shapes"]
+      trained_tasks = config["tasks"]
+      if task_filter is not None and task_filter not in trained_tasks:
+         print(f"[demo] warning: --task {task_filter!r} not in trained tasks "
+               f"{trained_tasks} — results may be poor")
+   else:
+      from bc_train import GoalEncoder
+      goal_encoder  = GoalEncoder()
+      goal_encoder.eval()
+      n_shapes      = 1   # oracle/random default
+      trained_tasks = None
+   
    from prompt_gen import PromptGenerator
    _gen = PromptGenerator()
    pygame.init()
@@ -419,7 +459,6 @@ def run_demo(model_path, prompt, use_random, multi_task,
       agent_label  = "RANDOM"
       print("running random agent")
    else:
-      goal_encoder = load_goal_encoder(model_path)
       try:
          from stable_baselines3 import PPO
          model = PPO.load(model_path)
@@ -439,9 +478,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
    seq_pool = list(_gen.training_pool()) if (use_oracle and sequential) else None
 
    # --- first episode ---
-   cur_prompt, goal, encoding = make_episode(
-      goal_encoder, prompt, multi_task, seq_pool, task_filter)
-   env    = ShapeEnv(goal=goal, render_mode=None)
+   cur_prompt, goal, encoding, n_shapes = make_episode(
+      goal_encoder, prompt, multi_task, seq_pool, task_filter,
+      n_shapes=n_shapes, trained_tasks=trained_tasks)
+   env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
    env.set_goal_encoding(encoding)
    oracle = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
              if use_oracle else None)
@@ -557,8 +597,9 @@ def run_demo(model_path, prompt, use_random, multi_task,
                f"score: {final_score:.3f}  task: {cur_prompt}")
          
          stay_paused = paused or skip
-         cur_prompt, goal, encoding = make_episode(
-            goal_encoder, prompt, multi_task, seq_pool, task_filter)
+         cur_prompt, goal, encoding, _ = make_episode(
+            goal_encoder, prompt, multi_task, seq_pool, task_filter,
+            n_shapes=n_shapes, trained_tasks=trained_tasks)
          env.goal = goal
          env.set_goal_encoding(encoding)
          oracle   = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
@@ -591,9 +632,8 @@ if __name__ == "__main__":
       help="path to saved SB3 model (without .zip extension)",
    )
    parser.add_argument(
-      "--prompt", type=str,
-      default="sort shapes from smallest to largest left to right",
-      help="natural language goal prompt",
+      "--prompt", type=str, default=None,
+      help="natural language goal prompt. if omitted, samples from trained tasks",
    )
    parser.add_argument(
       "--random", action="store_true",

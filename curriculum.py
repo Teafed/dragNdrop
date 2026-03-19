@@ -48,32 +48,86 @@ _STAGES = [
    # step ceilings are tighter than original so the curriculum actually
    # moves through starter stages within a reasonable run length.
    {
-      "name":         "stage 0 — reach",
+      "name":         "stage 0a — reach (1 shape)",
       "tasks":        ["reach"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "reach",
-      "gate_sr":      0.50,   # was 0.80 — advance as soon as agent is reliably reaching
-      "step_ceiling": 30_000, # was 50k — don't spend more than this on reach alone
+      "gate_sr":      0.50,
+      "step_ceiling": 25_000,
    },
    {
-      "name":         "stage 1 — touch",
+      "name":         "stage 0b — reach (1-2 shapes)",
+      "tasks":        ["reach"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 2,
+      "gate_task":    "reach",
+      "gate_sr":      0.50,
+      "step_ceiling": 50_000,
+   },
+   {
+      "name":         "stage 1a — touch (1 shape)",
       "tasks":        ["touch"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "touch",
-      "gate_sr":      0.50,   # was 0.80
-      "step_ceiling": 40_000, # was 50k — touch needs a bit more time than reach
+      "gate_sr":      0.50,
+      "step_ceiling": 75_000,
    },
    {
-      "name":         "stage 2 — drag",
+      "name":         "stage 1b — touch (1-2 shapes)",
+      "tasks":        ["touch"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 2,
+      "gate_task":    "touch",
+      "gate_sr":      0.50,
+      "step_ceiling": 100_000,
+   },
+   {
+      "name":         "stage 1c — reach and touch (1-2 shapes)",
+      "tasks":        ["reach", "touch"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 2,
+      "gate_task":    "touch",
+      "gate_sr":      0.50,
+      "step_ceiling": 150_000,
+   },
+   {
+      "name":         "stage 2a — drag (1 shape)",
       "tasks":        ["drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "drag",
-      "gate_sr":      0.40,   # was 0.70 — drag is harder, accept lower threshold
-      "step_ceiling": 60_000, # was 75k
+      "gate_sr":      0.40,
+      "step_ceiling": 200_000,
    },
+   {
+      "name":         "stage 2b — reach and drag (1 shape)",
+      "tasks":        ["reach", "drag"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 1,
+      "gate_task":    "drag",
+      "gate_sr":      0.40,
+      "step_ceiling": 250_000,
+   },
+   {
+      "name":         "stage 2c — reach, touch, and drag (1 shape)",
+      "tasks":        ["reach", "touch", "drag"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 1,
+      "gate_task":    "drag",
+      "gate_sr":      0.40,
+      "step_ceiling": 300_000,
+   },
+   {
+      "name":         "stage 3 — reach, touch, and drag (1-2 shapes, final)",
+      "tasks":        ["reach", "touch", "drag"],
+      "n_shapes_min": 1,
+      "n_shapes_max": 2,
+      "gate_task":    None,   # no gate — stay here for remaining budget
+      "gate_sr":      None,
+      "step_ceiling": None,
+   }
 
    # --- WAVE 3 STAGES: commented out for starter task debugging ---
    # Uncomment these blocks (and remove the final-stage override below)
@@ -130,15 +184,6 @@ _STAGES = [
    # NOTE: stage 2 (drag) is currently the FINAL stage. it has no gate_task=None
    # so we add a terminal "stay here" stage that mirrors the old stage 7 behaviour
    # but only for the three starter tasks. Remove this once wave 3 is re-enabled.
-   {
-      "name":         "stage 3 — starter tasks (final)",
-      "tasks":        ["reach", "touch", "drag"],
-      "n_shapes_min": 1,
-      "n_shapes_max": 1,
-      "gate_task":    None,   # no gate — stay here for remaining budget
-      "gate_sr":      None,
-      "step_ceiling": None,
-   },
 ]
 
 
