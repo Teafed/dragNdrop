@@ -223,11 +223,24 @@ def train(
       # stage — bc warms up all tasks, then ppo fine-tunes with curriculum.
       print(f"\n--- collecting {bc_episodes} oracle demonstrations "
             f"across all task pool prompts ---")
+      # get the tasks from the final curriculum stage
+      task_weights = None
+      if use_curriculum:
+         from curriculum import _STAGES
+         final_stage  = _STAGES[-1]
+         final_tasks  = final_stage["tasks"]
+         task_weights = {t: (2.0 if t == "touch" else 1.0) for t in final_tasks}
+         n_shapes_range = (final_stage["n_shapes_min"], final_stage["n_shapes_max"])
+      else:
+         task_weights   = None
+         n_shapes_range = None
 
       dataset = collect_demonstrations(
          n_episodes=bc_episodes,
          goal_encoder=goal_encoder,
          verbose=True,
+         task_weights=task_weights,
+         n_shapes_range=n_shapes_range,
       )
 
       device = "cuda" if torch.cuda.is_available() else "cpu"

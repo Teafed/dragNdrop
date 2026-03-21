@@ -3,24 +3,8 @@ curriculum.py
 
 curriculum manager for staged multi-task training.
 
-the curriculum progresses through seven stages, starting with simple
-cursor skill tasks and building up to the full wave 3 task suite.
-progression is performance-gated (advance when the gate task hits a
-solve rate threshold) with a step ceiling so training doesn't stall.
-
 stages:
-   0  reach only              n_shapes 1     gate 50%  ceiling  30k
-   1  touch only              n_shapes 1     gate 50%  ceiling  40k
-   2  drag only               n_shapes 1     gate 40%  ceiling  60k
-   # --- WAVE 3 STAGES DISABLED FOR STARTER TASK DEBUGGING ---
-   # 3  sequence only           n_shapes 2-3   gate 60%  ceiling 150k
-   # 4  + arrange_in_region     n_shapes 2-3   gate 60%  ceiling 150k
-   # 5  + arrange_in_line       n_shapes 2-4   gate 60%  ceiling 200k
-   # 6  + groups (fewer shapes) n_shapes 2-3   gate 40%  ceiling 200k
-   # 7  all tasks               n_shapes 2-6   no gate   remaining steps
-
-within each stage, active tasks are sampled with equal probability
-regardless of how many TASK_POOL prompts map to each task.
+   [fill this out]
 
 usage:
    manager = CurriculumManager()
@@ -45,8 +29,6 @@ _STAGES = [
    # cursor skill stages, not mastery checkpoints. advancing early is better
    # than stalling here; the agent can still improve on reach/touch while
    # training later stages.
-   # step ceilings are tighter than original so the curriculum actually
-   # moves through starter stages within a reasonable run length.
    {
       "name":         "stage 0a — reach (1 shape)",
       "tasks":        ["reach"],

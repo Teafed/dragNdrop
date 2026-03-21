@@ -157,17 +157,14 @@ class BicameralNetwork(nn.Module):
       # movement head: combined features -> [dx, dy], squashed to [-1, 1]
       self.move_head = nn.Sequential(
          nn.Linear(hidden * 2, hidden),
-         nn.Tanh(),
          nn.Linear(hidden, 2),
          nn.Tanh(),
       )
 
       # grip head: combined features -> grip logit (unbounded, no Tanh).
       # BCE loss during BC training; threshold at 0.0 at runtime.
-      # no Tanh here — BCE expects raw logits, not squashed values.
       self.grip_head = nn.Sequential(
          nn.Linear(hidden * 2, hidden // 2),
-         nn.Tanh(),
          nn.Linear(hidden // 2, 1),
       )
 
@@ -422,10 +419,7 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    transplant 1: copy BicameralNetwork weights into _BicameralExtractor.net
                  via direct state_dict copy (architectures match).
 
-   transplant 2: compose BC's split heads (move_head, grip_head) into
-                 SB3's single action_net (hidden*2 -> 3) by composing
-                 each head's two linear layers independently, then
-                 stacking move (rows 0:2) and grip (row 2) together.
+   transplant 2: if you see this, update this description
    """
    if goal is None:
       # use a neutral default that is valid for all tasks — the real goal
@@ -478,31 +472,38 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    # still gives a far better initialisation direction than random weights.
    try:
       with torch.no_grad():
-         # movement head composition: (hidden*2 -> hidden -> 2)
-         mW1   = bc_network.move_head[0].weight   # (hidden,    hidden*2)
-         mb1   = bc_network.move_head[0].bias     # (hidden,)
-         mW2   = bc_network.move_head[2].weight   # (2,         hidden)
-         mb2   = bc_network.move_head[2].bias     # (2,)
-         W_move = mW2 @ mW1                       # (2, hidden*2)
-         b_move = mW2 @ mb1 + mb2                 # (2,)
 
-         # grip head composition: (hidden*2 -> hidden//2 -> 1)
-         gW1   = bc_network.grip_head[0].weight   # (hidden//2, hidden*2)
-         gb1   = bc_network.grip_head[0].bias     # (hidden//2,)
-         gW2   = bc_network.grip_head[2].weight   # (1,         hidden//2)
-         gb2   = bc_network.grip_head[2].bias     # (1,)
-         W_grip = gW2 @ gW1                       # (1, hidden*2)
-         b_grip = gW2 @ gb1 + gb2                 # (1,)
+         # move_head is now: [0]=Linear(512,256), [1]=Linear(256,2), [2]=Tanh
+         # mW1   = bc_network.move_head[0].weight   # (256, 512)
+         # mb1   = bc_network.move_head[0].bias     # (256,)
+         # mW2   = bc_network.move_head[1].weight   # (2, 256)
+         # mb2   = bc_network.move_head[1].bias     # (2,)
+         # W_move = mW2 @ mW1                       # (2, hidden*2)
+         # b_move = mW2 @ mb1 + mb2                 # (2,)
+
+         # grip_head is now: [0]=Linear(512,128), [1]=Linear(128,1)
+         # gW1   = bc_network.grip_head[0].weight   # (128, 512)
+         # gb1   = bc_network.grip_head[0].bias     # (128,)
+         # gW2   = bc_network.grip_head[1].weight   # (1, 128)
+         # gb2   = bc_network.grip_head[1].bias     # (1,)
+         # W_grip = gW2 @ gW1                       # (1, hidden*2)
+         # b_grip = gW2 @ gb1 + gb2                 # (1,)
 
          # stack into (3, hidden*2) to match SB3's action_net
-         W_eff = torch.cat([W_move, W_grip], dim=0)   # (3, hidden*2)
-         b_eff = torch.cat([b_move, b_grip], dim=0)   # (3,)
+         # W_eff = torch.cat([W_move, W_grip], dim=0)   # (3, hidden*2)
+         # b_eff = torch.cat([b_move, b_grip], dim=0)   # (3,)
+
+         # sb3_action_net = model.policy.action_net
+         # sb3_action_net.weight.copy_(W_eff)
+         # sb3_action_net.bias.copy_(b_eff)
+      # print("  [transplant 2] composed BC move+grip heads into PPO action_net "
+            # f"({W_eff.shape[1]}->{W_eff.shape[0]}).")
 
          sb3_action_net = model.policy.action_net
-         sb3_action_net.weight.copy_(W_eff)
-         sb3_action_net.bias.copy_(b_eff)
-      print("  [transplant 2] composed BC move+grip heads into PPO action_net "
-            f"({W_eff.shape[1]}->{W_eff.shape[0]}).")
+         # small random init centered at zero so grip can go either way
+         nn.init.orthogonal_(sb3_action_net.weight, gain=0.01)
+         nn.init.constant_(sb3_action_net.bias, 0.0)
+      print("  [action_net] initialized near zero for unbiased grip exploration.")
    except Exception as e:
       print(f"  [transplant 2] failed ({e}) — action_net starts from random init.")
 

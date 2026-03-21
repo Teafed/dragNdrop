@@ -237,6 +237,14 @@ class ShapeEnv(gym.Env):
 
    def step(self, action):
       self.steps += 1
+      task = self.goal.get("task", "")
+      if self.steps <= 3:
+         print(f"[touch step {self.steps}] "
+               f"grip_raw={float(action[2]):.3f}  "
+               f"holding={self.holding}  "
+               f"cx={self.cx:.0f}  cy={self.cy:.0f}  "
+               f"target=({self.shapes[self.target_idx].x:.0f}, "
+               f"{self.shapes[self.target_idx].y:.0f})")
 
       dx_raw   = float(action[0])
       dy_raw   = float(action[1])
@@ -311,9 +319,18 @@ class ShapeEnv(gym.Env):
       # dominate the task score signal.
       task = self.goal.get("task", "reach")
       grip_bonus = 0.0
+      # if task == "touch" and self.holding:
+      #    print(f"[touch debug] holding=True  new_score={new_score:.4f}  grabbed_idx={self.grabbed_idx}  target_idx={self.target_idx}")
+      if task == "touch" and self.holding and self.grabbed_idx == self.target_idx:
+         # additional bonus proportional to proximity — encourages holding grip
+         # while overlapping the target, not just the moment of initial grab
+         target = self.shapes[self.target_idx]
+         dist   = np.sqrt((self.cx - target.x)**2 + (self.cy - target.y)**2)
+         if dist <= GRIP_RADIUS:
+            grip_bonus += 2.0   # strong signal: you're doing the right thing
       if task in ("touch", "drag") and self.holding:
          if self.grabbed_idx == self.target_idx:
-            grip_bonus = 0.10
+            grip_bonus += 1.0
 
       # bookkeeping
       self.prev_score_delta = score_delta
@@ -453,6 +470,27 @@ class ShapeEnv(gym.Env):
             s.x = float(rng.uniform(MARGIN, WINDOW_W - MARGIN))
             s.y = float(rng.uniform(MARGIN, WINDOW_H - MARGIN))
 
+      if task == "drag":
+         region = self.goal.get("region")
+         if region and region != "none":
+            boundary = REGION_INNER[region]
+            for _ in range(MAX_SPAWN_RETRIES):
+               target = shapes[self.target_idx] if hasattr(self, 'target_idx') else shapes[0]
+               # check if target shape is already inside the region
+               if region == "left"   and target.x > boundary: break
+               if region == "right"  and target.x < boundary: break
+               if region == "top"    and target.y > boundary: break
+               if region == "bottom" and target.y < boundary: break
+               # it's inside the region — respawn it on the opposite side
+               if region in ("left", "right"):
+                  lo = boundary + MARGIN if region == "left" else MARGIN
+                  hi = WINDOW_W - MARGIN if region == "left" else boundary - MARGIN
+                  target.x = float(rng.uniform(lo, hi))
+               else:
+                  lo = boundary + MARGIN if region == "top" else MARGIN
+                  hi = WINDOW_H - MARGIN if region == "top" else boundary - MARGIN
+                  target.y = float(rng.uniform(lo, hi))
+               
       return shapes
 
    def _initial_score_solved(self, shapes) -> bool:
@@ -603,9 +641,49 @@ class ShapeEnv(gym.Env):
 
    def _compute_score(self) -> float:
       return self._compute_task_score()
+   
+   # -------------------------------------------------------------------------
+   # solve checkers
+   # -------------------------------------------------------------------------
 
    def _is_solved(self) -> bool:
-      return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+      task = self.goal.get("task", "")
+      if task == "reach":
+         return self._solved_reach()
+      elif task == "touch":
+         return self._solved_touch()
+      elif task == "drag":
+         return self._solved_drag()
+      else:
+         # score threshold is fine for arrangement tasks since
+         # the score directly measures the spatial arrangement quality
+         return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
+   
+   def _solved_reach(self) -> bool:
+      if not self.shapes:
+         return False
+      target = self.shapes[self.target_idx]
+      dist   = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      return dist <= GRIP_RADIUS
+
+   def _solved_touch(self) -> bool:
+      if not self.shapes:
+         return False
+      target = self.shapes[self.target_idx]
+      dist   = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
+      return self.holding and dist <= GRIP_RADIUS
+
+   def _solved_drag(self) -> bool:
+      if not self.shapes:
+         return False
+      region       = self.goal.get("region")
+      if not region or region == "none":
+         return False
+      target       = self.shapes[self.target_idx]
+      region_score = self._per_shape_region_score(target, region)
+      # require shape to actually be inside the region (score >= 0.7,
+      # which is the inside=True contribution from _per_shape_region_score)
+      return region_score >= 0.7
 
    # -------------------------------------------------------------------------
    # starter task score functions
@@ -643,75 +721,53 @@ class ShapeEnv(gym.Env):
       return float(0.7 * t)
 
    def _score_touch(self) -> float:
-      """
-      score for touch: grip must be active while overlapping the target shape.
-      solved when holding and overlapping target.
-
-      score uses the same two-zone proximity shape as reach (0->0.7 far,
-      0.7->0.99 near), so the agent has gradient signal all the way in.
-      the grip jump to 1.0 only fires when actually over the target AND
-      holding — no discontinuous gap in the score range.
-
-      old version: 0.5*proximity + 0.5*grip_on produced scores in [0, 0.5]
-      without grip and a jump to 1.0 with grip. the range (0.5, 1.0) was
-      unreachable, so there was no gradient signal connecting proximity to
-      the grip action. the agent learned to hover at ~0.5 and stop.
-      """
-      if not self.shapes:
-         return 0.0
-      target      = self.shapes[self.target_idx]
-      dist        = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
-      if self.holding and dist <= GRIP_RADIUS:
-         return 1.0
-      # same two-zone proximity as reach — continuous gradient to the goal
-      ref_dist    = WINDOW_W / 2.0
-      near_thresh = GRIP_RADIUS * 2.0
-      if dist <= near_thresh:
-         t = (near_thresh - dist) / near_thresh
-         return float(0.7 + 0.29 * t)
-      t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
-      return float(0.7 * t)
-
-   def _score_drag(self) -> float:
-      """
-      score for drag: grip target shape and move it into the target region.
-      solved when score >= SCORE_SOLVE_THRESHOLD.
-
-      two-phase score to provide gradient signal for both prerequisites:
-
-      phase 1 — not holding target: score cursor proximity to the shape,
-         using same two-zone function as reach/touch (0->0.99). this guides
-         the agent to navigate to the shape and grip it. without this, the
-         only signal is shape position, which is flat until grip happens.
-
-      phase 2 — holding target: score shape proximity to the region boundary
-         via _per_shape_region_score, scaled to [0.4, 1.0] so the transition
-         from phase 1 (max ~0.99) doesn't produce a negative reward jump when
-         the agent first grips. 0.4 is the floor so the agent doesn't drop
-         below phase 1 score just by gripping.
-      """
       if not self.shapes:
          return 0.0
       target = self.shapes[self.target_idx]
-      region = self.goal.get("region", "left")
+      dist   = np.sqrt((self.cx - target.x)**2 + (self.cy - target.y)**2)
+
+      # solved
+      if self.holding and dist <= GRIP_RADIUS:
+         return 1.0
+
+      # holding but not on target — small score, don't reward wrong-target grip
+      if self.holding:
+         return 0.1
+
+      # not holding — proximity score capped LOW so hovering near shape
+      # is not a competitive strategy vs actually gripping
+      ref_dist    = WINDOW_W / 2.0
+      near_thresh = GRIP_RADIUS * 2.0
+      if dist <= near_thresh:
+         t = (near_thresh - dist) / near_thresh
+         return float(0.3 + 0.09 * t)   # tops out at 0.39 — well below solved
+      t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
+      return float(0.3 * t)
+
+   def _score_drag(self) -> float:
+      if not self.shapes:
+         return 0.0
+      target = self.shapes[self.target_idx]
+      region = self.goal.get("region")
+      if not region or region == "none":
+         return 0.0
 
       if self.holding and self.grabbed_idx == self.target_idx:
-         # phase 2: shape is moving — score its position toward the region.
-         # scale _per_shape_region_score (0->1) into (0.4->1.0) so gripping
-         # never produces a reward cliff vs phase 1.
+         # phase 2: shape is grabbed — score its position toward the region.
+         # floor at 0.5 so gripping from phase 1's max (~0.99) still produces
+         # a small positive delta rather than a cliff.
          region_score = self._per_shape_region_score(target, region)
-         return float(0.4 + 0.6 * region_score)
+         return float(0.5 + 0.5 * region_score)
 
-      # phase 1: not holding — score cursor proximity to target shape.
-      # same two-zone function as reach so the agent has gradient all the way in.
+      # phase 1: not holding — score cursor proximity to target
       dist        = np.sqrt((self.cx - target.x) ** 2 + (self.cy - target.y) ** 2)
       ref_dist    = WINDOW_W / 2.0
       near_thresh = GRIP_RADIUS * 2.0
       if dist <= near_thresh:
          t = (near_thresh - dist) / near_thresh
-         return float(0.7 + 0.29 * t)
+         return float(0.4 + 0.09 * t)   # tops out at 0.49, just below phase 2 floor
       t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
-      return float(0.7 * t)
+      return float(0.4 * t)
 
    # -------------------------------------------------------------------------
    # wave 3 score functions
@@ -773,7 +829,9 @@ class ShapeEnv(gym.Env):
 
    def _score_arrange_in_region(self) -> float:
       """mean per-shape region score."""
-      region = self.goal.get("region", "left")
+      region = self.goal.get("region")
+      if not region or region == "none":
+         return 0.0
       scores = [self._per_shape_region_score(s, region) for s in self.shapes]
       return float(np.mean(scores))
 

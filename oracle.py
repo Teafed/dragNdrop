@@ -8,10 +8,6 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
 
 --- explore / commit loop ---
    explore: select which shape to move next using weighted random selection.
-            the "most wrong" shape is most likely chosen but not guaranteed.
-            if the episode score is already above IDLE_THRESHOLD, all
-            priorities are set very low and the oracle idles until the
-            episode terminates naturally.
 
    commit:  navigate cursor to the selected shape, grip it, drag it to
             the computed target, then release. returns to explore once
@@ -74,10 +70,6 @@ COMMIT_JITTER      = 30.0   # pixels — random offset from ideal target
 REGION_EXTRA_DEPTH = 60.0   # pixels — random extra depth into region
 NOISE_STD          = 0.06   # action noise std (0 for clean oracle demo)
 
-# oracle idles only when the episode is genuinely solved — same threshold
-# as the environment's own solve check so there's no gap to exploit
-IDLE_THRESHOLD = SCORE_SOLVE_THRESHOLD
-
 # cursor approach: how close before gripping (slightly larger than GRIP_RADIUS
 # so the oracle reliably lands inside the grip zone)
 APPROACH_DIST = GRIP_RADIUS * 0.8
@@ -126,8 +118,7 @@ class OraclePolicy:
       env  = self.env
       task = env.goal.get("task", "arrange_in_sequence")
 
-      # --- idle if already good enough ---
-      if env._compute_task_score() >= IDLE_THRESHOLD:
+      if env._is_solved():
          return np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
       # --- explore: pick next shape if needed ---
@@ -633,11 +624,12 @@ def _sample_task(rng, weights: dict):
    return tasks[int(rng.choice(len(tasks), p=probs))]
 
 def collect_demonstrations(
-   n_episodes:   int   = 500,
-   noise_std:    float = NOISE_STD,
-   verbose:      bool  = True,
-   goal_encoder        = None,
-   task_weights:  dict  = None,
+   n_episodes:     int   = 500,
+   noise_std:      float = NOISE_STD,
+   verbose:        bool  = True,
+   goal_encoder          = None,
+   task_weights:   dict  = None,
+   n_shapes_range: tuple = None,   # (min, max) — defaults to (2, MAX_SHAPES)
 ) -> dict:
    """
    run the oracle across tasks and collect (obs, action) pairs plus
@@ -683,7 +675,11 @@ def collect_demonstrations(
    for ep in range(1, n_episodes + 1):
       prompt = _gen.sample(task=_sample_task(rng, task_weights))
       goal   = parse_goal(prompt)
-      n_shp  = int(rng.integers(2, MAX_SHAPES + 1))
+      if n_shapes_range is not None:
+         lo, hi = n_shapes_range
+         n_shp = int(rng.integers(lo, hi + 1))
+      else:
+         n_shp = int(rng.integers(2, MAX_SHAPES + 1))
 
       raw_emb = get_embedding(prompt)
       with torch.no_grad():
