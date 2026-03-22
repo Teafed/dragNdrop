@@ -1045,9 +1045,9 @@ class ShapeEnv(gym.Env):
    def _draw_cursor(self):
       """
       draw cursor as a small circle with crosshairs.
-         |
+        |
       - o -
-         |
+        |
       circle is filled when holding a shape, outline when not.
       """
       cx  = int(self.cx)

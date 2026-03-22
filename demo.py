@@ -251,14 +251,13 @@ def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None,
 # saliency analysis
 # ---------------------------------------------------------------------------
 
-# obs region labels for the 108-dim vector
+# obs region labels for the 108-dim vector — must match shape_env._get_obs()
 _OBS_REGIONS = [
-   ("cursor_state",   slice(0,   4),  "cx cy holding grabbed_idx"),
-   ("grabbed_shape",  slice(4,   9),  "grabbed shape features"),
-   ("nearest_shape",  slice(9,   14), "nearest shape features"),
-   ("all_shapes",     slice(14,  44), "all 6 shapes (zero-padded)"),
-   ("goal_struct",    slice(44,  76), "structured goal one-hots"),
-   ("goal_semantic",  slice(76,  108),"MiniLM semantic projection"),
+   ("cursor_state",  slice(0,   4),  "cx cy holding grabbed_idx"),
+   ("grabbed_shape", slice(4,   9),  "grabbed shape features"),
+   ("nearest_shape", slice(9,   14), "nearest shape features"),
+   ("all_shapes",    slice(14,  44), "all 6 shapes zero-padded"),
+   ("goal_encoding", slice(44, 108), "64-dim llm goal projection"),
 ]
 
 
@@ -298,43 +297,17 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
 def print_saliency(saliency: dict, prompt: str, detail: bool = False):
    """
    print saliency table with a bar chart normalised to the max region.
-   if detail=True, also show per-field breakdown within goal_struct.
+   detail is unused for now — reserved for when goal encoding is split
+   into structured + semantic halves.
    """
-   from config import (SUPPORTED_TASKS, COLOR_NAMES_GOAL, SHAPE_TYPES)
-
-   max_grad = max(v["mean_grad"] for k, v in saliency.items() if k != "goal_struct_raw") + 1e-8
+   max_grad = max(v["mean_grad"] for v in saliency.values()) + 1e-8
    print(f"\n  saliency — {prompt}")
    print(f"  {'region':<16} {'mean |grad|':>11}  bar")
    print(f"  {'-'*52}")
    for name, vals in saliency.items():
-      if name == "goal_struct_raw": continue
       g   = vals["mean_grad"]
       bar = "█" * int(g / max_grad * 30)
       print(f"  {name:<16} {g:>11.5f}  {bar}")
-
-   if detail and "goal_struct_raw" in saliency:
-      # break down goal_struct by field
-      raw = saliency["goal_struct_raw"]   # per-dim gradients (32,)
-      fields = [
-         ("task",      SUPPORTED_TASKS,   7),
-         ("color",     COLOR_NAMES_GOAL + ["none"], 6),
-         ("type",      SHAPE_TYPES + ["none"],       4),
-         ("region",    ["left","right","top","bottom","none"], 5),
-         ("axis",      ["x","y","none"],              3),
-         ("direction", ["asc","desc","none"],          3),
-         ("attribute", ["size","color","none"],        3),
-         ("bounded",   ["bounded"],                    1),
-      ]
-      print(f"\n  goal_struct field breakdown:")
-      offset = 0
-      for fname, labels, ndim in fields:
-         vals_f = raw[offset:offset+ndim]
-         peak_i = int(vals_f.argmax())
-         peak_v = float(vals_f[peak_i])
-         bar    = "█" * int(peak_v / (max_grad + 1e-8) * 30)
-         label  = labels[peak_i] if peak_i < len(labels) else str(peak_i)
-         print(f"    {fname:<12} peak={label:<12} {peak_v:.5f}  {bar}")
-         offset += ndim
    print()
 
 # ---------------------------------------------------------------------------
@@ -447,6 +420,8 @@ def run_demo(model_path, prompt, use_random, multi_task,
    _gen = PromptGenerator()
    pygame.init()
    pygame.key.set_repeat(400, 80)
+   if use_human:
+      pygame.mouse.set_visible(False)
    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
    pygame.display.set_caption("dragNdrop demo")
    clock  = pygame.time.Clock()
@@ -568,13 +543,14 @@ def run_demo(model_path, prompt, use_random, multi_task,
          if use_human:
             # compute action from mouse position and left button state.
             # dx/dy: unit vector from cursor toward mouse, scaled to [-1,1].
+            # dead zone prevents jitter when mouse is close to cursor.
             # grip: left mouse button held down.
             mx, my    = pygame.mouse.get_pos()
             btn       = pygame.mouse.get_pressed()
             ddx       = mx - env.cx
             ddy       = my - env.cy
             dist_m    = float(np.sqrt(ddx**2 + ddy**2))
-            if dist_m > 1.0:
+            if dist_m > 8.0:
                dx_act = float(ddx / dist_m)
                dy_act = float(ddy / dist_m)
             else:
@@ -646,6 +622,7 @@ def run_demo(model_path, prompt, use_random, multi_task,
          paused         = stay_paused
          print(f"episode {episode} — {cur_prompt}")
 
+   pygame.mouse.set_visible(True)
    pygame.quit()
    print("demo closed")
    if history:
