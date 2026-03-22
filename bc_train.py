@@ -412,7 +412,8 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
                       vec_env=None,
                       goal: dict = None,
                       ent_coef: float = 0.02,
-                      lr_ppo:   float = 1e-4) -> PPO:
+                      lr_ppo:     float = 1e-4,
+                      batch_size: int   = 128) -> PPO:
    """
    create a PPO model using BicameralPolicy and copy BC network weights in.
 
@@ -444,7 +445,7 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
       env,
       learning_rate=lr_ppo,
       n_steps=2048,
-      batch_size=128,
+      batch_size=batch_size,
       n_epochs=10,
       gamma=0.99,
       gae_lambda=0.95,

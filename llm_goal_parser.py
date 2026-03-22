@@ -267,13 +267,7 @@ def get_embedding(prompt: str) -> np.ndarray:
       return _embedding_cache[prompt]
 
    if _embedding_model is None:
-      try:
-         from sentence_transformers import SentenceTransformer
-      except ImportError:
-         raise RuntimeError(
-            "sentence-transformers not installed — "
-            "run: pip install sentence-transformers"
-         )
+      from sentence_transformers import SentenceTransformer
       from config import EMBEDDING_MODEL
       print(f"[goal_parser] loading embedding model '{EMBEDDING_MODEL}'...")
       import logging
