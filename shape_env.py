@@ -258,8 +258,8 @@ class ShapeEnv(gym.Env):
       else:
          self.n_shapes = self._fixed_n_shapes
 
-      self.cx          = float(WINDOW_W / 2)
-      self.cy          = float(WINDOW_H / 2)
+      # cursor position persists across episodes — don't reset cx/cy here.
+      # holding and grabbed_idx always reset since starting mid-grab is invalid.
       self.holding     = False
       self.grabbed_idx = -1
       self.steps       = 0

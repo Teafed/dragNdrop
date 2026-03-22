@@ -411,14 +411,16 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
 # ---------------------------------------------------------------------------
 
 def run_demo(model_path, prompt, use_random, multi_task,
-             use_oracle, sequential,
+             use_oracle, sequential, use_human=False,
              show_saliency=False, task_filter=None):
    """
-   single render loop for all interactive agent types (model, oracle, random).
+   single render loop for all interactive agent types
+   (model, oracle, random, human).
    the only difference is how `action` is computed each step.
    """
-   # load config first so n_shapes and task guard are available
-   # oracle/random paths still construct GoalEncoder the same way
+   # load config first so n_shapes and task guard are available.
+   # oracle and random modes also load config so --task and n_shapes
+   # reflect the training run rather than hardcoded defaults.
    if not use_oracle and not use_random:
       config        = load_model_config(model_path)
       goal_encoder  = config["goal_encoder"]
@@ -428,11 +430,18 @@ def run_demo(model_path, prompt, use_random, multi_task,
          print(f"[demo] warning: --task {task_filter!r} not in trained tasks "
                f"{trained_tasks} — results may be poor")
    else:
+      # try to load config for n_shapes / task list — fall back to defaults
+      # if no model has been trained yet or path doesn't exist
+      try:
+         config        = load_model_config(model_path)
+         n_shapes      = config["n_shapes"]
+         trained_tasks = config["tasks"]
+      except Exception:
+         n_shapes      = 2
+         trained_tasks = None
       from bc_train import GoalEncoder
-      goal_encoder  = GoalEncoder()
+      goal_encoder = GoalEncoder()
       goal_encoder.eval()
-      n_shapes      = 1   # oracle/random default
-      trained_tasks = None
    
    from prompt_gen import PromptGenerator
    _gen = PromptGenerator()
@@ -445,17 +454,21 @@ def run_demo(model_path, prompt, use_random, multi_task,
 
    # --- load agent ---
    if use_oracle:
-      from bc_train import GoalEncoder
-      goal_encoder = GoalEncoder()
-      goal_encoder.eval()
-      model        = None
-      agent_label  = "ORACLE"
+      model       = None
+      agent_label = "ORACLE"
       print("running oracle agent")
    elif use_random:
       goal_encoder = None
       model        = None
       agent_label  = "RANDOM"
       print("running random agent")
+   elif use_human:
+      model       = None
+      agent_label = "HUMAN"
+      print("running in human control mode")
+      print("  mouse:          move cursor toward pointer")
+      print("  left click:     grip / release")
+      print("  Q / N / SPC / D work as normal")
    else:
       try:
          from stable_baselines3 import PPO
@@ -467,10 +480,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
          sys.exit(1)
       agent_label = "MODEL"
 
-   _saliency        = show_saliency and (model is not None)
+   _saliency = show_saliency and (model is not None)
    if show_saliency and model is None:
       print("[demo] --saliency requires a trained model (--model). "
-            "saliency is disabled for oracle/random agents.")
+            "saliency is disabled for oracle/random/human agents.")
 
    # sequential pool for oracle --sequential mode
    seq_pool = list(_gen.training_pool()) if (use_oracle and sequential) else None
@@ -495,7 +508,11 @@ def run_demo(model_path, prompt, use_random, multi_task,
    history      = []      # completed episode records for Shift+D
 
    print(f"\nepisode {episode} — {cur_prompt}")
-   print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
+   if use_human:
+      print("mouse to move  left-click to grip  "
+            "Q quit  N next  SPC pause  D dump  Shift+D summary\n")
+   else:
+      print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
 
    running = True
    while running:
@@ -548,7 +565,24 @@ def run_demo(model_path, prompt, use_random, multi_task,
       truncated  = ep_truncated
 
       if should_step and not skip:
-         if use_oracle:
+         if use_human:
+            # compute action from mouse position and left button state.
+            # dx/dy: unit vector from cursor toward mouse, scaled to [-1,1].
+            # grip: left mouse button held down.
+            mx, my    = pygame.mouse.get_pos()
+            btn       = pygame.mouse.get_pressed()
+            ddx       = mx - env.cx
+            ddy       = my - env.cy
+            dist_m    = float(np.sqrt(ddx**2 + ddy**2))
+            if dist_m > 1.0:
+               dx_act = float(ddx / dist_m)
+               dy_act = float(ddy / dist_m)
+            else:
+               dx_act = 0.0
+               dy_act = 0.0
+            grip_act = 1.0 if btn[0] else -1.0
+            action   = np.array([dx_act, dy_act, grip_act], dtype=np.float32)
+         elif use_oracle:
             action = oracle.act(obs)
          elif model is not None:
             action, _ = model.predict(obs, deterministic=True)
@@ -634,6 +668,10 @@ if __name__ == "__main__":
       help="natural language goal prompt. if omitted, samples from trained tasks",
    )
    parser.add_argument(
+      "--human", action="store_true",
+      help="control the cursor yourself with mouse (left click = grip)",
+   )
+   parser.add_argument(
       "--random", action="store_true",
       help="use a random agent instead of a trained model",
    )
@@ -693,6 +731,7 @@ if __name__ == "__main__":
          model_path=args.model,
          prompt=args.prompt,
          use_random=args.random,
+         use_human=args.human,
          multi_task=args.multi_task,
          use_oracle=args.oracle,
          sequential=args.sequential,
