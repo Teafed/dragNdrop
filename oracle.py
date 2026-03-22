@@ -33,9 +33,9 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
    flat BC training only uses (obs, action).
 
 --- starter tasks ---
-   reach:  navigate cursor to target shape (env.target_idx)
-   touch:  navigate to env.target_idx then activate grip
-   drag:   navigate to env.target_idx, grip, drag to target region
+   reach:  navigate cursor to the closest shape in env.target_indices
+   touch:  navigate to closest valid target then activate grip
+   drag:   navigate to closest valid target, grip, drag to target region
 
 --- wave 3 tasks ---
    arrange_in_sequence / arrange_in_line:
@@ -224,8 +224,14 @@ class OraclePolicy:
       attribute = env.goal.get("attribute", "none")
 
       if task in ("reach", "touch", "drag"):
-         # use the env's pre-computed target index (respects target_color/type)
-         idx    = env.target_idx
+         # pick the closest valid target so oracle navigates efficiently.
+         # with multiple valid targets (e.g. "touch any red shape"), this
+         # avoids committing to a far shape when a closer one also qualifies.
+         idx = min(
+            env.target_indices,
+            key=lambda i: float(np.sqrt(
+               (env.cx - env.shapes[i].x)**2 + (env.cy - env.shapes[i].y)**2))
+         )
          target = self._compute_target(idx, task)
          return idx, target
 

@@ -123,9 +123,7 @@ def draw_scene(surface, env, font, episode, steps, prompt,
 
    # top-left HUD: task info
    score   = env._compute_score()
-   rank    = env._compute_rank_corr()
-   hud_str = (f"task: {task}   progress: {score:.2%}   "
-              f"rank/cohesion: {rank:+.2f}")
+   hud_str = f"task: {task}   progress: {score:.2%}"
    surface.blit(font.render(hud_str, True, (200, 200, 200)), (10, 10))
 
    # prompt on second line — truncate if very long
@@ -176,7 +174,7 @@ def dump_state(env, step, episode, prompt=None, extra=None):
          pass
    for i, s in enumerate(env.shapes):
       if task in ("reach", "touch", "drag"):
-         marker = " <-- target" if i == env.target_idx else ""
+         marker = " <-- target" if i in env.target_indices else ""
       else:
          # arrangement: show which shape oracle is currently working on
          if oracle_target is not None and oracle_target >= 0:
