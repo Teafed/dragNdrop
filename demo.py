@@ -255,12 +255,11 @@ def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None,
 
 # obs region labels for the 108-dim vector
 _OBS_REGIONS = [
-   ("cursor_state",   slice(0,   4),  "cx cy holding grabbed_idx"),
-   ("grabbed_shape",  slice(4,   9),  "grabbed shape features"),
-   ("nearest_shape",  slice(9,   14), "nearest shape features"),
-   ("all_shapes",     slice(14,  44), "all 6 shapes (zero-padded)"),
-   ("goal_struct",    slice(44,  76), "structured goal one-hots"),
-   ("goal_semantic",  slice(76,  108),"MiniLM semantic projection"),
+   ("cursor_state",  slice(0,   4),  "cx cy holding grabbed_idx"),
+   ("grabbed_shape", slice(4,   9),  "grabbed shape features"),
+   ("nearest_shape", slice(9,   14), "nearest shape features"),
+   ("all_shapes",    slice(14,  44), "all 6 shapes zero-padded"),
+   ("goal_encoding", slice(44, 108), "64-dim llm goal projection"),
 ]
 
 
