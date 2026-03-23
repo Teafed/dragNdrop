@@ -1,0 +1,12 @@
+{
+   "n_shapes": 6,
+   "tasks": [
+      "reach",
+      "touch",
+      "drag",
+      "arrange_in_line",
+      "arrange_in_sequence",
+      "arrange_in_groups",
+      "arrange_in_region"
+   ]
+}
