@@ -33,7 +33,7 @@ from config import GOAL_ENCODING_DIM
 
 def load_model_config(model_path: str) -> dict:
    """
-   load training_config.json from alongside the model.
+   load env_config.json from alongside the model.
    returns config dict. falls back to safe defaults with a warning if
    the file isn't found (e.g. for models trained before this was added).
 
@@ -43,16 +43,15 @@ def load_model_config(model_path: str) -> dict:
    """
    import json
    from bc_train import GoalEncoder
-   config_path = os.path.join(os.path.dirname(model_path), "training_config.json")
+   config_path = os.path.join(os.path.dirname(model_path), "env_config.json")
    if os.path.exists(config_path):
       with open(config_path) as f:
          config = json.load(f)
-      print(f"[demo] training config loaded from {config_path}")
+      print(f"[demo] env config loaded from {config_path}")
    else:
-      print(f"[demo] no training_config.json found at {config_path} — "
+      print(f"[demo] no env_config.json found at {config_path} — "
             f"defaulting to n_shapes=1, tasks=reach/touch/drag")
       config = {"n_shapes": 1, "tasks": ["reach", "touch", "drag"]}
-   # goal encoder is always fixed seed 42 — no file needed
    encoder = GoalEncoder()
    encoder.eval()
    config["goal_encoder"] = encoder

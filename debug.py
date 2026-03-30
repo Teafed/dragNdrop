@@ -385,7 +385,7 @@ def test_oracle_per_task(n_episodes_per_task: int = 20) -> bool:
    }
 
    all_ok = True
-   rng    = np.random.default_rng(42)
+   rng    = np.random.default_rng(31)
 
    for task, prompt in task_prompts.items():
       goal    = _default_goal(task)
@@ -468,11 +468,6 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
             device=device,
          )
 
-      print("  note: this is a quick diagnostic run (80 episodes, 10 epochs).")
-      print("  loss will be higher than a full training run — that's expected.")
-      print("  look for: loss decreasing steadily across epochs (not plateauing")
-      print("  after epoch 2), grip loss dropping below ~0.25, dxy below ~0.30.")
-      print("  a plateau at high loss usually means too little data or lr too high.")
       ok = True
 
    except Exception as e:
@@ -737,13 +732,13 @@ if __name__ == "__main__":
 
    ok7 = ok8 = ok6 = ok9 = None
    if args.oracle:
-      ok7 = test_oracle_per_task(n_episodes_per_task=args.oracle_episodes)
-      ok8 = test_bc_loss()
       if args.render:
          test_oracle_render()
          ok6 = True
       else:
          print("=== test 6: skipped (no --render flag) ===\n")
+      ok7 = test_oracle_per_task(n_episodes_per_task=args.oracle_episodes)
+      ok8 = test_bc_loss()
       ok9 = test_bc_loss_per_task(n_episodes=args.oracle_episodes)
    else:
       print("=== tests 6-9: skipped (no --oracle flag) ===\n")

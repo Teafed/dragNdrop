@@ -40,11 +40,11 @@ from config import MAX_SHAPES, N_ENVS, SUPPORTED_TASKS
 from prompt_gen import PromptGenerator
 
 # ---------------------------------------------------------------------------
-# training config
+# env config
 # ---------------------------------------------------------------------------
 
-def _save_training_config(save_path: str, curriculum, timesteps: int):
-   """write training_config.json alongside the model files."""
+def _save_env_config(save_path: str, curriculum, timesteps: int):
+   """write env_config.json alongside the model files."""
    import json
    os.makedirs(save_path, exist_ok=True)
    n_shapes = curriculum.n_shapes_range[1] if curriculum is not None else MAX_SHAPES
@@ -53,10 +53,10 @@ def _save_training_config(save_path: str, curriculum, timesteps: int):
       "n_shapes": n_shapes,
       "tasks":    tasks,
    }
-   path = os.path.join(save_path, "training_config.json")
+   path = os.path.join(save_path, "env_config.json")
    with open(path, "w") as f:
       json.dump(config, f, indent=3)
-   print(f"[train] training config saved to {path}")
+   print(f"[train] env config saved to {path}")
 
 # ---------------------------------------------------------------------------
 # goal-conditioned env factory
@@ -217,13 +217,11 @@ def train(
       print("\n[curriculum] disabled — training on all tasks from step 0")
 
    # write config immediately so it exists even if training crashes later
-   _save_training_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum, timesteps)
 
    # --- oracle BC warm-start ---
    bc_network = None
    if use_oracle:
-      print(f"\n--- collecting {bc_episodes} oracle demonstrations "
-            f"across all task pool prompts ---")
       task_weights   = None
       n_shapes_range = None
       if use_curriculum:
@@ -260,8 +258,9 @@ def train(
    use_gpu     = (device == "cuda")
    n_envs      = N_ENVS * 4 if use_gpu else N_ENVS
    batch_size  = 512         if use_gpu else 128
-   vec_cls     = SubprocVecEnv if use_gpu else DummyVecEnv
-
+   # vec_cls     = SubprocVecEnv if use_gpu else DummyVecEnv
+   vec_cls = DummyVecEnv # just test this first
+   
    print(f"\n[train] device={device}  n_envs={n_envs}  "
          f"batch_size={batch_size}  vec={vec_cls.__name__}")
 
@@ -308,7 +307,7 @@ def train(
 
    final_path = os.path.join(save_path, "final_model")
    model.save(final_path)
-   _save_training_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum, timesteps)
 
    print(f"\n--- done. model saved to {final_path} ---")
    

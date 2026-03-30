@@ -1,20 +1,21 @@
 """
 curriculum.py
 
-curriculum manager for staged multi-task training.
+staged training curriculum for the shape manipulation agent.
 
-stages:
-   [fill this out]
+stages progress from simple cursor skills (reach, touch, drag) up to the
+full multi-shape arrangement tasks. each stage has a performance gate —
+if the agent hits the solve rate threshold before the step ceiling, it
+advances early. if not, it advances at the ceiling anyway so training
+doesn't stall.
 
-usage:
-   manager = CurriculumManager()
-   prompt  = manager.sample_prompt()
-   n_shp   = manager.sample_n_shapes()
-   ...
-   advanced = manager.maybe_advance(
-      per_task_solve_rates={"reach": 0.85, ...},
-      current_step=30_000,
-   )
+gate thresholds are intentionally permissive (40-50%) for starter stages.
+these build cursor skills, not mastery — advancing early is better than
+stalling, since the agent continues improving on earlier tasks while
+training later ones.
+
+wave 3 arrangement stages are defined but commented out. enable them once
+reach/touch/drag are solving reliably.
 """
 
 import random
@@ -24,13 +25,8 @@ import random
 # ---------------------------------------------------------------------------
 
 _STAGES = [
-   # --- starter stages: cursor skill building ---
-   # gate thresholds are intentionally permissive (50-60%) — these are
-   # cursor skill stages, not mastery checkpoints. advancing early is better
-   # than stalling here; the agent can still improve on reach/touch while
-   # training later stages.
    {
-      "name":         "stage 0a — reach (1 shape)",
+      "name":         "reach — 1 shape",
       "tasks":        ["reach"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
@@ -39,7 +35,7 @@ _STAGES = [
       "step_ceiling": 25_000,
    },
    {
-      "name":         "stage 0b — reach (1-2 shapes)",
+      "name":         "reach — 1-2 shapes",
       "tasks":        ["reach"],
       "n_shapes_min": 1,
       "n_shapes_max": 2,
@@ -48,7 +44,7 @@ _STAGES = [
       "step_ceiling": 50_000,
    },
    {
-      "name":         "stage 1a — touch (1 shape)",
+      "name":         "touch — 1 shape",
       "tasks":        ["touch"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
@@ -57,7 +53,7 @@ _STAGES = [
       "step_ceiling": 75_000,
    },
    {
-      "name":         "stage 1b — touch (1-2 shapes)",
+      "name":         "touch — 1-2 shapes",
       "tasks":        ["touch"],
       "n_shapes_min": 1,
       "n_shapes_max": 2,
@@ -66,7 +62,7 @@ _STAGES = [
       "step_ceiling": 100_000,
    },
    {
-      "name":         "stage 1c — reach and touch (1-2 shapes)",
+      "name":         "reach and touch — 1-2 shapes",
       "tasks":        ["reach", "touch"],
       "n_shapes_min": 1,
       "n_shapes_max": 2,
@@ -75,7 +71,7 @@ _STAGES = [
       "step_ceiling": 150_000,
    },
    {
-      "name":         "stage 2a — drag (1 shape)",
+      "name":         "drag — 1 shape",
       "tasks":        ["drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
@@ -84,7 +80,7 @@ _STAGES = [
       "step_ceiling": 200_000,
    },
    {
-      "name":         "stage 2b — reach and drag (1 shape)",
+      "name":         "reach and drag — 1 shape",
       "tasks":        ["reach", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
@@ -93,7 +89,7 @@ _STAGES = [
       "step_ceiling": 250_000,
    },
    {
-      "name":         "stage 2c — reach, touch, and drag (1 shape)",
+      "name":         "reach, touch and drag — 1 shape",
       "tasks":        ["reach", "touch", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
@@ -102,21 +98,21 @@ _STAGES = [
       "step_ceiling": 300_000,
    },
    {
-      "name":         "stage 3 — reach, touch, and drag (1-2 shapes, final)",
+      "name":         "reach, touch and drag — 1-2 shapes (final)",
       "tasks":        ["reach", "touch", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 2,
       "gate_task":    None,   # no gate — stay here for remaining budget
       "gate_sr":      None,
       "step_ceiling": None,
-   }
+   },
 
-   # --- WAVE 3 STAGES: commented out for starter task debugging ---
-   # Uncomment these blocks (and remove the final-stage override below)
-   # once reach/touch/drag are solving reliably.
-
+   # --- wave 3 stages (disabled) ---
+   # uncomment these and remove the final stage above once starter tasks
+   # are solving reliably. also update final_stage reference in train.py.
+   #
    # {
-   #    "name":         "stage 3 — sequence",
+   #    "name":         "arrange in sequence — 2-3 shapes",
    #    "tasks":        ["arrange_in_sequence"],
    #    "n_shapes_min": 2,
    #    "n_shapes_max": 3,
@@ -125,7 +121,7 @@ _STAGES = [
    #    "step_ceiling": 150_000,
    # },
    # {
-   #    "name":         "stage 4 — + region",
+   #    "name":         "sequence and region — 2-3 shapes",
    #    "tasks":        ["arrange_in_sequence", "arrange_in_region"],
    #    "n_shapes_min": 2,
    #    "n_shapes_max": 3,
@@ -134,7 +130,7 @@ _STAGES = [
    #    "step_ceiling": 150_000,
    # },
    # {
-   #    "name":         "stage 5 — + line",
+   #    "name":         "sequence, region and line — 2-4 shapes",
    #    "tasks":        ["arrange_in_sequence", "arrange_in_region",
    #                     "arrange_in_line"],
    #    "n_shapes_min": 2,
@@ -144,28 +140,24 @@ _STAGES = [
    #    "step_ceiling": 200_000,
    # },
    # {
-   #    "name":         "stage 6 — + groups (fewer shapes)",
+   #    "name":         "all arrangement tasks — 2-3 shapes",
    #    "tasks":        ["arrange_in_sequence", "arrange_in_region",
    #                     "arrange_in_line", "arrange_in_groups"],
    #    "n_shapes_min": 2,
-   #    "n_shapes_max": 3,   # fewer shapes — groups is hard, ramp slowly
+   #    "n_shapes_max": 3,
    #    "gate_task":    "arrange_in_groups",
    #    "gate_sr":      0.40,
    #    "step_ceiling": 200_000,
    # },
    # {
-   #    "name":         "stage 7 — all tasks",
+   #    "name":         "all tasks — 2-6 shapes (final)",
    #    "tasks":        SUPPORTED_TASKS,
    #    "n_shapes_min": 2,
    #    "n_shapes_max": 6,
-   #    "gate_task":    None,   # no gate — stay here for remaining steps
+   #    "gate_task":    None,
    #    "gate_sr":      None,
    #    "step_ceiling": None,
    # },
-
-   # NOTE: stage 2 (drag) is currently the FINAL stage. it has no gate_task=None
-   # so we add a terminal "stay here" stage that mirrors the old stage 7 behaviour
-   # but only for the three starter tasks. Remove this once wave 3 is re-enabled.
 ]
 
 
@@ -177,15 +169,15 @@ class CurriculumManager:
    """
    manages curriculum stage and task sampling for training.
 
-   stateful: tracks current stage and the step at which it started.
+   stateful: tracks current stage index and the step at which it started.
    train.py calls maybe_advance() after each per-task eval.
    """
 
    def __init__(self, verbose: bool = True, start_stage: int = 0):
-      self._stage_idx        = start_stage
+      self._stage_idx        = max(0, min(start_stage, len(_STAGES) - 1))
       self._stage_start_step = 0
       self.verbose           = verbose
-      self._log(f"curriculum starting at {self.stage['name']}")
+      self._log(f"curriculum starting at stage {self._stage_idx} — {self.stage['name']}")
 
    @property
    def stage(self) -> dict:
@@ -209,9 +201,7 @@ class CurriculumManager:
       return self._stage_idx == len(_STAGES) - 1
 
    def sample_prompt(self) -> str:
-      """
-      sample a prompt from the current stage's active tasks.
-      """
+      """sample a prompt from the current stage's active tasks."""
       from prompt_gen import sample_prompt
       task = random.choice(self.active_tasks)
       return sample_prompt(task)
@@ -227,9 +217,9 @@ class CurriculumManager:
                      current_step: int) -> bool:
       """
       check whether to advance to the next stage.
-      returns True if advanced, False otherwise.
+      returns True if the stage advanced, False otherwise.
 
-      per_task_solve_rates: {task_name: solve_rate} from last eval.
+      per_task_solve_rates: {task_name: solve_rate} from the last eval.
       current_step: total training timesteps elapsed.
       """
       if self.is_final_stage:
@@ -256,10 +246,10 @@ class CurriculumManager:
       return False
 
    def _advance(self, current_step: int, reason: str):
-      old_name              = self.stage["name"]
-      self._stage_idx      += 1
+      old_name               = self.stage["name"]
+      self._stage_idx       += 1
       self._stage_start_step = current_step
-      new_name              = self.stage["name"]
+      new_name               = self.stage["name"]
       self._log(
          f"advancing: {old_name} → {new_name}  "
          f"(reason: {reason}  step: {current_step:,})"
@@ -271,7 +261,8 @@ class CurriculumManager:
 
    def status(self) -> str:
       s = self.stage
-      return (f"{s['name']}  tasks={self.active_tasks}  "
+      return (f"stage {self._stage_idx} — {s['name']}  "
+              f"tasks={self.active_tasks}  "
               f"n_shapes={self.n_shapes_range[0]}-{self.n_shapes_range[1]}")
 
    def _log(self, msg: str):

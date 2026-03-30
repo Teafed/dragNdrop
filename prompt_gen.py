@@ -436,7 +436,7 @@ if __name__ == "__main__":
                        help="print full training pool size")
    args = parser.parse_args()
 
-   gen = PromptGenerator(seed=42)
+   gen = PromptGenerator(seed=31)
 
    if args.coverage:
       gen.coverage_report()
