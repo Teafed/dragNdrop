@@ -218,7 +218,7 @@ def test_all_tasks() -> bool:
          rewards = []
          for _ in range(10):
             action = env.action_space.sample()
-            obs, reward, info = env.step(action)
+            obs, reward, _, _, info = env.step(action)
             rewards.append(reward)
 
          obs_ok  = obs.shape[0] == get_obs_size()
