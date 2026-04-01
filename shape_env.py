@@ -516,15 +516,9 @@ class ShapeEnv(gym.Env):
          if len(set(color_indices.tolist())) == n and n > 2:
             color_indices[1] = color_indices[0]
 
-      # TODO: make sure this is for tasks where there must be only 1 target!
       elif task in ("reach", "touch", "drag") and tc not in ("none", "any"):
          target_color_idx               = COLOR_NAMES.index(tc)
          color_indices[guaranteed_slot] = target_color_idx
-         for i in range(n):
-            if i == guaranteed_slot:
-               continue
-            while color_indices[i] == target_color_idx:
-               color_indices[i] = rng.integers(0, n_colors)
 
       return color_indices
 
@@ -551,15 +545,9 @@ class ShapeEnv(gym.Env):
       elif n >= 2 and len(set(type_indices.tolist())) < 2:
          type_indices[1] = (int(type_indices[0]) + 1) % N_SHAPE_TYPES
 
-      # TODO: make sure this is for tasks where there must be only 1 target!
       if task in ("reach", "touch", "drag") and tt not in ("none", "any"):
          target_type_idx               = SHAPE_TYPES.index(tt)
          type_indices[guaranteed_slot]  = target_type_idx
-         for i in range(n):
-            if i == guaranteed_slot:
-               continue
-            while type_indices[i] == target_type_idx:
-               type_indices[i] = rng.integers(0, N_SHAPE_TYPES)
 
       return type_indices
 
