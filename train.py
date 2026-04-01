@@ -42,8 +42,8 @@ from prompt_gen import PromptGenerator
 # training config
 # ---------------------------------------------------------------------------
 
-def _save_training_config(save_path: str, curriculum, timesteps: int):
-   """write training_config.json alongside the model files."""
+def _save_env_config(save_path: str, curriculum, timesteps: int):
+   """write env_config.json alongside the model files."""
    import json
    os.makedirs(save_path, exist_ok=True)
    n_shapes = curriculum.n_shapes_range[1] if curriculum is not None else MAX_SHAPES
@@ -52,10 +52,10 @@ def _save_training_config(save_path: str, curriculum, timesteps: int):
       "n_shapes": n_shapes,
       "tasks":    tasks,
    }
-   path = os.path.join(save_path, "training_config.json")
+   path = os.path.join(save_path, "env_config.json")
    with open(path, "w") as f:
       json.dump(config, f, indent=3)
-   print(f"[train] training config saved to {path}")
+   print(f"[train] env config saved to {path}")
 
 # ---------------------------------------------------------------------------
 # goal-conditioned env factory
@@ -216,7 +216,7 @@ def train(
       print("\n[curriculum] disabled — training on all tasks from step 0")
 
    # write config immediately so it exists even if training crashes later
-   _save_training_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum, timesteps)
 
    if use_oracle:
       # demos are collected across the full task pool regardless of curriculum
@@ -286,7 +286,7 @@ def train(
 
    final_path = os.path.join(save_path, "final_model")
    model.save(final_path)
-   _save_training_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum, timesteps)
 
    print(f"\n--- done. model saved to {final_path} ---")
    
