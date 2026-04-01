@@ -55,7 +55,7 @@ from dataclasses import dataclass
 
 from config import (
    MAX_SHAPES, OBS_VALUES_PER_SHAPE, GOAL_ENCODING_DIM, get_obs_size,
-   SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
+   get_action_size, SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
    CURSOR_SPEED, GRIP_THRESHOLD, GRIP_RADIUS,
 )
 
@@ -94,7 +94,6 @@ REGION_INNER = {
    "bottom": WINDOW_H * 0.65,
 }
 
-# TODO: remove this, allow any speed
 LINE_SPREAD_THRESHOLD = 120  # perpendicular speed in pixels
 
 # TODO: add "none"? see llm_goal_parser
@@ -113,14 +112,12 @@ _CURSOR_RADIUS   = 3    # circle radius (pixels)
 _CURSOR_GAP      = 4    # gap between circle edge and crosshair line start
 _CURSOR_ARM      = 8    # crosshair arm length (pixels)
 _CURSOR_COLOR    = (220, 220, 220)
-_CURSOR_COLOR_ON = (220, 220, 220)   # same color — grip shown by fill only
 
 
 # ---------------------------------------------------------------------------
 # RewardConfig
 # ---------------------------------------------------------------------------
 
-# TODO: only completion_bonus is used right now! use others
 @dataclass
 class RewardConfig:
    """
@@ -232,16 +229,18 @@ class ShapeEnv(gym.Env):
       )
 
       obs_size = get_obs_size()
+      action_size = get_action_size()
       self.observation_space = spaces.Box(
          low=-2.0, high=2.0, shape=(obs_size,), dtype=np.float32)
-      # TODO: use action_size similar to obs_size instead of 3
-      # also how did we choose the high and low values for these?
+      # how did we choose the high and low values for these?
       self.action_space = spaces.Box(
-         low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+         low=-1.0, high=1.0, shape=(action_size,), dtype=np.float32)
 
       # cursor state
       self.cx          = float(WINDOW_W / 2)
       self.cy          = float(WINDOW_H / 2)
+      self.grip        = False
+      self.prev_grip   = False
       self.holding     = False  # True only when grip active AND shape grabbed
       self.grabbed_idx = -1     # index into self.shapes, -1 = nothing grabbed
 
@@ -249,9 +248,6 @@ class ShapeEnv(gym.Env):
       self.shapes           = []
       self.steps            = 0
       self.prev_score       = 0.0
-      # removed
-      # self.prev_score_delta = 0.0
-      # self.prev_rank_corr   = 0.0
       self.target_indices = [0]  # indices of all valid target shapes
       self.window           = None
       self.clock            = None
@@ -275,7 +271,6 @@ class ShapeEnv(gym.Env):
       self.steps            = 0
       self.shapes           = self._spawn_shapes()
       self.target_indices   = self._find_target_indices()
-      # TODO: does this make sense to do? why not set to 0?
       self.prev_score       = self._compute_task_score()
       
       return self._get_obs(), {}
@@ -309,6 +304,7 @@ class ShapeEnv(gym.Env):
       if self.render_mode == "human":
          self._render_frame()
 
+      self.prev_grip = self.grip
       return obs, reward, terminated, truncated, info
 
    # TODO: in demo.py, can we use this instead of having the headless function?
@@ -350,12 +346,16 @@ class ShapeEnv(gym.Env):
       self.cy = new_cy
 
       # grip logic
-      want_grip = grip_raw > GRIP_THRESHOLD
-      if want_grip and not self.holding:
+      self.grip = grip_raw > GRIP_THRESHOLD
+      grip_edge = self.grip and not self.prev_grip   # True only on the frame grip activates
+      if grip_edge:
+         print("this should only print once per click")
          self.grabbed_idx = self._try_grab()
-      elif not want_grip:
+      elif not self.grip:
          self.grabbed_idx = -1
-      self.holding = want_grip and self.grabbed_idx >= 0
+         self.holding   = self.grip and self.grabbed_idx >= 0
+         self.prev_grip = self.grip
+      self.holding = self.grip and self.grabbed_idx >= 0
 
       # drag grabbed shape with cursor
       if self.holding:
@@ -824,10 +824,7 @@ class ShapeEnv(gym.Env):
       # gripping a valid target; check proximity
       # TODO: do we need to check proximity? should already be at cursor
       if self.holding and self.grabbed_idx in self.target_indices:
-         s    = self.shapes[self.grabbed_idx]
-         dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-         if dist <= GRIP_RADIUS:
-            return 1.0
+         return 1.0
 
       # gripping something invalid
       if self.holding:
@@ -1075,7 +1072,7 @@ class ShapeEnv(gym.Env):
         |
       - o -
         |
-      circle is filled when holding a shape, outline when not.
+      circle is filled when clicking, outline when not.
       """
       cx  = int(self.cx)
       cy  = int(self.cy)
@@ -1084,7 +1081,7 @@ class ShapeEnv(gym.Env):
       arm = _CURSOR_ARM
       col = _CURSOR_COLOR
 
-      if self.holding:
+      if self.grip:
          pygame.draw.circle(self.window, col, (cx, cy), r)
       else:
          pygame.draw.circle(self.window, col, (cx, cy), r, 1)
