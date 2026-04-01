@@ -349,7 +349,6 @@ class ShapeEnv(gym.Env):
       self.grip = grip_raw > GRIP_THRESHOLD
       grip_edge = self.grip and not self.prev_grip   # True only on the frame grip activates
       if grip_edge:
-         print("this should only print once per click")
          self.grabbed_idx = self._try_grab()
       elif not self.grip:
          self.grabbed_idx = -1
