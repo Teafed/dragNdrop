@@ -60,7 +60,7 @@ GRIP_THRESHOLD  = 0.0   # action[2] > this -> holding = True
 GRIP_RADIUS     = 20    # pixels — cursor must be within this to attach to shape
 
 # ---------------------------------------------------------------------------
-# obs size helper
+# obs and action size helper
 # ---------------------------------------------------------------------------
 
 def get_obs_size() -> int:
@@ -77,6 +77,12 @@ def get_obs_size() -> int:
    return (CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE
            + MAX_SHAPES * OBS_VALUES_PER_SHAPE
            + GOAL_ENCODING_DIM)
+
+def get_action_size() -> int:
+   """
+   cx + cy + grip = 3
+   """
+   return 3
 
 # ---------------------------------------------------------------------------
 # task framework
