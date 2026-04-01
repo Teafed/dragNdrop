@@ -201,7 +201,7 @@ class CurriculumCallback(BaseCallback):
                f"stage_{prev_stage_idx:02d}_checkpoint")
             self.model.save(ckpt)
             from train import _save_env_config
-            _save_env_config(self._save_path, self.curriculum, self.num_timesteps)
+            _save_env_config(self._save_path, self.curriculum)
             if self.verbose >= 1:
                print(f"[curriculum] checkpoint saved: {ckpt}.zip; training config updated")
          # log new stage index so tensorboard shows the transition

@@ -217,7 +217,7 @@ def train(
       print("\n[curriculum] disabled — training on all tasks from step 0")
 
    # write config immediately so it exists even if training crashes later
-   _save_env_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum)
 
    # --- oracle BC warm-start ---
    bc_network = None
@@ -300,7 +300,7 @@ def train(
 
    final_path = os.path.join(save_path, "final_model")
    model.save(final_path)
-   _save_env_config(save_path, curriculum, timesteps)
+   _save_env_config(save_path, curriculum)
 
    print(f"\n--- done. model saved to {final_path} ---")
    
