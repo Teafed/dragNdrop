@@ -31,6 +31,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal, get_embedding
@@ -39,7 +40,7 @@ from config import MAX_SHAPES, N_ENVS, SUPPORTED_TASKS
 from prompt_gen import PromptGenerator
 
 # ---------------------------------------------------------------------------
-# training config
+# env config
 # ---------------------------------------------------------------------------
 
 def _save_env_config(save_path: str, curriculum, timesteps: int):
@@ -218,16 +219,24 @@ def train(
    # write config immediately so it exists even if training crashes later
    _save_env_config(save_path, curriculum, timesteps)
 
+   # --- oracle BC warm-start ---
+   bc_network = None
    if use_oracle:
-      # demos are collected across the full task pool regardless of curriculum
-      # stage — bc warms up all tasks, then ppo fine-tunes with curriculum.
-      print(f"\n--- collecting {bc_episodes} oracle demonstrations "
-            f"across all task pool prompts ---")
+      task_weights   = None
+      n_shapes_range = None
+      if use_curriculum:
+         from curriculum import _STAGES
+         final_stage    = _STAGES[-1]
+         final_tasks    = final_stage["tasks"]
+         task_weights   = {t: (2.0 if t == "touch" else 1.0) for t in final_tasks}
+         n_shapes_range = (final_stage["n_shapes_min"], final_stage["n_shapes_max"])
 
       dataset = collect_demonstrations(
          n_episodes=bc_episodes,
          goal_encoder=goal_encoder,
          verbose=True,
+         task_weights=task_weights,
+         n_shapes_range=n_shapes_range,
       )
 
       device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -237,43 +246,48 @@ def train(
          epochs=bc_epochs,
          device=device,
       )
-
-      n_envs  = N_ENVS
-      vec_env = make_vec_env(
-         make_goal_conditioned_env(goal_encoder, curriculum), n_envs=n_envs)
-
-      if resume_model is not None:
-         print(f"\n--- resuming from checkpoint: {resume_model} ---")
-         model = PPO.load(resume_model, env=vec_env)
-      else:
-         print("\n--- initialising PPO from BC weights (BicameralPolicy) ---")
-         model = build_ppo_from_bc(bc_network, n_shapes=MAX_SHAPES, vec_env=vec_env)
-
    else:
-      n_envs  = N_ENVS
-      vec_env = make_vec_env(
-         make_goal_conditioned_env(goal_encoder, curriculum), n_envs=n_envs)
+      device = "cuda" if torch.cuda.is_available() else "cpu"
 
-      if resume_model is not None:
-         print(f"\n--- resuming from checkpoint: {resume_model} ---")
-         model = PPO.load(resume_model, env=vec_env)
-      else:
-         model = PPO(
-            BicameralPolicy,
-            vec_env,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=128,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.05,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            verbose=1,
-            tensorboard_log="./logs/tensorboard/",
-         )
+   use_gpu     = (device == "cuda")
+   n_envs      = N_ENVS * 4 if use_gpu else N_ENVS
+   batch_size  = 512         if use_gpu else 128
+   vec_cls = DummyVecEnv
+   
+   print(f"\n[train] device={device}  n_envs={n_envs}  "
+         f"batch_size={batch_size}  vec={vec_cls.__name__}")
+
+   vec_env = make_vec_env(
+      make_goal_conditioned_env(goal_encoder, curriculum),
+      n_envs=n_envs,
+      vec_env_cls=vec_cls,
+   )
+
+   # --- build PPO model ---
+   if resume_model is not None:
+      print(f"\n--- resuming from checkpoint: {resume_model} ---")
+      model = PPO.load(resume_model, env=vec_env)
+   elif bc_network is not None:
+      print("\n--- initialising PPO from BC weights (BicameralPolicy) ---")
+      model = build_ppo_from_bc(bc_network, n_shapes=MAX_SHAPES, vec_env=vec_env,
+                                batch_size=batch_size)
+   else:
+      model = PPO(
+         BicameralPolicy,
+         vec_env,
+         learning_rate=3e-4,
+         n_steps=2048,
+         batch_size=batch_size,
+         n_epochs=10,
+         gamma=0.99,
+         gae_lambda=0.95,
+         clip_range=0.2,
+         ent_coef=0.05,
+         vf_coef=0.5,
+         max_grad_norm=0.5,
+         verbose=1,
+         tensorboard_log="./logs/tensorboard/",
+      )
 
    # goal encoder is fixed (random projection, not trained) — set eval mode
    # once here regardless of which branch was taken above.
