@@ -33,7 +33,7 @@ from config import GOAL_ENCODING_DIM
 
 def load_model_config(model_path: str) -> dict:
    """
-   load training_config.json from alongside the model.
+   load env_config.json from alongside the model.
    returns config dict. falls back to safe defaults with a warning if
    the file isn't found (e.g. for models trained before this was added).
 
@@ -43,16 +43,15 @@ def load_model_config(model_path: str) -> dict:
    """
    import json
    from bc_train import GoalEncoder
-   config_path = os.path.join(os.path.dirname(model_path), "training_config.json")
+   config_path = os.path.join(os.path.dirname(model_path), "env_config.json")
    if os.path.exists(config_path):
       with open(config_path) as f:
          config = json.load(f)
-      print(f"[demo] training config loaded from {config_path}")
+      print(f"[demo] env config loaded from {config_path}")
    else:
-      print(f"[demo] no training_config.json found at {config_path} — "
+      print(f"[demo] no env_config.json found at {config_path} — "
             f"defaulting to n_shapes=1, tasks=reach/touch/drag")
       config = {"n_shapes": 1, "tasks": ["reach", "touch", "drag"]}
-   # goal encoder is always fixed seed 42 — no file needed
    encoder = GoalEncoder()
    encoder.eval()
    config["goal_encoder"] = encoder
@@ -123,9 +122,7 @@ def draw_scene(surface, env, font, episode, steps, prompt,
 
    # top-left HUD: task info
    score   = env._compute_score()
-   rank    = env._compute_rank_corr()
-   hud_str = (f"task: {task}   progress: {score:.2%}   "
-              f"rank/cohesion: {rank:+.2f}")
+   hud_str = f"task: {task}   progress: {score:.2%}"
    surface.blit(font.render(hud_str, True, (200, 200, 200)), (10, 10))
 
    # prompt on second line — truncate if very long
@@ -176,7 +173,7 @@ def dump_state(env, step, episode, prompt=None, extra=None):
          pass
    for i, s in enumerate(env.shapes):
       if task in ("reach", "touch", "drag"):
-         marker = " <-- target" if i == env.target_idx else ""
+         marker = " <-- target" if i in env.target_indices else ""
       else:
          # arrangement: show which shape oracle is currently working on
          if oracle_target is not None and oracle_target >= 0:
@@ -253,7 +250,7 @@ def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None,
 # saliency analysis
 # ---------------------------------------------------------------------------
 
-# obs region labels for the 108-dim vector
+# obs region labels for the 108-dim vector — must match shape_env._get_obs()
 _OBS_REGIONS = [
    ("cursor_state",  slice(0,   4),  "cx cy holding grabbed_idx"),
    ("grabbed_shape", slice(4,   9),  "grabbed shape features"),
@@ -299,43 +296,17 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
 def print_saliency(saliency: dict, prompt: str, detail: bool = False):
    """
    print saliency table with a bar chart normalised to the max region.
-   if detail=True, also show per-field breakdown within goal_struct.
+   detail is unused for now — reserved for when goal encoding is split
+   into structured + semantic halves.
    """
-   from config import (SUPPORTED_TASKS, COLOR_NAMES_GOAL, SHAPE_TYPES)
-
-   max_grad = max(v["mean_grad"] for k, v in saliency.items() if k != "goal_struct_raw") + 1e-8
+   max_grad = max(v["mean_grad"] for v in saliency.values()) + 1e-8
    print(f"\n  saliency — {prompt}")
    print(f"  {'region':<16} {'mean |grad|':>11}  bar")
    print(f"  {'-'*52}")
    for name, vals in saliency.items():
-      if name == "goal_struct_raw": continue
       g   = vals["mean_grad"]
       bar = "█" * int(g / max_grad * 30)
       print(f"  {name:<16} {g:>11.5f}  {bar}")
-
-   if detail and "goal_struct_raw" in saliency:
-      # break down goal_struct by field
-      raw = saliency["goal_struct_raw"]   # per-dim gradients (32,)
-      fields = [
-         ("task",      SUPPORTED_TASKS,   7),
-         ("color",     COLOR_NAMES_GOAL + ["none"], 6),
-         ("type",      SHAPE_TYPES + ["none"],       4),
-         ("region",    ["left","right","top","bottom","none"], 5),
-         ("axis",      ["x","y","none"],              3),
-         ("direction", ["asc","desc","none"],          3),
-         ("attribute", ["size","color","none"],        3),
-         ("bounded",   ["bounded"],                    1),
-      ]
-      print(f"\n  goal_struct field breakdown:")
-      offset = 0
-      for fname, labels, ndim in fields:
-         vals_f = raw[offset:offset+ndim]
-         peak_i = int(vals_f.argmax())
-         peak_v = float(vals_f[peak_i])
-         bar    = "█" * int(peak_v / (max_grad + 1e-8) * 30)
-         label  = labels[peak_i] if peak_i < len(labels) else str(peak_i)
-         print(f"    {fname:<12} peak={label:<12} {peak_v:.5f}  {bar}")
-         offset += ndim
    print()
 
 # ---------------------------------------------------------------------------
@@ -412,14 +383,16 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
 # ---------------------------------------------------------------------------
 
 def run_demo(model_path, prompt, use_random, multi_task,
-             use_oracle, sequential,
+             use_oracle, sequential, use_human=False,
              show_saliency=False, task_filter=None):
    """
-   single render loop for all interactive agent types (model, oracle, random).
+   single render loop for all interactive agent types
+   (model, oracle, random, human).
    the only difference is how `action` is computed each step.
    """
-   # load config first so n_shapes and task guard are available
-   # oracle/random paths still construct GoalEncoder the same way
+   # load config first so n_shapes and task guard are available.
+   # oracle and random modes also load config so --task and n_shapes
+   # reflect the training run rather than hardcoded defaults.
    if not use_oracle and not use_random:
       config        = load_model_config(model_path)
       goal_encoder  = config["goal_encoder"]
@@ -429,16 +402,25 @@ def run_demo(model_path, prompt, use_random, multi_task,
          print(f"[demo] warning: --task {task_filter!r} not in trained tasks "
                f"{trained_tasks} — results may be poor")
    else:
+      # try to load config for n_shapes / task list — fall back to defaults
+      # if no model has been trained yet or path doesn't exist
+      try:
+         config        = load_model_config(model_path)
+         n_shapes      = config["n_shapes"]
+         trained_tasks = config["tasks"]
+      except Exception:
+         n_shapes      = 2
+         trained_tasks = None
       from bc_train import GoalEncoder
-      goal_encoder  = GoalEncoder()
+      goal_encoder = GoalEncoder()
       goal_encoder.eval()
-      n_shapes      = 1   # oracle/random default
-      trained_tasks = None
    
    from prompt_gen import PromptGenerator
    _gen = PromptGenerator()
    pygame.init()
    pygame.key.set_repeat(400, 80)
+   if use_human:
+      pygame.mouse.set_visible(False)
    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
    pygame.display.set_caption("dragNdrop demo")
    clock  = pygame.time.Clock()
@@ -446,17 +428,21 @@ def run_demo(model_path, prompt, use_random, multi_task,
 
    # --- load agent ---
    if use_oracle:
-      from bc_train import GoalEncoder
-      goal_encoder = GoalEncoder()
-      goal_encoder.eval()
-      model        = None
-      agent_label  = "ORACLE"
+      model       = None
+      agent_label = "ORACLE"
       print("running oracle agent")
    elif use_random:
       goal_encoder = None
       model        = None
       agent_label  = "RANDOM"
       print("running random agent")
+   elif use_human:
+      model       = None
+      agent_label = "HUMAN"
+      print("running in human control mode")
+      print("  mouse:          move cursor toward pointer")
+      print("  left click:     grip / release")
+      print("  Q / N / SPC / D work as normal")
    else:
       try:
          from stable_baselines3 import PPO
@@ -468,10 +454,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
          sys.exit(1)
       agent_label = "MODEL"
 
-   _saliency        = show_saliency and (model is not None)
+   _saliency = show_saliency and (model is not None)
    if show_saliency and model is None:
       print("[demo] --saliency requires a trained model (--model). "
-            "saliency is disabled for oracle/random agents.")
+            "saliency is disabled for oracle/random/human agents.")
 
    # sequential pool for oracle --sequential mode
    seq_pool = list(_gen.training_pool()) if (use_oracle and sequential) else None
@@ -496,7 +482,11 @@ def run_demo(model_path, prompt, use_random, multi_task,
    history      = []      # completed episode records for Shift+D
 
    print(f"\nepisode {episode} — {cur_prompt}")
-   print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
+   if use_human:
+      print("mouse to move  left-click to grip  "
+            "Q quit  N next  SPC pause  D dump  Shift+D summary\n")
+   else:
+      print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
 
    running = True
    while running:
@@ -549,7 +539,25 @@ def run_demo(model_path, prompt, use_random, multi_task,
       truncated  = ep_truncated
 
       if should_step and not skip:
-         if use_oracle:
+         if use_human:
+            # compute action from mouse position and left button state.
+            # dx/dy: unit vector from cursor toward mouse, scaled to [-1,1].
+            # dead zone prevents jitter when mouse is close to cursor.
+            # grip: left mouse button held down.
+            mx, my    = pygame.mouse.get_pos()
+            btn       = pygame.mouse.get_pressed()
+            ddx       = mx - env.cx
+            ddy       = my - env.cy
+            dist_m    = float(np.sqrt(ddx**2 + ddy**2))
+            if dist_m > 8.0:
+               dx_act = float(ddx / dist_m)
+               dy_act = float(ddy / dist_m)
+            else:
+               dx_act = 0.0
+               dy_act = 0.0
+            grip_act = 1.0 if btn[0] else -1.0
+            action   = np.array([dx_act, dy_act, grip_act], dtype=np.float32)
+         elif use_oracle:
             action = oracle.act(obs)
          elif model is not None:
             action, _ = model.predict(obs, deterministic=True)
@@ -613,6 +621,7 @@ def run_demo(model_path, prompt, use_random, multi_task,
          paused         = stay_paused
          print(f"episode {episode} — {cur_prompt}")
 
+   pygame.mouse.set_visible(True)
    pygame.quit()
    print("demo closed")
    if history:
@@ -633,6 +642,10 @@ if __name__ == "__main__":
    parser.add_argument(
       "--prompt", type=str, default=None,
       help="natural language goal prompt. if omitted, samples from trained tasks",
+   )
+   parser.add_argument(
+      "--human", action="store_true",
+      help="control the cursor yourself with mouse (left click = grip)",
    )
    parser.add_argument(
       "--random", action="store_true",
@@ -694,6 +707,7 @@ if __name__ == "__main__":
          model_path=args.model,
          prompt=args.prompt,
          use_random=args.random,
+         use_human=args.human,
          multi_task=args.multi_task,
          use_oracle=args.oracle,
          sequential=args.sequential,
