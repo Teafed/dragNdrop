@@ -43,7 +43,7 @@ from prompt_gen import PromptGenerator
 # env config
 # ---------------------------------------------------------------------------
 
-def _save_env_config(save_path: str, curriculum, timesteps: int):
+def _save_env_config(save_path: str, curriculum):
    """write env_config.json alongside the model files."""
    import json
    os.makedirs(save_path, exist_ok=True)
