@@ -96,17 +96,6 @@ REGION_INNER = {
 
 LINE_SPREAD_THRESHOLD = 120  # perpendicular speed in pixels
 
-# TODO: add "none"? see llm_goal_parser
-SUPPORTED_TASKS = [
-   "reach",
-   "touch",
-   "drag",
-   "arrange_in_sequence",
-   "arrange_in_line",
-   "arrange_in_region",
-   "arrange_in_groups",
-]
-
 # cursor crosshair dimensions
 _CURSOR_RADIUS   = 3    # circle radius (pixels)
 _CURSOR_GAP      = 4    # gap between circle edge and crosshair line start
