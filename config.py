@@ -36,13 +36,46 @@ LEFT_STREAM_DIM      = CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE + MAX_SHAPES * OBS_V
 RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM   # shapes + goal = 94
 
 # ---------------------------------------------------------------------------
-# shape types
+# shape types and colors
 # ---------------------------------------------------------------------------
 
 SHAPE_TYPES    = ["circle", "square", "triangle"]
 N_SHAPE_TYPES  = len(SHAPE_TYPES)
 SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
-COLOR_NAMES_GOAL = ["red", "green", "teal", "yellow", "purple"]
+SHAPE_COLORS   = ["red", "green", "teal", "yellow", "purple"]
+N_SHAPE_COLORS = len(SHAPE_COLORS)
+SHAPE_COLOR_IDX = {s: i for i, s in enumerate(SHAPE_COLORS)}
+
+# ---------------------------------------------------------------------------
+# goal parsing
+# ---------------------------------------------------------------------------
+
+GOAL_SCHEMA = {
+   "task":         str,
+   "axis":         str,
+   "direction":    str,
+   "attribute":    str,
+   "region":       str,
+   "bounded":      bool,
+   "target_color": str,   # "none" | "any" | color name (reach/touch/drag)
+   "target_type":  str,   # "none" | "any" | shape type  (reach/touch/drag)
+}
+
+VALID_COLORS = ("red", "green", "teal", "yellow", "purple", "any", "none")
+VALID_TYPES  = ("circle", "square", "triangle", "any", "none")
+
+SUPPORTED_TASKS = [
+   # starter tasks
+   "reach",
+   "touch",
+   "drag",
+   # arrangement tasks
+   "arrange_in_sequence",
+   "arrange_in_line",
+   "arrange_in_region",
+   "arrange_in_groups",
+   "none",
+]
 
 # ---------------------------------------------------------------------------
 # policy architecture
@@ -60,7 +93,7 @@ GRIP_THRESHOLD  = 0.0   # action[2] > this -> holding = True
 GRIP_RADIUS     = 20    # pixels — cursor must be within this to attach to shape
 
 # ---------------------------------------------------------------------------
-# obs and action size helper
+# obs and action size helpers
 # ---------------------------------------------------------------------------
 
 def get_obs_size() -> int:
@@ -83,67 +116,3 @@ def get_action_size() -> int:
    cx + cy + grip = 3
    """
    return 3
-
-# ---------------------------------------------------------------------------
-# task framework
-#
-# WAVE 3 TASKS DISABLED FOR STARTER TASK DEBUGGING.
-# To re-enable: uncomment the wave 3 entries in SUPPORTED_TASKS and TASK_POOL,
-# then restore the wave 3 stages in curriculum.py.
-# ---------------------------------------------------------------------------
-
-SUPPORTED_TASKS = [
-   # starter tasks — ACTIVE
-   "reach",
-   "touch",
-   "drag",
-   # wave 3 tasks — DISABLED (comment back in when ready)
-   # "arrange_in_sequence",
-   # "arrange_in_line",
-   # "arrange_in_region",
-   # "arrange_in_groups",
-]
-
-# ---------------------------------------------------------------------------
-# task pool
-# ---------------------------------------------------------------------------
-
-TASK_POOL = [
-   # --- starter tasks (ACTIVE) ---
-   "move the cursor to the shape",
-   "move the cursor to the yellow shape",
-   "move the cursor to the triangle",
-   "click on the shape",
-   "click on the red shape",
-   "click on the square",
-   "drag the shape to the left side",
-   "drag the shape to the right side",
-   "drag the shape to the top",
-   "drag the shape to the bottom",
-
-   # --- wave 3 tasks (DISABLED — uncomment to restore) ---
-   # arrange_in_sequence
-   # "sort shapes from smallest to largest left to right",
-   # "sort shapes from largest to smallest left to right",
-   # "sort shapes from smallest to largest top to bottom",
-   # "sort shapes from largest to smallest top to bottom",
-
-   # arrange_in_line
-   # "arrange shapes in a horizontal line evenly spaced",
-   # "arrange shapes in a vertical line evenly spaced",
-   # "arrange shapes in a horizontal line sorted smallest to largest",
-   # "arrange shapes in a vertical line sorted largest to smallest",
-
-   # arrange_in_region
-   # "move all shapes to the left side",
-   # "move all shapes to the right side",
-   # "move all shapes to the top",
-   # "move all shapes to the bottom",
-
-   # arrange_in_groups
-   # "group shapes by color",
-   # "put shapes of the same color close together",
-   # "group shapes by type",
-   # "put shapes of the same type close together",
-   # "group the circles squares and triangles separately",
-]

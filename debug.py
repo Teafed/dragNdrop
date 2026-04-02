@@ -484,7 +484,7 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# test 9: oracle visual check
+# test 6: oracle visual check
 # ---------------------------------------------------------------------------
 
 def test_oracle_render():
