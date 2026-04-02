@@ -207,7 +207,7 @@ class ShapeEnv(gym.Env):
    ):
       super().__init__()
 
-      self._fixed_n_shapes = n_shapes
+      self._max_shapes     = n_shapes
       self.n_shapes        = n_shapes if n_shapes is not None else 2
       self.render_mode     = render_mode
       self.rc              = reward_config or RewardConfig()
@@ -230,9 +230,9 @@ class ShapeEnv(gym.Env):
 
       obs_size = get_obs_size()
       action_size = get_action_size()
+      # TODO: find out why the obs bounds are [-2, 2]
       self.observation_space = spaces.Box(
          low=-2.0, high=2.0, shape=(obs_size,), dtype=np.float32)
-      # how did we choose the high and low values for these?
       self.action_space = spaces.Box(
          low=-1.0, high=1.0, shape=(action_size,), dtype=np.float32)
 
@@ -260,10 +260,12 @@ class ShapeEnv(gym.Env):
    def reset(self, seed=None):
       super().reset(seed=seed)
 
-      if self._fixed_n_shapes is None:
-         self.n_shapes = int(self.np_random.integers(2, MAX_SHAPES + 1))
+      # TODO: spawn fixed number of shapes
+      # TODO: set min number instead of just 1 (specified in curriculum)
+      if self._max_shapes is None:
+         self.n_shapes = int(self.np_random.integers(1, MAX_SHAPES + 1))
       else:
-         self.n_shapes = self._fixed_n_shapes
+         self.n_shapes = int(self.np_random.integers(1, self._max_shapes + 1))
 
       self.holding     = False
       self.grabbed_idx = -1
@@ -451,7 +453,7 @@ class ShapeEnv(gym.Env):
 
    def _spawn_shapes(self) -> list:
       """
-      spawn n_shapes with randomized attributes and positions.
+      spawn from 1 to n_shapes with randomized attributes and positions.
       for starter tasks with a specific target spec, one shape is guaranteed
       to match and is placed at a random slot so agent can't exploit position.
       for drag, the target shape is spawned outside the goal region.
