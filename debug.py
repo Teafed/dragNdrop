@@ -720,7 +720,7 @@ if __name__ == "__main__":
    parser.add_argument("--n-shapes",        type=int, default=3)
    parser.add_argument("--oracle",          action="store_true",
                        help="run oracle diagnostics (tests 7-9)")
-   parser.add_argument("--oracle-episodes", type=int, default=20)
+   parser.add_argument("--oracle-episodes", type=int, default=40)
    args = parser.parse_args()
 
    ok1 = test_env_steps(n_shapes=min(args.n_shapes, 2))
