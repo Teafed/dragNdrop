@@ -716,7 +716,8 @@ class ShapeEnv(gym.Env):
 
    def _is_solved(self) -> bool:
       task = self.goal.get("task", "")
-      if task == "reach":   return self._solved_reach()
+      if task == "none":    return True
+      elif task == "reach": return self._solved_reach()
       elif task == "touch": return self._solved_touch()
       elif task == "drag":  return self._solved_drag()
       else:

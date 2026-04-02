@@ -4,45 +4,23 @@ llm_goal_parser.py
 LLM goal parsing and embedding layer.
 
 public functions:
-    parse_goal(prompt) -> dict
-    get_embedding(prompt) -> np.ndarray [EMBEDDING_DIM]
+   parse_goal(prompt) -> dict
+   get_embedding(prompt) -> np.ndarray [EMBEDDING_DIM]
 
-wave 3 task framework — four tasks from the 2x2x2 cube:
-    arrange_in_sequence  ordered along axis, perpendicular unconstrained
-    arrange_in_line      ordered or spaced along axis, perpendicular bounded
-    arrange_in_region    all shapes in a canvas subregion, unordered
-    arrange_in_groups    shapes partitioned by attribute into subregions
+starter task framework:
+   reach                move the cursor to a shape
+   touch                click on a shape
+   drag                 move a shape to a region
+
+arrangement task framework:
+   arrange_in_sequence  ordered along axis, perpendicular unconstrained
+   arrange_in_line      ordered or spaced along axis, perpendicular bounded
+   arrange_in_region    all shapes in a canvas subregion, unordered
+   arrange_in_groups    shapes partitioned by attribute into subregions
 """
 
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# schema
-# ---------------------------------------------------------------------------
-
-GOAL_SCHEMA = {
-   "task":         str,
-   "axis":         str,
-   "direction":    str,
-   "attribute":    str,
-   "region":       str,
-   "bounded":      bool,
-   "target_color": str,   # "none" | "any" | color name (reach/touch/drag)
-   "target_type":  str,   # "none" | "any" | shape type  (reach/touch/drag)
-}
-
-VALID_COLORS = ("red", "green", "teal", "yellow", "purple", "any", "none")
-VALID_TYPES  = ("circle", "square", "triangle", "any", "none")
-
-SUPPORTED_TASKS = [
-   "reach",
-   "touch",
-   "drag",
-   "arrange_in_sequence",
-   "arrange_in_line",
-   "arrange_in_region",
-   "arrange_in_groups",
-]
+from config import SUPPORTED_TASKS, GOAL_SCHEMA, VALID_TYPES, VALID_COLORS
 
 # ---------------------------------------------------------------------------
 # public API
@@ -140,7 +118,7 @@ def _stub_parse(prompt: str) -> dict:
          return _groups_goal("shape_type")
       return _groups_goal("color")
 
-   # --- arrange_in_line vs arrange_in_sequence ---
+   # --- arrange_in_line ---
    is_line = any(kw in prompt for kw in (
       "in a line", "in line",
       "in a horizontal line", "in horizontal line",
@@ -167,10 +145,29 @@ def _stub_parse(prompt: str) -> dict:
          "target_color": "none",
          "target_type":  "none",
       }
-
-   # default: arrange_in_sequence
+   # arrange_in_sequence
+   if any(kw in prompt for kw in (
+      "sort shapes", "order shapes",
+      "arrange shapes",
+      "ascending left to right", "descending left to right",
+      "ascending top to bottom", "descending top to bottom",
+   )):
+      axis      = _infer_axis(prompt)
+      direction = _infer_direction(prompt)
+      return {
+         "task":         "arrange_in_sequence",
+         "axis":         axis,
+         "direction":    direction,
+         "attribute":    attribute if attribute != "none" else "size",
+         "region":       "none",
+         "bounded":      False,
+         "target_color": "none",
+         "target_type":  "none",
+      }
+   
+   # default: "none" task
    return {
-      "task":         "arrange_in_sequence",
+      "task":         "none",
       "axis":         axis,
       "direction":    direction,
       "attribute":    attribute if attribute != "none" else "size",

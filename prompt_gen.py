@@ -35,7 +35,7 @@ import random
 from itertools import product
 from typing import Optional
 
-from config import SHAPE_TYPES, COLOR_NAMES_GOAL, SUPPORTED_TASKS
+from config import SHAPE_TYPES, SHAPE_COLORS, SUPPORTED_TASKS
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +148,10 @@ _TEMPLATES: dict[str, list[str]] = {
       "cluster shapes by color",
       "cluster shapes by type",
    ],
+   "none": [
+      "do nothing", "no task", "be yourself", "wait for next task",
+      "wait", "hang tight", "do whatever", "do anything"
+   ],
 }
 
 # tasks where target specificity applies (starter tasks only)
@@ -234,11 +238,11 @@ class PromptGenerator:
       if level == "any":
          return "any", "any"
       elif level == "color":
-         return self.rng.choice(COLOR_NAMES_GOAL), "any"
+         return self.rng.choice(SHAPE_COLORS), "any"
       elif level == "type":
          return "any", self.rng.choice(SHAPE_TYPES)
       else:   # both
-         return self.rng.choice(COLOR_NAMES_GOAL), self.rng.choice(SHAPE_TYPES)
+         return self.rng.choice(SHAPE_COLORS), self.rng.choice(SHAPE_TYPES)
 
    def _sample_target_phrase(self, color: str, shape_type: str) -> str:
       """sample a phrase for the given (color, shape_type) pair."""
@@ -294,7 +298,7 @@ class PromptGenerator:
          for _ in range(n_per_task):
             pool.append(self._make_prompt(task, "any", "any"))
          # color-only
-         for color in COLOR_NAMES_GOAL:
+         for color in SHAPE_COLORS:
             for _ in range(n_per_task):
                pool.append(self._make_prompt(task, color, "any"))
          # type-only
@@ -302,7 +306,7 @@ class PromptGenerator:
             for _ in range(n_per_task):
                pool.append(self._make_prompt(task, "any", shape_type))
          # fully specified
-         for color, shape_type in product(COLOR_NAMES_GOAL, SHAPE_TYPES):
+         for color, shape_type in product(SHAPE_COLORS, SHAPE_TYPES):
             for _ in range(n_per_task):
                pool.append(self._make_prompt(task, color, shape_type))
 
@@ -354,7 +358,7 @@ class PromptGenerator:
       specs    = set()
       attempts = 0
       while len(specs) < n_needed and attempts < 100:
-         color      = self.rng.choice(COLOR_NAMES_GOAL)
+         color      = self.rng.choice(SHAPE_COLORS)
          shape_type = self.rng.choice(SHAPE_TYPES)
          specs.add((color, shape_type))
          attempts  += 1
@@ -371,7 +375,7 @@ class PromptGenerator:
       behaves differently based on goal specificity.
       """
       generic  = self._make_prompt(task, "any", "any")
-      color    = self.rng.choice(COLOR_NAMES_GOAL)
+      color    = self.rng.choice(SHAPE_COLORS)
       stype    = self.rng.choice(SHAPE_TYPES)
       specific = self._make_prompt(task, color, stype)
       return generic, specific
@@ -388,11 +392,11 @@ class PromptGenerator:
          if task in _TARGET_TASKS:
             n_any   = len(self.all_prompts(task, "any", "any"))
             n_color = sum(len(self.all_prompts(task, c, "any"))
-                          for c in COLOR_NAMES_GOAL)
+                          for c in SHAPE_COLORS)
             n_type  = sum(len(self.all_prompts(task, "any", t))
                           for t in SHAPE_TYPES)
             n_both  = sum(len(self.all_prompts(task, c, t))
-                          for c, t in product(COLOR_NAMES_GOAL, SHAPE_TYPES))
+                          for c, t in product(SHAPE_COLORS, SHAPE_TYPES))
             total   = n_any + n_color + n_type + n_both
             print(f"  {task:<22} any={n_any:3d}  color={n_color:3d}  "
                   f"type={n_type:3d}  both={n_both:3d}  total={total:4d}")
