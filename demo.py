@@ -569,10 +569,11 @@ def run_demo(model_path, prompt, use_random, multi_task,
          steps         += 1
          ep_terminated  = terminated
          ep_truncated   = truncated
-         # auto-print saliency once at step 1 (fresh scene) and every 100 steps
-         if _saliency and (steps == 1 or steps % 100 == 0):
+         # auto-print saliency once at step 1 (fresh scene) and every 50 steps
+         if _saliency and (steps == 1 or steps % 50 == 0):
             sal = compute_saliency(model, obs)
             print_saliency(sal, cur_prompt)
+            print(f"reward: {reward}")
 
       step_once = False   # always clear after this frame
       phase = oracle.phase if oracle is not None else None
