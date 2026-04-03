@@ -229,7 +229,7 @@ class ShapeEnv(gym.Env):
       self.cx          = float(WINDOW_W / 2)
       self.cy          = float(WINDOW_H / 2)
       self.grip        = False
-      self.prev_grip   = False
+      self._prev_grip  = False
       self.holding     = False  # True only when grip active AND shape grabbed
       self.grabbed_idx = -1     # index into self.shapes, -1 = nothing grabbed
 
@@ -237,7 +237,7 @@ class ShapeEnv(gym.Env):
       self.shapes           = []
       self.steps            = 0
       self.prev_score       = 0.0
-      self.target_indices = [0]  # indices of all valid target shapes
+      self.target_indices   = [0]  # indices of all valid target shapes
       self.window           = None
       self.clock            = None
       self.font             = None
@@ -276,7 +276,7 @@ class ShapeEnv(gym.Env):
       new_score  = self._compute_task_score()
       reward     = self._compute_reward(
          prev_score, new_score, cursor_action, intended_action,
-         self.goal.get("task", ""))
+         self.goal.get("task", "none"))
 
       self.prev_score = new_score
 
@@ -295,7 +295,7 @@ class ShapeEnv(gym.Env):
       if self.render_mode == "human":
          self._render_frame()
 
-      self.prev_grip = self.grip
+      self._prev_grip = self.grip
       return obs, reward, terminated, truncated, info
 
    # TODO: in demo.py, can we use this instead of having the headless function?
@@ -338,13 +338,13 @@ class ShapeEnv(gym.Env):
 
       # grip logic
       self.grip = grip_raw > GRIP_THRESHOLD
-      grip_edge = self.grip and not self.prev_grip   # True only on the frame grip activates
+      grip_edge = self.grip and not self._prev_grip   # True only on the frame grip activates
       if grip_edge:
          self.grabbed_idx = self._try_grab()
       elif not self.grip:
          self.grabbed_idx = -1
-         self.holding   = self.grip and self.grabbed_idx >= 0
-         self.prev_grip = self.grip
+         self.holding = self.grip and self.grabbed_idx >= 0
+         self._prev_grip = self.grip
       self.holding = self.grip and self.grabbed_idx >= 0
 
       # drag grabbed shape with cursor
@@ -387,7 +387,6 @@ class ShapeEnv(gym.Env):
    # reward
    # -------------------------------------------------------------------------
 
-   # TODO: use more RewardConfig items from self.rc
    def _compute_reward(
       self,
       prev_score:     float,
@@ -419,14 +418,27 @@ class ShapeEnv(gym.Env):
       arrangement tasks probably don't need grip bonuses, score delta already
       captures shape movement progress continuously.
       """
-      if not self.holding or self.grabbed_idx < 0:
-         return 0.0
-      if task not in ("touch", "drag"):
-         return 0.0
-      if self.grabbed_idx not in self.target_indices:
-         return 0.0
+      bonus = 0.0
+      
+      # reward for attempting to grip
+      if not self._prev_grip and self.grip:
+         # print("click!")
+         s    = self.shapes[self._nearest_non_grabbed()]
+         dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
+         if dist > GRIP_RADIUS and dist < GRIP_RADIUS * 4:
+            bonus += 5.0
+         elif dist > GRIP_RADIUS * 4 and dist < GRIP_RADIUS * 8:
+            bonus += 2.5
+         else: bonus += 1.5
 
-      bonus = self.rc.grip_grab
+      if not self.holding or self.grabbed_idx < 0:
+         return bonus
+      if task not in ("touch", "drag"):
+         return bonus
+      if self.grabbed_idx not in self.target_indices:
+         return bonus
+      
+      bonus += self.rc.grip_grab
 
       if task == "touch":
          s    = self.shapes[self.grabbed_idx]
@@ -449,7 +461,7 @@ class ShapeEnv(gym.Env):
       positions are resampled if the episode would start already solved.
       """
       rng       = self.np_random
-      task      = self.goal.get("task")
+      task      = self.goal.get("task", "none")
       attribute = self.goal.get("attribute", "none")
       tc        = self.goal.get("target_color", "none")
       tt        = self.goal.get("target_type",  "none")
@@ -696,7 +708,7 @@ class ShapeEnv(gym.Env):
    # -------------------------------------------------------------------------
 
    def _compute_task_score(self) -> float:
-      task = self.goal.get("task", "")
+      task = self.goal.get("task", "none")
       if task == "reach":             return self._score_reach()
       elif task == "touch":           return self._score_touch()
       elif task == "drag":            return self._score_drag()
@@ -715,7 +727,7 @@ class ShapeEnv(gym.Env):
    # -------------------------------------------------------------------------
 
    def _is_solved(self) -> bool:
-      task = self.goal.get("task", "")
+      task = self.goal.get("task", "none")
       if task == "none":    return True
       elif task == "reach": return self._solved_reach()
       elif task == "touch": return self._solved_touch()
