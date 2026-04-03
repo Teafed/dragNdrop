@@ -81,6 +81,21 @@ python debug.py --oracle               # + oracle solve rates + BC loss
 python debug.py --oracle-episodes 40
 ```
 
+**run curriculum tester:**
+```
+# train with custom params
+python curriculum_tester.py train TestCurriculum --timesteps 2000 --bc-episodes 10 --bc-epochs 2
+
+# train without oracle (skip BC entirely)
+python curriculum_tester.py train TestCurriculum --timesteps 2000 --no-oracle
+
+# run the model
+python curriculum_tester.py run TestCurriculum --episodes 5
+
+# list all curriculums
+python curriculum_tester.py list
+```
+
 **tensorboard:**
 ```bash
 tensorboard --logdir logs/tensorboard

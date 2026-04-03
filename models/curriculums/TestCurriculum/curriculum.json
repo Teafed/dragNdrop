@@ -1,0 +1,11 @@
+[
+    {
+        "name": "test stage — reach only (1 shape)",
+        "tasks": ["reach"],
+        "n_shapes_min": 1,
+        "n_shapes_max": 1,
+        "gate_task": null,
+        "gate_sr": null,
+        "step_ceiling": null
+    }
+]
