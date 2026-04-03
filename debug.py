@@ -218,7 +218,7 @@ def test_all_tasks() -> bool:
          rewards = []
          for _ in range(10):
             action = env.action_space.sample()
-            obs, reward, info = env.step(action)
+            obs, reward, _, _, info = env.step(action)
             rewards.append(reward)
 
          obs_ok  = obs.shape[0] == get_obs_size()
@@ -484,7 +484,7 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# test 9: oracle visual check
+# test 6: oracle visual check
 # ---------------------------------------------------------------------------
 
 def test_oracle_render():
@@ -720,7 +720,7 @@ if __name__ == "__main__":
    parser.add_argument("--n-shapes",        type=int, default=3)
    parser.add_argument("--oracle",          action="store_true",
                        help="run oracle diagnostics (tests 7-9)")
-   parser.add_argument("--oracle-episodes", type=int, default=20)
+   parser.add_argument("--oracle-episodes", type=int, default=40)
    args = parser.parse_args()
 
    ok1 = test_env_steps(n_shapes=min(args.n_shapes, 2))

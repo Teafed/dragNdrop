@@ -8,10 +8,6 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
 
 --- explore / commit loop ---
    explore: select which shape to move next using weighted random selection.
-            the "most wrong" shape is most likely chosen but not guaranteed.
-            if the episode score is already above IDLE_THRESHOLD, all
-            priorities are set very low and the oracle idles until the
-            episode terminates naturally.
 
    commit:  navigate cursor to the selected shape, grip it, drag it to
             the computed target, then release. returns to explore once
@@ -24,10 +20,8 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
       GRIP_OFF  grip releases (one step with grip=-1), shape stays at target
 
 --- navigate-then-drag oracle ---
-   the oracle no longer teleports shapes. all movement goes through cursor
-   physics: navigate to shape, grip, drag to target, release.
-   this produces BC demonstrations that reflect physical cursor interaction
-   rather than instantaneous selection.
+   all movement goes through cursor physics:
+   navigate to shape, grip, drag to target, release.
 
 --- high-level annotations ---
    each transition also stores:
@@ -37,11 +31,11 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
    flat BC training only uses (obs, action).
 
 --- starter tasks ---
-   reach:  navigate cursor to target shape (env.target_idx)
-   touch:  navigate to env.target_idx then activate grip
-   drag:   navigate to env.target_idx, grip, drag to target region
+   reach:  navigate cursor to the closest shape in env.target_indices
+   touch:  navigate to closest valid target then activate grip
+   drag:   navigate to closest valid target, grip, drag to target region
 
---- wave 3 tasks ---
+--- arrangement tasks ---
    arrange_in_sequence / arrange_in_line:
       priority  = |current_rank - ideal_rank|
       target    = ideal slot position + jitter
@@ -70,13 +64,9 @@ from config import (
 # ---------------------------------------------------------------------------
 
 EXPLORE_TEMP       = 0.5    # softmax temperature for shape selection
-COMMIT_JITTER      = 30.0   # pixels — random offset from ideal target
-REGION_EXTRA_DEPTH = 60.0   # pixels — random extra depth into region
+COMMIT_JITTER      = 30.0   # pixels: random offset from ideal target
+REGION_EXTRA_DEPTH = 60.0   # pixels: random extra depth into region
 NOISE_STD          = 0.06   # action noise std (0 for clean oracle demo)
-
-# oracle idles only when the episode is genuinely solved — same threshold
-# as the environment's own solve check so there's no gap to exploit
-IDLE_THRESHOLD = SCORE_SOLVE_THRESHOLD
 
 # cursor approach: how close before gripping (slightly larger than GRIP_RADIUS
 # so the oracle reliably lands inside the grip zone)
@@ -116,7 +106,7 @@ class OraclePolicy:
       self.committed_shape  = None
       self.committed_target = None
       self.phase            = _DONE   # forces _explore on first act() call
-      self._group_zones     = {}      # cleared each episode — new zone assignment
+      self._group_zones     = {}      # cleared each episode - new zone assignment
 
    def act(self, obs=None) -> np.ndarray:
       """
@@ -124,10 +114,9 @@ class OraclePolicy:
       obs is accepted but unused — oracle reads env state directly.
       """
       env  = self.env
-      task = env.goal.get("task", "arrange_in_sequence")
+      task = env.goal.get("task", "")
 
-      # --- idle if already good enough ---
-      if env._compute_task_score() >= IDLE_THRESHOLD:
+      if env._is_solved():
          return np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
       # --- explore: pick next shape if needed ---
@@ -233,8 +222,14 @@ class OraclePolicy:
       attribute = env.goal.get("attribute", "none")
 
       if task in ("reach", "touch", "drag"):
-         # use the env's pre-computed target index (respects target_color/type)
-         idx    = env.target_idx
+         # pick the closest valid target so oracle navigates efficiently.
+         # with multiple valid targets (e.g. "touch any red shape"), this
+         # avoids committing to a far shape when a closer one also qualifies.
+         idx = min(
+            env.target_indices,
+            key=lambda i: float(np.sqrt(
+               (env.cx - env.shapes[i].x)**2 + (env.cy - env.shapes[i].y)**2))
+         )
          target = self._compute_target(idx, task)
          return idx, target
 
@@ -633,11 +628,12 @@ def _sample_task(rng, weights: dict):
    return tasks[int(rng.choice(len(tasks), p=probs))]
 
 def collect_demonstrations(
-   n_episodes:   int   = 500,
-   noise_std:    float = NOISE_STD,
-   verbose:      bool  = True,
-   goal_encoder        = None,
-   task_weights:  dict  = None,
+   n_episodes:     int   = 500,
+   noise_std:      float = NOISE_STD,
+   verbose:        bool  = True,
+   goal_encoder          = None,
+   task_weights:   dict  = None,
+   n_shapes_range: tuple = None,   # (min, max) — defaults to (2, MAX_SHAPES)
 ) -> dict:
    """
    run the oracle across tasks and collect (obs, action) pairs plus
@@ -683,7 +679,11 @@ def collect_demonstrations(
    for ep in range(1, n_episodes + 1):
       prompt = _gen.sample(task=_sample_task(rng, task_weights))
       goal   = parse_goal(prompt)
-      n_shp  = int(rng.integers(2, MAX_SHAPES + 1))
+      if n_shapes_range is not None:
+         lo, hi = n_shapes_range
+         n_shp = int(rng.integers(lo, hi + 1))
+      else:
+         n_shp = int(rng.integers(2, MAX_SHAPES + 1))
 
       raw_emb = get_embedding(prompt)
       with torch.no_grad():
