@@ -107,7 +107,6 @@ tensorboard --logdir logs/tensorboard
 
 ```
 config.py           — shared constants: canvas size, obs dims, task lists
-                      (wave 3 tasks currently commented out)
 shape_env.py        — gymnasium environment: cursor, shapes, obs/action spaces, rewards
 llm_goal_parser.py  — rule-based goal parser (task, axis, direction, attribute, region)
 oracle.py           — scripted expert policy + demo collection for BC warm-start
@@ -116,7 +115,6 @@ curriculum.py       — staged curriculum manager (starter stages only while deb
 train.py            — training entry point (oracle BC warm-start → PPO fine-tune)
 callbacks.py        — SB3 callbacks: per-task solve rates, curriculum advancement
 demo.py             — pygame demo: oracle or trained model, pause/dump controls
-demo_reach.py       — reach-only diagnostic demo with dist/score HUD and grip ring
 debug.py            — diagnostic script: env sanity, oracle solve rates, BC loss curve
 sweep.py            — lightweight hyperparameter sweep over short training trials
 ```
@@ -133,40 +131,35 @@ llm_goal_parser.parse_goal()
     |   rule-based pattern matching -> goal dict
     |
     v
-GoalEncoder (MLP)
-    |   sentence embedding (384-dim, all-MiniLM-L6-v2)
-    |   -> 64-dim goal encoding
-    |
-    v
 ShapeEnv (Gymnasium)
-    |   observation : 108-dim (cursor state + shape features + goal encoding)
+    |   observation : 428-dim (cursor state + shape features + goal embedding)
     |   action      : [dx, dy, grip]  all in [-1, 1]
     |   reward      : score delta + step penalty + completion bonus
     |
     v
 BicameralPolicy (PPO)
     |-- left encoder   : obs[0:44]   -- cursor-local stream
-    |-- right encoder  : obs[14:108] -- scene-global stream
+    |-- right encoder  : obs[14:428] -- scene-global stream
     |-- cross-attention: right queries left (global reads cursor state)
     +-- action head    : concat(left, right) -> [dx, dy, grip]
 ```
 
 ---
 
-## observation space (108-dim)
+## observation space (428-dim)
 
 ```
 [0-3]    cursor state         cx_norm, cy_norm, holding, grabbed_idx_norm
 [4-8]    grabbed shape        features of currently held shape (zeros if none)
 [9-13]   nearest free shape   features of closest non-grabbed shape
 [14-43]  all shapes           6 x 5 values, zero-padded
-[44-107] goal encoding        64-dim from GoalEncoder
+[44-427] goal embedding       384-dim from sentence-transformers
 
 per-shape features (5 values):
     x_norm, y_norm, size_norm, color_idx_norm, shape_type_norm
 
 left stream  (cursor-local):  indices  0-43   (44 values)
-right stream (scene-global):  indices 14-107  (94 values)
+right stream (scene-global):  indices 14-427  (414 values)
 overlap on [14-43] is intentional.
 ```
 
@@ -179,7 +172,7 @@ overlap on [14-43] is intentional.
 
 dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (15px)
 grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
-          <= GRIP_THRESHOLD       -> release held shape
+          <= GRIP_THRESHOLD      -> release held shape
 ```
 
 ---
@@ -216,7 +209,7 @@ solve reliably.
 | 2     | drag                      | 1        | 40%  | 60k          |
 | 3     | reach + touch + drag      | 1        | —    | remaining    |
 
-### disabled stages (wave 3)
+### disabled stages (arrangement)
 
 | stage | tasks active                  | n_shapes | gate | step ceiling |
 |-------|-------------------------------|----------|------|--------------|

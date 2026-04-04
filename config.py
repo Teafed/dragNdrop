@@ -8,7 +8,6 @@
 
 EMBEDDING_MODEL   = "all-MiniLM-L6-v2"
 EMBEDDING_DIM     = 384
-GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
 
 # ---------------------------------------------------------------------------
 # observation space
@@ -17,15 +16,15 @@ GOAL_ENCODING_DIM = 64   # GoalEncoder MLP output: 384 -> 128 -> 64
 MAX_SHAPES           = 6    # maximum shapes any episode can have
 OBS_VALUES_PER_SHAPE = 5    # per-shape features: x, y, size, color, shape_type
 
-# obs vector layout (108-dim total):
+# obs vector layout (428-dim total):
 #   [0-3]    cursor state: cx_norm, cy_norm, holding, grabbed_idx_norm
 #   [4-8]    grabbed shape features (zeros if nothing grabbed)
 #   [9-13]   nearest non-grabbed shape features (zeros if no shapes)
 #   [14-43]  all shapes zero-padded (MAX_SHAPES * OBS_VALUES_PER_SHAPE)
-#   [44-107] goal encoding (GOAL_ENCODING_DIM)
+#   [44-427] goal embedding (EMBEDDING_DIM)
 #
 # left stream  (cursor-local):  indices  0-43  (44 values)
-# right stream (scene-global):  indices 14-107 (94 values)
+# right stream (scene-global):  indices 14-427 (413 values)
 # overlap on [14-43] is intentional — both streams see all shape positions.
 
 CURSOR_STATE_SIZE    = 4    # cx_norm, cy_norm, holding, grabbed_idx_norm
@@ -33,7 +32,16 @@ FOCAL_SHAPE_SIZE     = OBS_VALUES_PER_SHAPE * 2   # grabbed + nearest (5 + 5)
 
 LEFT_STREAM_DIM      = CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE + MAX_SHAPES * OBS_VALUES_PER_SHAPE
 # = 4 + 10 + 30 = 44
-RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + GOAL_ENCODING_DIM   # shapes + goal = 94
+RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + EMBEDDING_DIM   # shapes + goal = 30 + 384 = 414
+
+# obs region labels for the 428-dim vector; must match shape_env._get_obs()
+OBS_REGIONS = [
+   ("cursor_state",   slice(0,   4),  "cx cy holding grabbed_idx"),
+   ("grabbed_shape",  slice(4,   9),  "grabbed shape features"),
+   ("nearest_shape",  slice(9,   14), "nearest shape features"),
+   ("all_shapes",     slice(14,  44), "all 6 shapes zero-padded"),
+   ("goal_embedding", slice(44, 428), "384-dim llm goal projection"),
+]
 
 # ---------------------------------------------------------------------------
 # shape types and colors
@@ -98,18 +106,18 @@ GRIP_RADIUS     = 20    # pixels — cursor must be within this to attach to sha
 
 def get_obs_size() -> int:
    """
-   total flattened observation vector size: 108.
+   total flattened observation vector size: 384.
 
       CURSOR_STATE_SIZE                          4
     + FOCAL_SHAPE_SIZE  (grabbed + nearest)     10
     + MAX_SHAPES * OBS_VALUES_PER_SHAPE         30
-    + GOAL_ENCODING_DIM                         64
+    + EMBEDDING_DIM                            384
                                                ---
-                                               108
+                                               428
    """
    return (CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE
            + MAX_SHAPES * OBS_VALUES_PER_SHAPE
-           + GOAL_ENCODING_DIM)
+           + EMBEDDING_DIM)
 
 def get_action_size() -> int:
    """

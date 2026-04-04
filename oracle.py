@@ -631,19 +631,12 @@ def collect_demonstrations(
    n_episodes:     int   = 500,
    noise_std:      float = NOISE_STD,
    verbose:        bool  = True,
-   goal_encoder          = None,
    task_weights:   dict  = None,
    n_shapes_range: tuple = None,   # (min, max) — defaults to (2, MAX_SHAPES)
 ) -> dict:
    """
    run the oracle across tasks and collect (obs, action) pairs plus
    high-level annotations for future HBC training.
-
-   goal_encoder: a GoalEncoder instance to use for encoding prompts into
-   the obs goal slice. if None, a fresh GoalEncoder() is constructed —
-   but since GoalEncoder now uses a fixed seed, both paths produce
-   identical encodings. passing the instance from train.py is preferred
-   for clarity.
 
    dataset keys:
       "observations":  np.ndarray (N, obs_dim)
@@ -654,14 +647,9 @@ def collect_demonstrations(
       "hl_target_y":   np.ndarray (N,)     high-level: target y in pixels
    """
    from llm_goal_parser import parse_goal, get_embedding
-   import torch
-   from bc_train import GoalEncoder
    from prompt_gen import PromptGenerator
    _gen = PromptGenerator()
 
-   if goal_encoder is None:
-      goal_encoder = GoalEncoder()
-   goal_encoder.eval()
    rng = np.random.default_rng()
 
    all_obs         = []
@@ -685,13 +673,7 @@ def collect_demonstrations(
       else:
          n_shp = int(rng.integers(2, MAX_SHAPES + 1))
 
-      raw_emb = get_embedding(prompt)
-      with torch.no_grad():
-         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-         encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
       env    = ShapeEnv(n_shapes=n_shp, goal=goal)
-      env.set_goal_encoding(encoding)
       oracle = OraclePolicy(env, noise_std=noise_std, rng=rng)
       obs, _ = env.reset()
       oracle.reset()
