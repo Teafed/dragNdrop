@@ -85,7 +85,7 @@ COLORS = {
 COLOR_NAMES = list(COLORS.keys())
 BG_COLOR    = (30, 30, 30)
 
-# region boundaries: parts of canvas, shared with oracle
+# parts of canvas, shared with oracle
 # TODO: add center?
 REGION_INNER = {
    "left":   WINDOW_W * 0.35,
