@@ -37,19 +37,17 @@ class ShapeTaskCallback(BaseCallback):
 
    args:
       curriculum:      CurriculumManager instance, or None for no curriculum.
-      goal_encoder:    GoalEncoder used to compute goal embeddings.
       eval_freq:       how often (in training timesteps) to run eval.
       n_eval_episodes: number of episodes to average over.
       verbose:         0 = silent, 1 = print metrics each eval.
    """
 
-   def __init__(self, curriculum, goal_encoder,
+   def __init__(self, curriculum,
                 eval_freq: int = 5000,
                 n_eval_episodes: int = 10,
                 verbose: int = 1):
       super().__init__(verbose)
       self.curriculum      = curriculum
-      self.goal_encoder    = goal_encoder
       self.eval_freq       = eval_freq
       self.n_eval_episodes = n_eval_episodes
       self._last_eval_step = 0
@@ -58,7 +56,6 @@ class ShapeTaskCallback(BaseCallback):
 
    def _make_eval_env(self):
       """build a fresh Monitor-wrapped ShapeEnv for the current stage."""
-      import torch
       from llm_goal_parser import parse_goal, get_embedding
 
       if self.curriculum is not None:
@@ -70,12 +67,8 @@ class ShapeTaskCallback(BaseCallback):
 
       goal    = parse_goal(prompt)
       raw_emb = get_embedding(prompt)
-      with torch.no_grad():
-         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-         encoding = self.goal_encoder(emb_t).squeeze(0).numpy()
 
-      env = ShapeEnv(n_shapes=n_shp, goal=goal)
-      env.set_goal_encoding(encoding)
+      env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
       return Monitor(env)
 
    def _on_step(self) -> bool:
@@ -144,18 +137,16 @@ class CurriculumCallback(BaseCallback):
 
    args:
       curriculum:      CurriculumManager instance (from curriculum.py).
-      goal_encoder:    trained GoalEncoder (for computing goal embeddings).
       eval_freq:       how often (in timesteps) to run per-task eval.
       n_eval_episodes: episodes per task per eval.
       verbose:         0 = silent, 1 = print per-task results each eval.
    """
 
-   def __init__(self, curriculum, goal_encoder,
+   def __init__(self, curriculum,
                 eval_freq: int = 10_000, n_eval_episodes: int = 20,
                 verbose: int = 1, save_path: str = None):
       super().__init__(verbose)
       self.curriculum      = curriculum
-      self.goal_encoder    = goal_encoder
       self.eval_freq       = eval_freq
       self.n_eval_episodes = n_eval_episodes
       self._save_path        = save_path  # if set, saves checkpoint on stage advance
@@ -226,15 +217,11 @@ class CurriculumCallback(BaseCallback):
          for _ in range(self.n_eval_episodes):
             prompt = sample_prompt(task)
             goal    = parse_goal(prompt)
-            raw_emb = get_embedding(prompt)
-            with torch.no_grad():
-               emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-               encoding = self.goal_encoder(emb_t).squeeze(0).numpy()
+            raw_emb  = get_embedding(prompt)
 
             lo, hi  = self.curriculum.n_shapes_range
             n_shp   = random.randint(lo, hi)
-            env     = Monitor(ShapeEnv(n_shapes=n_shp, goal=goal))
-            env.env.set_goal_encoding(encoding)
+            env     = Monitor(ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb))
 
             obs, _     = env.reset()
             done       = False

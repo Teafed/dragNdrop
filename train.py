@@ -62,7 +62,7 @@ def _save_env_config(save_path: str, curriculum):
 # goal-conditioned env factory
 # ---------------------------------------------------------------------------
 
-def make_goal_conditioned_env(goal_encoder, curriculum=None, render_mode=None):
+def make_goal_conditioned_env(curriculum=None, render_mode=None):
    """
    returns a factory function for Monitor-wrapped ShapeEnvs.
    if curriculum is provided, samples task and n_shapes from the current
@@ -78,14 +78,9 @@ def make_goal_conditioned_env(goal_encoder, curriculum=None, render_mode=None):
          n_shp  = None   # ShapeEnv samples randomly up to MAX_SHAPES
 
       goal    = parse_goal(prompt)
-      raw_emb = get_embedding(prompt)
+      raw_emb  = get_embedding(prompt)
 
-      with torch.no_grad():
-         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-         encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
-      env = ShapeEnv(n_shapes=n_shp, goal=goal)
-      env.set_goal_encoding(encoding)
+      env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
       return Monitor(env)
 
    return _init
@@ -95,7 +90,7 @@ def make_goal_conditioned_env(goal_encoder, curriculum=None, render_mode=None):
 # callbacks
 # ---------------------------------------------------------------------------
 
-def build_callbacks(goal_encoder, save_path: str, n_envs: int,
+def build_callbacks(save_path: str, n_envs: int,
                     curriculum=None) -> CallbackList:
    """
    build the callback stack.
@@ -121,11 +116,7 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
          n_shp  = None
       goal    = parse_goal(prompt)
       raw_emb = get_embedding(prompt)
-      with torch.no_grad():
-         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-         encoding = goal_encoder(emb_t).squeeze(0).numpy()
-      env = ShapeEnv(n_shapes=n_shp, goal=goal)
-      env.set_goal_encoding(encoding)
+      env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
       return Monitor(env)
 
    eval_callback = EvalCallback(
@@ -137,12 +128,8 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
       verbose=1,
    )
 
-   # FIX: pass curriculum + goal_encoder so ShapeTaskCallback can re-sample
-   # a fresh env from the current stage at every eval, rather than being
-   # frozen on the stage-0 env that was constructed at callback build time.
    task_callback = ShapeTaskCallback(
       curriculum=curriculum,
-      goal_encoder=goal_encoder,
       eval_freq=5000,
       n_eval_episodes=10,
       verbose=1,
@@ -154,7 +141,6 @@ def build_callbacks(goal_encoder, save_path: str, n_envs: int,
    if curriculum is not None:
       curriculum_callback = CurriculumCallback(
          curriculum=curriculum,
-         goal_encoder=goal_encoder,
          eval_freq=5_000,    # was 10k — check more often so gate fires promptly
          n_eval_episodes=30, # was 20 — more episodes = less noisy gate measurement
          verbose=1,
@@ -200,13 +186,8 @@ def train(
    start_stage: skip directly to this curriculum stage (useful for
    resuming or ablating individual stages).
    """
-   from bc_train import (
-      GoalEncoder, BicameralPolicy,
-      train_bc, build_ppo_from_bc,
-   )
+   from bc_train import BicameralPolicy, train_bc, build_ppo_from_bc
    from oracle import collect_demonstrations
-
-   goal_encoder = GoalEncoder()
 
    if use_curriculum:
       from curriculum import CurriculumManager
@@ -233,7 +214,6 @@ def train(
 
       dataset = collect_demonstrations(
          n_episodes=bc_episodes,
-         goal_encoder=goal_encoder,
          verbose=True,
          task_weights=task_weights,
          n_shapes_range=n_shapes_range,
@@ -258,7 +238,7 @@ def train(
          f"batch_size={batch_size}  vec={vec_cls.__name__}")
 
    vec_env = make_vec_env(
-      make_goal_conditioned_env(goal_encoder, curriculum),
+      make_goal_conditioned_env(curriculum),
       n_envs=n_envs,
       vec_env_cls=vec_cls,
    )
@@ -289,11 +269,7 @@ def train(
          tensorboard_log="./logs/tensorboard/",
       )
 
-   # goal encoder is fixed (random projection, not trained) — set eval mode
-   # once here regardless of which branch was taken above.
-   goal_encoder.eval()
-
-   callbacks = build_callbacks(goal_encoder, save_path, n_envs, curriculum)
+   callbacks = build_callbacks(save_path, n_envs, curriculum)
 
    print(f"\n--- training PPO for {timesteps:,} timesteps ---\n")
    model.learn(total_timesteps=timesteps, callback=callbacks)
@@ -304,7 +280,7 @@ def train(
 
    print(f"\n--- done. model saved to {final_path} ---")
    
-   return model, goal_encoder
+   return model
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +297,7 @@ if __name__ == "__main__":
    )
    parser.add_argument(
       "--save", type=str, default="./models/shape_agent",
-      help="directory to save model checkpoints and goal encoder",
+      help="directory to save models and env convfig",
    )
    parser.add_argument(
       "--no-oracle", action="store_true",

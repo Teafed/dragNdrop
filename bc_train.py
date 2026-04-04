@@ -12,7 +12,7 @@ behavior cloning trainer for the shape manipulation agent.
       purpose: "what is the cursor doing right now, and what is it near?"
 
    right stream (scene-global, relational):
-      input:  obs[14:108] — all shapes + goal encoding
+      input:  obs[14:428] — all shapes + goal embedding
       purpose: "where is everything and what does the goal say?"
 
    overlap on obs[14:43] (all shapes) is intentional — both streams see
@@ -62,54 +62,12 @@ from stable_baselines3.common.monitor import Monitor
 
 from shape_env import ShapeEnv
 from config import (
-   EMBEDDING_DIM, GOAL_ENCODING_DIM, POLICY_HIDDEN_SIZE,
-   LEFT_STREAM_DIM, RIGHT_STREAM_DIM,
+   POLICY_HIDDEN_SIZE, LEFT_STREAM_DIM, RIGHT_STREAM_DIM,
 )
 
 # obs slice indices — must match shape_env._get_obs() layout
 _LEFT_SLICE  = slice(0,  44)    # cursor state + focal shapes + all shapes
-_RIGHT_SLICE = slice(14, 108)   # all shapes + goal encoding
-
-
-# ---------------------------------------------------------------------------
-# goal encoder MLP
-# ---------------------------------------------------------------------------
-
-# fixed seed for GoalEncoder weight init. this ensures the same prompt always
-# produces the same 64-dim encoding across demo collection, BC training, and PPO
-_GOAL_ENCODER_SEED = 42
-
-
-class GoalEncoder(nn.Module):
-   """
-   projects raw EMBEDDING_DIM sentence embeddings down to GOAL_ENCODING_DIM.
-   sits between get_embedding() and the policy input.
-
-   weights are fixed at construction using _GOAL_ENCODER_SEED — the encoder
-   is never trained. this guarantees the same prompt always maps to the same
-   64-dim vector across all runs, processes, and call sites.
-   """
-
-   def __init__(self):
-      super().__init__()
-      self.net = nn.Sequential(
-         nn.Linear(EMBEDDING_DIM, 128),
-         nn.ReLU(),
-         nn.Linear(128, GOAL_ENCODING_DIM),
-         nn.Tanh(),
-      )
-      # apply fixed seed init immediately after construction.
-      # fork_rng() ensures this doesn't disturb the global RNG state.
-      with torch.random.fork_rng():
-         torch.manual_seed(_GOAL_ENCODER_SEED)
-         for layer in self.net:
-            if isinstance(layer, nn.Linear):
-               nn.init.xavier_uniform_(layer.weight)
-               nn.init.zeros_(layer.bias)
-
-   def forward(self, x: torch.Tensor) -> torch.Tensor:
-      return self.net(x)
-
+_RIGHT_SLICE = slice(14, 428)   # all shapes + goal embedding
 
 # ---------------------------------------------------------------------------
 # bicameral policy network
@@ -120,7 +78,7 @@ class BicameralNetwork(nn.Module):
    two-stream policy network with cross-attention.
 
    left stream:   obs[0:44]   -> hidden_size features  (cursor-local)
-   right stream:  obs[14:108] -> hidden_size features  (scene-global)
+   right stream:  obs[14:428] -> hidden_size features  (scene-global)
    cross-attn:    right queries left (global reads local cursor state)
    action head:   (left + right) -> action_dim
 
@@ -170,13 +128,13 @@ class BicameralNetwork(nn.Module):
 
    def forward(self, obs: torch.Tensor) -> torch.Tensor:
       """
-      obs: (batch, 108)
+      obs: (batch, 428)
       returns: (batch, 3) — [dx, dy] in [-1, 1], grip as raw logit.
       during BC: grip column fed to BCE loss directly.
       at runtime (PPO / inference): threshold grip logit at 0.0.
       """
       left_in  = obs[:, _LEFT_SLICE]    # (batch, 44)
-      right_in = obs[:, _RIGHT_SLICE]   # (batch, 94)
+      right_in = obs[:, _RIGHT_SLICE]   # (batch, 414)
 
       left_feat  = self.left_encoder(left_in)    # (batch, hidden)
       right_feat = self.right_encoder(right_in)  # (batch, hidden)
@@ -290,7 +248,7 @@ def train_bc(
    verbose:    bool  = True,
 ) -> BicameralNetwork:
    """
-   train a BicameralNetwork and GoalEncoder on (obs, action) pairs.
+   train a BicameralNetwork on (obs, action) pairs.
 
    loss:
       move loss:  MSE on action[:, 0:2]  (dx, dy) — continuous movement
@@ -304,7 +262,6 @@ def train_bc(
 
    returns:
       BicameralNetwork — on cpu, eval mode.
-      the GoalEncoder is owned by the caller; train_bc does not touch it.
    """
    obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
    act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
@@ -398,7 +355,6 @@ def train_bc(
       torch.save(network.state_dict(), weights_path)
       if verbose:
          print(f"\n  bicameral weights saved to  {weights_path}")
-         print(f"  goal encoder: fixed seed {_GOAL_ENCODER_SEED}, no checkpoint needed")
 
    return network.cpu()
 
@@ -426,9 +382,7 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
                  the start — grip timing is shaped by reward, not BC init.
    """
    if goal is None:
-      # use a neutral default that is valid for all tasks — the real goal
-      # encoding is always set via set_goal_encoding() in the env factory,
-      # so this dict is only used when vec_env is None (rare / debug path).
+      # this dict is only used when vec_env is None (rare / debug path).
       goal = {
          "task":         "none",
          "axis":         "none",

@@ -60,13 +60,12 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    run one training trial with the given hyperparams.
    returns a dict of metrics from the end of training.
    """
-   from bc_train import GoalEncoder, train_bc, build_ppo_from_bc
+   from bc_train import train_bc, build_ppo_from_bc
    from oracle import collect_demonstrations
 
    t_start = time.time()
 
    # --- bc phase ---
-   goal_encoder = GoalEncoder()
    dataset      = collect_demonstrations(
       n_episodes=bc_episodes,
       verbose=verbose,
@@ -78,23 +77,17 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
       device="cpu",
       verbose=verbose,
    )
-   goal_encoder.eval()
 
    # --- ppo phase ---
    curriculum = CurriculumManager(verbose=False, start_stage=0)
 
    def make_env():
       from llm_goal_parser import parse_goal, get_embedding
-      import torch
       prompt   = curriculum.sample_prompt()
       n_shp    = curriculum.sample_n_shapes()
       goal     = parse_goal(prompt)
       raw_emb  = get_embedding(prompt)
-      with torch.no_grad():
-         emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-         encoding = goal_encoder(emb_t).squeeze(0).numpy()
-      env = ShapeEnv(n_shapes=n_shp, goal=goal)
-      env.set_goal_encoding(encoding)
+      env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
       return env
 
    vec_env = make_vec_env(make_env, n_envs=N_ENVS, seed=seed)
@@ -109,7 +102,7 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    model.learn(total_timesteps=timesteps, progress_bar=False)
 
    # --- eval phase: per-task solve rates on starter tasks ---
-   metrics   = _eval_solve_rates(model, goal_encoder, curriculum,
+   metrics   = _eval_solve_rates(model, curriculum,
                                  tasks=["reach", "touch", "drag"],
                                  n_episodes=20)
    elapsed   = time.time() - t_start
@@ -126,10 +119,9 @@ def run_trial(ent_coef: float, lr_ppo: float, bc_episodes: int,
    }
 
 
-def _eval_solve_rates(model, goal_encoder, tasks: list,
+def _eval_solve_rates(model, tasks: list,
                       n_episodes: int) -> dict:
    """eval solve rate for each task; returns {task_sr_reach: 0.6, ...}."""
-   import torch
    from llm_goal_parser import parse_goal, get_embedding
    from prompt_gen import PromptGenerator
    from stable_baselines3.common.monitor import Monitor
@@ -140,13 +132,9 @@ def _eval_solve_rates(model, goal_encoder, tasks: list,
       for _ in range(n_episodes):
          prompt  = _gen.sample()
          goal    = parse_goal(prompt)
-         raw_emb = get_embedding(prompt)
-         with torch.no_grad():
-            emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-            encoding = goal_encoder(emb_t).squeeze(0).numpy()
+         raw_emb  = get_embedding(prompt)
          n_shp = 1 if task in ("reach", "touch", "drag") else 3
-         env   = Monitor(ShapeEnv(n_shapes=n_shp, goal=goal))
-         env.env.set_goal_encoding(encoding)
+         env   = Monitor(ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb))
          obs, _     = env.reset()
          done       = False
          terminated = False

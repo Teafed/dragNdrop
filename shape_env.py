@@ -10,15 +10,15 @@ gymnasium environment for 2D shape manipulation via a cursor.
             GRIP_RADIUS of a shape to actually grab it.
             holding is True only when grip is active AND a shape is grabbed.
 
---- observation space (108-dim) ---
+--- observation space (428-dim) ---
    [0-3]    cursor state: cx_norm, cy_norm, holding, grabbed_idx_norm
    [4-8]    grabbed shape features (zeros if nothing grabbed)
    [9-13]   nearest non-grabbed shape features (zeros if no shapes)
    [14-43]  all shapes zero-padded (MAX_SHAPES * OBS_VALUES_PER_SHAPE)
-   [44-107] goal encoding (GOAL_ENCODING_DIM)
+   [44-427] goal embedding (EMBEDDING_DIM)
 
    left stream  (cursor-local):  indices  0-43  (44 values)
-   right stream (scene-global):  indices 14-107 (94 values)
+   right stream (scene-global):  indices 14-427 (414 values)
 
 --- tasks ---
    starter:
@@ -54,9 +54,9 @@ import pygame
 from dataclasses import dataclass
 
 from config import (
-   MAX_SHAPES, OBS_VALUES_PER_SHAPE, GOAL_ENCODING_DIM, get_obs_size,
-   get_action_size, SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX,
-   CURSOR_SPEED, GRIP_THRESHOLD, GRIP_RADIUS,
+   MAX_SHAPES, OBS_VALUES_PER_SHAPE, get_obs_size, get_action_size,
+   SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX, CURSOR_SPEED,
+   GRIP_THRESHOLD, GRIP_RADIUS, EMBEDDING_DIM
 )
 
 # ---------------------------------------------------------------------------
@@ -211,10 +211,10 @@ class ShapeEnv(gym.Env):
          "bounded":   False,
       }
 
-      self._goal_encoding = (
-         goal_embedding[:GOAL_ENCODING_DIM].astype(np.float32)
+      self._goal_embedding = (
+         goal_embedding[:EMBEDDING_DIM].astype(np.float32)
          if goal_embedding is not None
-         else np.zeros(GOAL_ENCODING_DIM, dtype=np.float32)
+         else np.zeros(EMBEDDING_DIM, dtype=np.float32)
       )
 
       obs_size = get_obs_size()
@@ -655,7 +655,7 @@ class ShapeEnv(gym.Env):
       return self.target_indices
 
    # -------------------------------------------------------------------------
-   # obs and goal encoding
+   # obs and goal embedding
    # -------------------------------------------------------------------------
 
    def _get_obs(self) -> np.ndarray:
@@ -689,19 +689,14 @@ class ShapeEnv(gym.Env):
       padding    = np.zeros(n_padding * OBS_VALUES_PER_SHAPE, dtype=np.float32)
       all_shapes = np.concatenate([active_obs, padding])
 
-      # [44-107] goal encoding
+      # [44-427] goal embedding
       return np.concatenate([
          cursor_state,
          grabbed_feats,
          nearest_feats,
          all_shapes,
-         self._goal_encoding,
+         self._goal_embedding,
       ]).astype(np.float32)
-
-   def set_goal_encoding(self, encoding: np.ndarray):
-      assert encoding.shape == (GOAL_ENCODING_DIM,), (
-         f"expected ({GOAL_ENCODING_DIM},), got {encoding.shape}")
-      self._goal_encoding = encoding.astype(np.float32)
 
    # -------------------------------------------------------------------------
    # score dispatch

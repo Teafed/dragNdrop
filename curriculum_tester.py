@@ -25,7 +25,7 @@ usage:
 
    # --- train ---
    tester = CurriculumTester()
-   model, encoder = tester.test_curriculum("MyCurriculum", timesteps=300_000)
+   model = tester.test_curriculum("MyCurriculum", timesteps=300_000)
 
    # --- run / visualise ---
    tester.run_model("MyCurriculum", n_episodes=5, render=True)
@@ -276,7 +276,7 @@ class CurriculumTester:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_env_factory(goal_encoder, curriculum):
+    def _make_env_factory(curriculum):
         """returns an env factory compatible with make_vec_env."""
         _gen = PromptGenerator()
 
@@ -289,33 +289,25 @@ class CurriculumTester:
                 n_shp  = None
 
             goal    = parse_goal(prompt)
-            raw_emb = get_embedding(prompt)
-            with torch.no_grad():
-                emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-                encoding = goal_encoder(emb_t).squeeze(0).numpy()
-            env = ShapeEnv(n_shapes=n_shp, goal=goal)
-            env.set_goal_encoding(encoding)
+            raw_emb  = get_embedding(prompt)
+            env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
             return Monitor(env)
 
         return _init
 
     @staticmethod
-    def _build_callbacks(goal_encoder, save_path: str, n_envs: int,
+    def _build_callbacks(save_path: str, n_envs: int,
                          curriculum) -> CallbackList:
         """mirrors build_callbacks from train.py, scoped to save_path."""
 
         def _static_eval_env():
             _gen = PromptGenerator()
+            import numpy as np
             prompt = curriculum.sample_prompt() if curriculum else _gen.sample()
             n_shp  = curriculum.sample_n_shapes() if curriculum else None
             goal   = parse_goal(prompt)
-            raw    = get_embedding(prompt)
-            with torch.no_grad():
-                enc = goal_encoder(
-                    torch.tensor(raw, dtype=torch.float32).unsqueeze(0)
-                ).squeeze(0).numpy()
-            env = ShapeEnv(n_shapes=n_shp, goal=goal)
-            env.set_goal_encoding(enc)
+            raw_emb = get_embedding(prompt)
+            env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
             return Monitor(env)
 
         eval_cb = EvalCallback(
@@ -328,7 +320,6 @@ class CurriculumTester:
         )
         task_cb = ShapeTaskCallback(
             curriculum=curriculum,
-            goal_encoder=goal_encoder,
             eval_freq=5_000,
             n_eval_episodes=10,
             verbose=1,
@@ -338,7 +329,6 @@ class CurriculumTester:
         if curriculum is not None:
             curr_cb = CurriculumCallback(
                 curriculum=curriculum,
-                goal_encoder=goal_encoder,
                 eval_freq=5_000,
                 n_eval_episodes=30,
                 verbose=1,
@@ -395,9 +385,9 @@ class CurriculumTester:
                               (skips BC init if provided)
 
         returns:
-            (model, goal_encoder)
+            (model)
         """
-        from bc_train import GoalEncoder, BicameralPolicy, train_bc, build_ppo_from_bc
+        from bc_train import BicameralPolicy, train_bc, build_ppo_from_bc
         from oracle import collect_demonstrations
 
         save_path = _curriculum_dir(curriculum_name)
@@ -414,12 +404,11 @@ class CurriculumTester:
         curriculum = _JsonCurriculumManager(stages, verbose=True, start_stage=start_stage)
         print(f"[curriculum] initial stage: {curriculum.status()}\n")
 
-        goal_encoder = GoalEncoder()
         self._write_training_config(save_path, curriculum, timesteps)
 
         n_envs  = N_ENVS
         vec_env = make_vec_env(
-            self._make_env_factory(goal_encoder, curriculum), n_envs=n_envs
+            self._make_env_factory(curriculum), n_envs=n_envs
         )
 
         # --- model initialisation ---
@@ -431,7 +420,6 @@ class CurriculumTester:
             print(f"[train] collecting {bc_episodes} oracle demonstrations …")
             dataset = collect_demonstrations(
                 n_episodes=bc_episodes,
-                goal_encoder=goal_encoder,
                 verbose=True,
             )
             device     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -463,9 +451,8 @@ class CurriculumTester:
                 tensorboard_log=os.path.join(save_path, "tensorboard"),
             )
 
-        goal_encoder.eval()
 
-        callbacks = self._build_callbacks(goal_encoder, save_path, n_envs, curriculum)
+        callbacks = self._build_callbacks(save_path, n_envs, curriculum)
 
         print(f"\n[train] starting PPO — {timesteps:,} timesteps\n")
         model.learn(total_timesteps=timesteps, callback=callbacks)
@@ -479,7 +466,7 @@ class CurriculumTester:
         print(f"  final model → {final_path}.zip")
         print(f"  best model  → {_best_model_path(curriculum_name)}")
 
-        return model, goal_encoder
+        return model
 
     # ------------------------------------------------------------------
     # run_model — load a trained model and run episodes
@@ -507,7 +494,7 @@ class CurriculumTester:
             list of episode result dicts:
             [{"episode": i, "reward": float, "steps": int, "success": bool}, ...]
         """
-        from bc_train import GoalEncoder
+        import numpy as np
 
         # --- resolve model path ---
         best_path  = _best_model_path(curriculum_name)
@@ -536,9 +523,6 @@ class CurriculumTester:
         curriculum = _JsonCurriculumManager(stages, verbose=False,
                                             start_stage=len(stages) - 1)  # final stage
 
-        goal_encoder = GoalEncoder()
-        goal_encoder.eval()
-
         model = PPO.load(model_path)
 
         results = []
@@ -550,12 +534,7 @@ class CurriculumTester:
             goal    = parse_goal(prompt)
             raw_emb = get_embedding(prompt)
 
-            with torch.no_grad():
-                emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-                encoding = goal_encoder(emb_t).squeeze(0).numpy()
-
-            env = ShapeEnv(n_shapes=n_shp, goal=goal)
-            env.set_goal_encoding(encoding)
+            env = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
 
             obs, _  = env.reset()
             done    = False

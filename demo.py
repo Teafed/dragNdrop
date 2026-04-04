@@ -19,16 +19,14 @@ import os
 import random
 import sys
 import numpy as np
-import torch
 import pygame
 
 from shape_env import ShapeEnv, WINDOW_W, WINDOW_H, FPS, BG_COLOR
 from llm_goal_parser import parse_goal, get_embedding
-from config import GOAL_ENCODING_DIM
 
 
 # ---------------------------------------------------------------------------
-# goal encoder helpers
+# model config
 # ---------------------------------------------------------------------------
 
 def load_model_config(model_path: str) -> dict:
@@ -42,7 +40,6 @@ def load_model_config(model_path: str) -> dict:
    match what that stage was trained on.
    """
    import json
-   from bc_train import GoalEncoder
    config_path = os.path.join(os.path.dirname(model_path), "env_config.json")
    if os.path.exists(config_path):
       with open(config_path) as f:
@@ -52,18 +49,7 @@ def load_model_config(model_path: str) -> dict:
       print(f"[demo] no env_config.json found at {config_path} — "
             f"defaulting to n_shapes=1, tasks=reach/touch/drag")
       config = {"n_shapes": 1, "tasks": ["reach", "touch", "drag"]}
-   encoder = GoalEncoder()
-   encoder.eval()
-   config["goal_encoder"] = encoder
    return config
-
-def encode_goal(goal_encoder, prompt: str) -> np.ndarray:
-   """project a prompt string to a GOAL_ENCODING_DIM vector."""
-   raw_emb = get_embedding(prompt)
-   with torch.no_grad():
-      emb_t    = torch.tensor(raw_emb, dtype=torch.float32).unsqueeze(0)
-      encoding = goal_encoder(emb_t).squeeze(0).numpy()
-   return encoding
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +213,9 @@ def dump_episode_summary(history: list):
 # episode / goal helpers
 # ---------------------------------------------------------------------------
 
-def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None, 
+def make_episode(prompt, multi_task, sequential_pool=None, 
                  task_filter=None, n_shapes=None, trained_tasks=None):
-   """sample a new prompt (if multi_task or sequential), parse, encode."""
+   """sample a new prompt (if multi_task or sequential), parse, embed."""
    if sequential_pool is not None:
       p = sequential_pool.pop(0)
       sequential_pool.append(p)
@@ -241,23 +227,14 @@ def make_episode(goal_encoder, prompt, multi_task, sequential_pool=None,
    else:
       p = prompt
    g   = parse_goal(p)
-   enc = (encode_goal(goal_encoder, p) if goal_encoder is not None
-          else np.zeros(GOAL_ENCODING_DIM, dtype=np.float32))
-   return p, g, enc, n_shapes
+   e = get_embedding(p)
+
+   return p, g, e, n_shapes
 
 
 # ---------------------------------------------------------------------------
 # saliency analysis
 # ---------------------------------------------------------------------------
-
-# obs region labels for the 108-dim vector — must match shape_env._get_obs()
-_OBS_REGIONS = [
-   ("cursor_state",  slice(0,   4),  "cx cy holding grabbed_idx"),
-   ("grabbed_shape", slice(4,   9),  "grabbed shape features"),
-   ("nearest_shape", slice(9,   14), "nearest shape features"),
-   ("all_shapes",    slice(14,  44), "all 6 shapes zero-padded"),
-   ("goal_encoding", slice(44, 108), "64-dim llm goal projection"),
-]
 
 
 def compute_saliency(model, obs_np: np.ndarray) -> dict:
@@ -267,10 +244,11 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
 
    this shows which parts of the observation the policy is actually
    sensitive to — high gradient = policy is "looking at" that region.
-   near-zero gradient on goal_struct means the structured encoding
-   is being ignored despite being in the obs.
+   near-zero gradient on goal_struct means the LLM embedding is
+   being ignored despite being in the obs.
    """
    import torch
+   from config import OBS_REGIONS
    obs_t = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
    obs_t.requires_grad_(True)
 
@@ -284,7 +262,7 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
    grad = obs_t.grad.squeeze(0).abs().detach().numpy()
 
    result = {}
-   for name, slc, desc in _OBS_REGIONS:
+   for name, slc, desc in OBS_REGIONS:
       result[name] = {
          "mean_grad": float(grad[slc].mean()),
          "max_grad":  float(grad[slc].max()),
@@ -296,8 +274,7 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
 def print_saliency(saliency: dict, prompt: str, detail: bool = False):
    """
    print saliency table with a bar chart normalised to the max region.
-   detail is unused for now — reserved for when goal encoding is split
-   into structured + semantic halves.
+   detail is unused for now.
    """
    max_grad = max(v["mean_grad"] for v in saliency.values()) + 1e-8
    print(f"\n  saliency — {prompt}")
@@ -324,7 +301,6 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
       python demo.py --model models/shape_agent/best_model --headless --episodes 200
    """
    config       = load_model_config(model_path)
-   goal_encoder = config["goal_encoder"]
    n_shapes     = config["n_shapes"]
    trained_tasks = config["tasks"]
 
@@ -340,12 +316,11 @@ def run_headless(model_path: str, prompt: str, multi_task: bool,
 
    history = []
    for ep in range(1, n_episodes + 1):
-      p, g, enc, n_shp = make_episode(goal_encoder, prompt, multi_task,
-                                      task_filter=task_filter,
-                                      n_shapes=n_shapes,
-                                      trained_tasks=trained_tasks)
-      env    = ShapeEnv(goal=g, n_shapes=n_shp, render_mode=None)
-      env.set_goal_encoding(enc)
+      p, g, e, n_shp = make_episode(prompt, multi_task,
+                                    task_filter=task_filter,
+                                    n_shapes=n_shapes,
+                                    trained_tasks=trained_tasks)
+      env    = ShapeEnv(goal=g, n_shapes=n_shp, render_mode=None, goal_embedding=e)
       obs, _    = env.reset()
 
       total_reward = 0.0
@@ -395,7 +370,6 @@ def run_demo(model_path, prompt, use_random, multi_task,
    # reflect the training run rather than hardcoded defaults.
    if not use_oracle and not use_random:
       config        = load_model_config(model_path)
-      goal_encoder  = config["goal_encoder"]
       n_shapes      = config["n_shapes"]
       trained_tasks = config["tasks"]
       if task_filter is not None and task_filter not in trained_tasks:
@@ -411,9 +385,6 @@ def run_demo(model_path, prompt, use_random, multi_task,
       except Exception:
          n_shapes      = 2
          trained_tasks = None
-      from bc_train import GoalEncoder
-      goal_encoder = GoalEncoder()
-      goal_encoder.eval()
    
    from prompt_gen import PromptGenerator
    _gen = PromptGenerator()
@@ -432,7 +403,6 @@ def run_demo(model_path, prompt, use_random, multi_task,
       agent_label = "ORACLE"
       print("running oracle agent")
    elif use_random:
-      goal_encoder = None
       model        = None
       agent_label  = "RANDOM"
       print("running random agent")
@@ -463,11 +433,10 @@ def run_demo(model_path, prompt, use_random, multi_task,
    seq_pool = list(_gen.training_pool()) if (use_oracle and sequential) else None
 
    # --- first episode ---
-   cur_prompt, goal, encoding, n_shapes = make_episode(
-      goal_encoder, prompt, multi_task, seq_pool, task_filter,
+   cur_prompt, goal, emb, n_shapes = make_episode(
+      prompt, multi_task, seq_pool, task_filter,
       n_shapes=n_shapes, trained_tasks=trained_tasks)
-   env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None)
-   env.set_goal_encoding(encoding)
+   env    = ShapeEnv(n_shapes=n_shapes, goal=goal, render_mode=None, goal_embedding=emb)
    oracle = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
              if use_oracle else None)
    obs, _ = env.reset()
@@ -604,12 +573,12 @@ def run_demo(model_path, prompt, use_random, multi_task,
                f"steps: {steps}  reward: {total_reward:.2f}  "
                f"score: {final_score:.3f}  task: {cur_prompt}")
          
-         stay_paused = paused or skip
-         cur_prompt, goal, encoding, _ = make_episode(
-            goal_encoder, prompt, multi_task, seq_pool, task_filter,
+         stay_paused = paused
+         cur_prompt, goal, emb, _ = make_episode(
+            prompt, multi_task, seq_pool, task_filter,
             n_shapes=n_shapes, trained_tasks=trained_tasks)
          env.goal = goal
-         env.set_goal_encoding(encoding)
+         env._goal_embedding = emb
          oracle   = ((__import__("oracle").OraclePolicy)(env, noise_std=0.0)
                      if use_oracle else None)
          obs, _   = env.reset()
