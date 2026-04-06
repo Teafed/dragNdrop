@@ -338,7 +338,7 @@ if __name__ == "__main__":
    )
    args = parser.parse_args()
 
-   train_new(
+   train(
       timesteps=args.timesteps,
       save_path=args.save,
       bc_episodes=args.bc_episodes,
