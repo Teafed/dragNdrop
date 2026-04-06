@@ -161,7 +161,8 @@ def build_callbacks(save_path: str, n_envs: int,
 # training
 # ---------------------------------------------------------------------------
 
-def train(
+
+def train_old(
    timesteps:      int  = 800_000,
    save_path:      str  = "./models/shape_agent",
    bc_episodes:    int  = 500,
@@ -171,6 +172,7 @@ def train(
    start_stage:    int  = 0,
    resume_model:   str  = None,
 ):
+
    """
    train the goal-conditioned agent.
 
@@ -283,6 +285,135 @@ def train(
    return model
 
 
+def train_new(
+   timesteps:      int  = 800_000,
+   save_path:      str  = "./models/shape_agent",
+   bc_episodes:    int  = 500,
+   bc_epochs:      int  = 30,
+   use_oracle:     bool = True,
+   use_curriculum: bool = True,
+   start_stage:    int  = 0,
+   resume_model:   str  = None,
+):
+
+   """
+   train the goal-conditioned agent.
+
+   if use_oracle=True (recommended):
+      1. collect oracle demos (or load from disk if available)
+      2. train BicameralNetwork via BC
+      3. transplant BC weights into PPO with BicameralPolicy
+      4. PPO fine-tune with curriculum
+
+   if use_oracle=False:
+      skip steps 1-3 and train PPO from random init.
+
+   start_stage: skip directly to this curriculum stage (useful for
+   resuming or ablating individual stages).
+   """
+   from bc_train import BicameralPolicy, train_bc, build_ppo_from_bc
+   from oracle import collect_demonstrations
+   from prompt_train import run_phase0
+
+
+   if use_curriculum:
+      from curriculum import CurriculumManager
+      curriculum = CurriculumManager(verbose=True, start_stage=start_stage)
+      print(f"\n[curriculum] initial stage: {curriculum.status()}")
+   else:
+      curriculum = None
+      print("\n[curriculum] disabled — training on all tasks from step 0")
+
+   # write config immediately so it exists even if training crashes later
+   _save_env_config(save_path, curriculum)
+
+   # --- phase 0: pretrain right stream on prompt classification ---
+   phase0_network = run_phase0(save_path=os.path.join(save_path, "phase0"))
+
+   # --- oracle BC warm-start ---
+   bc_network = None
+   if use_oracle:
+      task_weights   = None
+      n_shapes_range = None
+      if use_curriculum:
+         from curriculum import _STAGES
+         final_stage    = _STAGES[-1]
+         final_tasks    = final_stage["tasks"]
+         task_weights   = {t: (2.0 if t == "touch" else 1.0) for t in final_tasks}
+         n_shapes_range = (final_stage["n_shapes_min"], final_stage["n_shapes_max"])
+
+      dataset = collect_demonstrations(
+         n_episodes=bc_episodes,
+         verbose=True,
+         task_weights=task_weights,
+         n_shapes_range=n_shapes_range,
+      )
+
+      device = "cuda" if torch.cuda.is_available() else "cpu"
+      bc_network = train_bc(
+         dataset=dataset,
+         save_path=save_path,
+         epochs=bc_epochs,
+         device=device,
+         pretrained_network=phase0_network
+      )
+   else:
+      device = "cuda" if torch.cuda.is_available() else "cpu"
+
+   use_gpu     = (device == "cuda")
+   n_envs      = N_ENVS * 4 if use_gpu else N_ENVS
+   batch_size  = 512         if use_gpu else 128
+   vec_cls = DummyVecEnv
+   
+   print(f"\n[train] device={device}  n_envs={n_envs}  "
+         f"batch_size={batch_size}  vec={vec_cls.__name__}")
+
+   vec_env = make_vec_env(
+      make_goal_conditioned_env(curriculum),
+      n_envs=n_envs,
+      vec_env_cls=vec_cls,
+   )
+
+   # --- build PPO model ---
+   if resume_model is not None:
+      print(f"\n--- resuming from checkpoint: {resume_model} ---")
+      model = PPO.load(resume_model, env=vec_env)
+   elif bc_network is not None:
+      print("\n--- initialising PPO from BC weights (BicameralPolicy) ---")
+      model = build_ppo_from_bc(bc_network, n_shapes=MAX_SHAPES, vec_env=vec_env,
+                                batch_size=batch_size)
+   else:
+      model = PPO(
+         BicameralPolicy,
+         vec_env,
+         learning_rate=3e-4,
+         n_steps=2048,
+         batch_size=batch_size,
+         n_epochs=10,
+         gamma=0.99,
+         gae_lambda=0.95,
+         clip_range=0.2,
+         ent_coef=0.05,
+         vf_coef=0.5,
+         max_grad_norm=0.5,
+         verbose=1,
+         tensorboard_log="./logs/tensorboard/",
+      )
+
+   callbacks = build_callbacks(save_path, n_envs, curriculum)
+
+   print(f"\n--- training PPO for {timesteps:,} timesteps ---\n")
+   model.learn(total_timesteps=timesteps, callback=callbacks)
+
+   final_path = os.path.join(save_path, "final_model")
+   model.save(final_path)
+   _save_env_config(save_path, curriculum)
+
+   print(f"\n--- done. model saved to {final_path} ---")
+   
+   return model
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -331,7 +462,7 @@ if __name__ == "__main__":
    )
    args = parser.parse_args()
 
-   train(
+   train_new(
       timesteps=args.timesteps,
       save_path=args.save,
       bc_episodes=args.bc_episodes,
