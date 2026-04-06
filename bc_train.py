@@ -238,127 +238,6 @@ class _BicameralExtractor(nn.Module):
 # BC training
 # ---------------------------------------------------------------------------
 
-def train_bc_old(
-   dataset:    dict,
-   save_path:  str,
-   epochs:     int   = 30,
-   batch_size: int   = 256,
-   lr:         float = 3e-4,
-   device:     str   = "cpu",
-   verbose:    bool  = True,
-) -> BicameralNetwork:
-   """
-   train a BicameralNetwork on (obs, action) pairs.
-
-   loss:
-      move loss:  MSE on action[:, 0:2]  (dx, dy) — continuous movement
-      grip loss:  BCE on action[:, 2]    (grip)   — binary on/off signal
-      total     = move_loss + 0.5 * grip_loss
-
-   grip is treated as binary (oracle outputs ±1.0) so BCE is correct here.
-   MSE on grip would let the network hedge toward 0.0 and never commit —
-   BCE penalises confident wrong predictions exponentially, forcing the
-   network to actually learn grip timing.
-
-   returns:
-      BicameralNetwork — on cpu, eval mode.
-   """
-   obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
-   act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
-
-   # compute grip class weight from dataset balance.
-   # oracle spends most transitions navigating (grip off), so grip-on labels
-   # are a minority. without reweighting, BCE minimises loss by predicting
-   # "always off" — which produces catastrophically high loss on grip-on steps.
-   # pos_weight = n_off / n_on tells BCE to treat each grip-on sample as if
-   # it were pos_weight samples, balancing the gradient contribution.
-   grip_labels = (act_t[:, 2] > 0.0)
-   n_on        = grip_labels.sum().item()
-   n_off       = (~grip_labels).sum().item()
-   pos_weight  = torch.tensor(
-      [n_off / max(n_on, 1)], dtype=torch.float32).to(device)
-   if verbose:
-      print(f"\n  grip balance: {n_on:,} on / {n_off:,} off  "
-            f"(pos_weight={pos_weight.item():.2f})")
-
-   network = BicameralNetwork().to(device)
-
-   optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-      optimizer, T_max=epochs, eta_min=1e-5)
-
-   loader = DataLoader(
-      TensorDataset(obs_t, act_t),
-      batch_size=batch_size,
-      shuffle=True,
-   )
-
-   if verbose:
-      print(f"\n--- behavior cloning (bicameral network) ---")
-      print(f"  obs dim     : {obs_t.shape[1]}  (left={LEFT_STREAM_DIM} right={RIGHT_STREAM_DIM})")
-      print(f"  action dim  : {act_t.shape[1]}  [dx, dy, grip]")
-      print(f"  samples     : {len(obs_t):,}")
-      print(f"  epochs      : {epochs}")
-      print(f"  batch size  : {batch_size}")
-      print(f"  lr          : {lr} (cosine decay to 1e-5)")
-      print(f"  loss        : MSE(dx,dy) + 0.5 * BCE(grip, weighted)")
-      print(f"  device      : {device}\n")
-
-   for epoch in range(1, epochs + 1):
-      epoch_loss      = 0.0
-      epoch_loss_grip = 0.0
-      epoch_loss_dxy  = 0.0
-      n_batches       = 0
-
-      for obs_batch, act_batch in loader:
-         pred = network(obs_batch)   # (batch, 3): [dx, dy, grip_logit]
-
-         # movement loss — MSE on continuous dx, dy
-         loss_dxy  = F.mse_loss(pred[:, 0:2], act_batch[:, 0:2])
-
-         # grip loss — weighted BCE on binary grip signal.
-         # oracle grip is ±1.0; convert to 0/1 labels for BCE.
-         # pos_weight corrects for class imbalance (grip-off majority).
-         grip_logit = pred[:, 2]
-         grip_tgt   = (act_batch[:, 2] > 0.0).float()
-         loss_grip  = F.binary_cross_entropy_with_logits(
-            grip_logit, grip_tgt, pos_weight=pos_weight)
-
-         loss = loss_dxy + 0.5 * loss_grip
-
-         optimizer.zero_grad()
-         loss.backward()
-         torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
-         optimizer.step()
-
-         epoch_loss      += loss.item()
-         epoch_loss_grip += loss_grip.item()
-         epoch_loss_dxy  += loss_dxy.item()
-         n_batches       += 1
-
-      scheduler.step()
-
-      avg_loss      = epoch_loss      / max(n_batches, 1)
-      avg_grip_loss = epoch_loss_grip / max(n_batches, 1)
-      avg_dxy_loss  = epoch_loss_dxy  / max(n_batches, 1)
-      cur_lr        = scheduler.get_last_lr()[0]
-
-      if verbose and (epoch % max(epochs // 5, 1) == 0 or epoch == 1):
-         print(f"  epoch {epoch:3d}/{epochs} | "
-               f"loss: {avg_loss:.4f}  "
-               f"(grip: {avg_grip_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
-               f"lr: {cur_lr:.2e}")
-
-   if save_path is not None:
-      os.makedirs(save_path, exist_ok=True)
-      weights_path = os.path.join(save_path, "bc_weights.pt")
-      torch.save(network.state_dict(), weights_path)
-      if verbose:
-         print(f"\n  bicameral weights saved to  {weights_path}")
-
-   return network.cpu()
-
-
 def train_bc(
    dataset:    dict,
    save_path:  str,
@@ -385,8 +264,6 @@ def train_bc(
    returns:
       BicameralNetwork — on cpu, eval mode.
    """
-
-  
    obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
    act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
 
@@ -409,7 +286,7 @@ def train_bc(
 
    if pretrained_network is not None:
       network.load_state_dict(pretrained_network.state_dict())
-      print("  [phase0] loaded pretrained right stream weights into BC network")   
+      print("  [bc_train] loaded prompt-trained right stream weights into BC network")   
 
    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

@@ -1,7 +1,7 @@
 """
 prompt_train.py
 
-phase 0 pretraining — teaches the right stream encoder to understand
+prompt pretraining — teaches the right stream encoder to understand
 natural language prompts before BC or PPO training begins.
 
 --- motivation ---
@@ -15,7 +15,7 @@ natural language prompts before BC or PPO training begins.
       3. how to combine both into useful action features
    all from sparse PPO reward alone — very slow.
 
-   phase 0 fixes problem 1 explicitly: we train a small classifier to
+   prompt training fixes problem 1 explicitly: we train a small classifier to
    predict task name directly from the 384-dim embedding. the classifier's
    learned weights are then transplanted into the embedding-processing
    columns of the right stream encoder, so BC/PPO starts with a right
@@ -69,7 +69,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import SUPPORTED_TASKS, POLICY_HIDDEN_SIZE
+from config import SUPPORTED_TASKS, POLICY_HIDDEN_SIZE, EMBEDDING_DIM
 from prompt_gen import PromptGenerator
 from llm_goal_parser import get_embedding
 
@@ -84,7 +84,6 @@ N_TASKS          = len(CLASSIFIER_TASKS)
 TASK_TO_IDX      = {t: i for i, t in enumerate(CLASSIFIER_TASKS)}
 IDX_TO_TASK      = {i: t for t, i in TASK_TO_IDX.items()}
 
-EMBEDDING_DIM    = 384    # all-MiniLM-L6-v2 output dimension
 RIGHT_SHAPE_COLS = 30     # shape layout columns in right stream input (obs[14:44])
 
 # ---------------------------------------------------------------------------
@@ -161,7 +160,7 @@ def build_dataset(
     # --- load from cache if available ---
     if cache_path is not None and os.path.exists(cache_path):
         if verbose:
-            print(f"[phase0] loading cached dataset from {cache_path}")
+            print(f"[prompt] loading cached dataset from {cache_path}")
         data = np.load(cache_path, allow_pickle=True)
         return {
             "embeddings": data["embeddings"],
@@ -170,7 +169,7 @@ def build_dataset(
         }
 
     if verbose:
-        print(f"\n[phase0] generating dataset — {n_samples:,} samples "
+        print(f"\n[prompt] generating dataset — {n_samples:,} samples "
               f"across {N_TASKS} tasks")
         print(f"  tasks: {CLASSIFIER_TASKS}")
 
@@ -522,7 +521,7 @@ def verify_transplant(
     bc_network.eval()
 
     if verbose:
-        print(f"\n[phase0] verifying transplant with {n_probes} probes...")
+        print(f"\n[prompt] verifying transplant with {n_probes} probes...")
 
     max_diff  = 0.0
     n_failed  = 0
@@ -595,7 +594,7 @@ def load_classifier(
     network = TaskClassifierNetwork(hidden=hidden, n_tasks=N_TASKS)
     network.load_state_dict(torch.load(weights_path, map_location="cpu"))
     network.eval()
-    print(f"[phase0] classifier loaded from {weights_path}")
+    print(f"[prompt] classifier loaded from {weights_path}")
     return network
 
 
@@ -614,7 +613,7 @@ def run_phase0(
     skip_if_exists:  bool  = True,
 ) -> "BicameralNetwork":
     """
-    full phase 0 pipeline:
+    full prompt training pipeline:
         1. build / load dataset
         2. train classifier (or load if already trained)
         3. evaluate per-task accuracy
@@ -665,7 +664,7 @@ def run_phase0(
     weights_path = os.path.join(save_path, "prompt_classifier.pt")
     if skip_if_exists and os.path.exists(weights_path):
         if verbose:
-            print(f"[phase0] classifier weights found at {weights_path} "
+            print(f"[prompt] classifier weights found at {weights_path} "
                   f"— skipping training (pass skip_if_exists=False to retrain)")
         classifier = load_classifier(save_path, hidden=hidden)
     else:
@@ -703,8 +702,8 @@ def run_phase0(
     transplant_path = os.path.join(save_path, "transplanted_bc_network.pt")
     torch.save(bc_network.state_dict(), transplant_path)
     if verbose:
-        print(f"[phase0] transplanted BicameralNetwork saved → {transplant_path}")
-        print(f"\n[phase0] done. BicameralNetwork ready for BC/PPO training.\n")
+        print(f"[prompt] transplanted BicameralNetwork saved → {transplant_path}")
+        print(f"\n[prompt] done. BicameralNetwork ready for BC/PPO training.\n")
 
     return bc_network
 
@@ -717,7 +716,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="phase 0 — pretrain prompt classifier and transplant "
+        description="prompt_train — pretrain prompt classifier and transplant "
                     "weights into BicameralNetwork right stream encoder"
     )
     parser.add_argument(
