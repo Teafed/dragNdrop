@@ -32,7 +32,7 @@ _STAGES = [
       "n_shapes_max": 1,
       "gate_task":    "reach",
       "gate_sr":      0.50,
-      "step_ceiling": 25_000,
+      "step_ceiling": 40_000,
    },
    {
       "name":         "reach — 1-2 shapes",
@@ -41,7 +41,7 @@ _STAGES = [
       "n_shapes_max": 2,
       "gate_task":    "reach",
       "gate_sr":      0.50,
-      "step_ceiling": 50_000,
+      "step_ceiling": 80_000,
    },
    {
       "name":         "touch — 1 shape",
@@ -50,7 +50,7 @@ _STAGES = [
       "n_shapes_max": 1,
       "gate_task":    "touch",
       "gate_sr":      0.50,
-      "step_ceiling": 75_000,
+      "step_ceiling": 120_000,
    },
    {
       "name":         "touch — 1-2 shapes",
@@ -59,7 +59,7 @@ _STAGES = [
       "n_shapes_max": 2,
       "gate_task":    "touch",
       "gate_sr":      0.50,
-      "step_ceiling": 100_000,
+      "step_ceiling": 160_000,
    },
    {
       "name":         "reach and touch — 1-2 shapes",
@@ -68,7 +68,7 @@ _STAGES = [
       "n_shapes_max": 2,
       "gate_task":    "touch",
       "gate_sr":      0.50,
-      "step_ceiling": 150_000,
+      "step_ceiling": 230_000,
    },
    {
       "name":         "drag — 1 shape",
@@ -77,7 +77,7 @@ _STAGES = [
       "n_shapes_max": 1,
       "gate_task":    "drag",
       "gate_sr":      0.40,
-      "step_ceiling": 200_000,
+      "step_ceiling": 310_000,
    },
    {
       "name":         "reach and drag — 1 shape",
@@ -86,7 +86,7 @@ _STAGES = [
       "n_shapes_max": 1,
       "gate_task":    "drag",
       "gate_sr":      0.40,
-      "step_ceiling": 250_000,
+      "step_ceiling": 390_000,
    },
    {
       "name":         "reach, touch and drag — 1 shape",
@@ -95,7 +95,7 @@ _STAGES = [
       "n_shapes_max": 1,
       "gate_task":    "drag",
       "gate_sr":      0.40,
-      "step_ceiling": 300_000,
+      "step_ceiling": 480_000,
    },
    {
       "name":         "reach, touch and drag — 1-2 shapes (final)",
