@@ -50,14 +50,14 @@ natural language prompts before BC or PPO training begins.
    python prompt_train.py --verify
 
    # in your training pipeline (before bc_train.py):
-   from prompt_train import run_phase0
-   bc_network = run_phase0()          # returns BicameralNetwork with transplanted weights
+   from prompt_train import train_prompt
+   bc_network = train_prompt()          # returns BicameralNetwork with transplanted weights
    # then pass bc_network to train_bc() as usual
 
 --- integration with train.py ---
    in train():
-      from prompt_train import run_phase0
-      bc_network = run_phase0(save_path=save_path)
+      from prompt_train import train_prompt
+      bc_network = train_prompt(save_path=save_path)
       # pass bc_network into build_ppo_from_bc() or use as BC init
 """
 
@@ -160,7 +160,7 @@ def build_dataset(
     # --- load from cache if available ---
     if cache_path is not None and os.path.exists(cache_path):
         if verbose:
-            print(f"[prompt] loading cached dataset from {cache_path}")
+            print(f"[prompt_train] loading cached dataset from {cache_path}")
         data = np.load(cache_path, allow_pickle=True)
         return {
             "embeddings": data["embeddings"],
@@ -169,7 +169,7 @@ def build_dataset(
         }
 
     if verbose:
-        print(f"\n[prompt] generating dataset — {n_samples:,} samples "
+        print(f"\n[prompt_train] generating dataset — {n_samples:,} samples "
               f"across {N_TASKS} tasks")
         print(f"  tasks: {CLASSIFIER_TASKS}")
 
@@ -252,7 +252,7 @@ def train_classifier(
 
     # --- class balance check ---
     if verbose:
-        print(f"\n[phase0] training classifier")
+        print(f"\n[prompt_train] training classifier")
         print(f"  samples    : {len(emb_t):,}")
         print(f"  hidden     : {hidden}")
         print(f"  epochs     : {epochs}")
@@ -353,7 +353,7 @@ def evaluate_classifier(
     overall_correct = 0
 
     if verbose:
-        print(f"\n[phase0] classifier evaluation")
+        print(f"\n[prompt_train] classifier evaluation")
         print(f"  {'task':<25} {'correct':>8}  {'total':>8}  {'accuracy':>9}")
         print(f"  {'-'*55}")
 
@@ -429,10 +429,10 @@ def transplant_into_bicameral(
     if bc_network is None:
         bc_network = BicameralNetwork()
         if verbose:
-            print("[phase0] created fresh BicameralNetwork for transplant")
+            print("[prompt_train] created fresh BicameralNetwork for transplant")
 
     if verbose:
-        print("\n[phase0] transplanting classifier weights → right stream encoder")
+        print("\n[prompt_train] transplanting classifier weights → right stream encoder")
 
     classifier_enc = classifier.encoder
     right_enc      = bc_network.right_encoder
@@ -521,7 +521,7 @@ def verify_transplant(
     bc_network.eval()
 
     if verbose:
-        print(f"\n[prompt] verifying transplant with {n_probes} probes...")
+        print(f"\n[prompt_train] verifying transplant with {n_probes} probes...")
 
     max_diff  = 0.0
     n_failed  = 0
@@ -571,13 +571,13 @@ def save_classifier(
     os.makedirs(save_path, exist_ok=True)
     weights_path = os.path.join(save_path, "prompt_classifier.pt")
     torch.save(classifier.state_dict(), weights_path)
-    print(f"[phase0] classifier weights saved → {weights_path}")
+    print(f"[prompt_train] classifier weights saved → {weights_path}")
 
     if metrics is not None:
         metrics_path = os.path.join(save_path, "prompt_classifier_metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=3)
-        print(f"[phase0] metrics saved → {metrics_path}")
+        print(f"[prompt_train] metrics saved → {metrics_path}")
 
 
 def load_classifier(
@@ -589,20 +589,20 @@ def load_classifier(
     if not os.path.exists(weights_path):
         raise FileNotFoundError(
             f"no classifier weights found at {weights_path}\n"
-            f"run phase 0 training first: python prompt_train.py"
+            f"run prompt training first: python prompt_train.py"
         )
     network = TaskClassifierNetwork(hidden=hidden, n_tasks=N_TASKS)
     network.load_state_dict(torch.load(weights_path, map_location="cpu"))
     network.eval()
-    print(f"[prompt] classifier loaded from {weights_path}")
+    print(f"[prompt_train] classifier loaded from {weights_path}")
     return network
 
 
 # ---------------------------------------------------------------------------
-# run_phase0 — main entry point for pipeline integration
+# train_prompt — main entry point for pipeline integration
 # ---------------------------------------------------------------------------
 
-def run_phase0(
+def train_prompt(
     save_path:       str   = "./models/phase0",
     n_samples:       int   = 10_000,
     epochs:          int   = 40,
@@ -634,21 +634,10 @@ def run_phase0(
 
     returns:
         BicameralNetwork with right stream encoder pre-initialized from
-        classifier weights. pass this directly to train_bc() or
-        build_ppo_from_bc() in your training pipeline.
+        classifier weights.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"  PHASE 0 — prompt classification pretraining")
-        print(f"  save_path : {save_path}")
-        print(f"  n_samples : {n_samples:,}")
-        print(f"  epochs    : {epochs}")
-        print(f"  hidden    : {hidden}  (must equal POLICY_HIDDEN_SIZE)")
-        print(f"  device    : {device}")
-        print(f"{'='*60}\n")
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -664,7 +653,7 @@ def run_phase0(
     weights_path = os.path.join(save_path, "prompt_classifier.pt")
     if skip_if_exists and os.path.exists(weights_path):
         if verbose:
-            print(f"[prompt] classifier weights found at {weights_path} "
+            print(f"[prompt_train] classifier weights found at {weights_path} "
                   f"— skipping training (pass skip_if_exists=False to retrain)")
         classifier = load_classifier(save_path, hidden=hidden)
     else:
@@ -702,8 +691,8 @@ def run_phase0(
     transplant_path = os.path.join(save_path, "transplanted_bc_network.pt")
     torch.save(bc_network.state_dict(), transplant_path)
     if verbose:
-        print(f"[prompt] transplanted BicameralNetwork saved → {transplant_path}")
-        print(f"\n[prompt] done. BicameralNetwork ready for BC/PPO training.\n")
+        print(f"[prompt_train] transplanted BicameralNetwork saved → {transplant_path}")
+        print(f"\n[prompt_train] done. BicameralNetwork ready for BC/PPO training.\n")
 
     return bc_network
 
@@ -791,7 +780,7 @@ if __name__ == "__main__":
 
     # --- full pipeline ---
     else:
-        run_phase0(
+        train_prompt(
             save_path=args.save,
             n_samples=args.samples,
             epochs=args.epochs,
