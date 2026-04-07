@@ -27,14 +27,16 @@ OBS_VALUES_PER_SHAPE = 5    # per-shape features: x, y, size, color, shape_type
 # right stream (scene-global):  indices 14-427 (413 values)
 # overlap on [14-43] is intentional — both streams see all shape positions.
 
-CURSOR_STATE_SIZE    = 4    # cx_norm, cy_norm, holding, grabbed_idx_norm
-FOCAL_SHAPE_SIZE     = OBS_VALUES_PER_SHAPE * 2   # grabbed + nearest (5 + 5)
+CURSOR_STATE_DIM    = 4    # cx_norm, cy_norm, holding, grabbed_idx_norm
+FOCAL_SHAPE_DIM     = OBS_VALUES_PER_SHAPE * 2   # grabbed + nearest (5 + 5)
 
-LEFT_STREAM_DIM      = CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE + MAX_SHAPES * OBS_VALUES_PER_SHAPE
+ALL_SHAPES_DIM      = MAX_SHAPES * OBS_VALUES_PER_SHAPE   # 6 * 5 = 30
+
+LEFT_STREAM_DIM     = CURSOR_STATE_DIM + FOCAL_SHAPE_DIM + ALL_SHAPES_DIM
 # = 4 + 10 + 30 = 44
-RIGHT_STREAM_DIM     = MAX_SHAPES * OBS_VALUES_PER_SHAPE + EMBEDDING_DIM   # shapes + goal = 30 + 384 = 414
 
-# obs region labels for the 428-dim vector; must match shape_env._get_obs()
+RIGHT_STREAM_DIM     = ALL_SHAPES_DIM + EMBEDDING_DIM   # shapes + goal = 30 + 384 = 414
+
 OBS_REGIONS = [
    ("cursor_state",   slice(0,   4),  "cx cy holding grabbed_idx"),
    ("grabbed_shape",  slice(4,   9),  "grabbed shape features"),
@@ -108,14 +110,14 @@ def get_obs_size() -> int:
    """
    total flattened observation vector size: 384.
 
-      CURSOR_STATE_SIZE                          4
-    + FOCAL_SHAPE_SIZE  (grabbed + nearest)     10
+      CURSOR_STATE_DIM                           4
+    + FOCAL_SHAPE_DIM  (grabbed + nearest)      10
     + MAX_SHAPES * OBS_VALUES_PER_SHAPE         30
     + EMBEDDING_DIM                            384
                                                ---
                                                428
    """
-   return (CURSOR_STATE_SIZE + FOCAL_SHAPE_SIZE
+   return (CURSOR_STATE_DIM + FOCAL_SHAPE_DIM
            + MAX_SHAPES * OBS_VALUES_PER_SHAPE
            + EMBEDDING_DIM)
 

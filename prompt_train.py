@@ -69,7 +69,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import SUPPORTED_TASKS, POLICY_HIDDEN_SIZE, EMBEDDING_DIM
+from config import SUPPORTED_TASKS, POLICY_HIDDEN_SIZE, EMBEDDING_DIM, ALL_SHAPES_DIM
 from prompt_gen import PromptGenerator
 from llm_goal_parser import get_embedding
 
@@ -84,7 +84,7 @@ N_TASKS          = len(CLASSIFIER_TASKS)
 TASK_TO_IDX      = {t: i for i, t in enumerate(CLASSIFIER_TASKS)}
 IDX_TO_TASK      = {i: t for t, i in TASK_TO_IDX.items()}
 
-RIGHT_SHAPE_COLS = 30     # shape layout columns in right stream input (obs[14:44])
+RIGHT_SHAPE_COLS = ALL_SHAPES_DIM # shape layout columns in right stream input (obs[14:44])
 
 # ---------------------------------------------------------------------------
 # TaskClassifierNetwork
