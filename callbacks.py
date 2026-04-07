@@ -85,14 +85,13 @@ class ShapeTaskCallback(BaseCallback):
             f"[task eval @ {self.num_timesteps:>8,d} steps]  "
             f"stage={stage}  "
             f"score: {metrics['mean_score']:.3f}  "
-            f"rank/cohesion: {metrics['rank_corr']:+.3f}  "
             f"solve_rate: {metrics['solve_rate']:.0%}  "
             f"avg_steps: {metrics['mean_ep_length']:.1f}"
          )
       return True
 
    def _run_eval(self) -> dict:
-      scores, rank_corrs, ep_lengths, solved = [], [], [], []
+      scores, ep_lengths, solved = [], [], []
       for _ in range(self.n_eval_episodes):
          # fresh env each episode so every episode reflects current stage
          eval_env   = self._make_eval_env()
@@ -106,7 +105,6 @@ class ShapeTaskCallback(BaseCallback):
             done    = terminated or truncated
             length += 1
          scores.append(info.get("score",     0.0))
-         rank_corrs.append(info.get("rank_corr", 0.0))
          ep_lengths.append(length)
          solved.append(float(terminated))
          eval_env.close()
@@ -115,7 +113,6 @@ class ShapeTaskCallback(BaseCallback):
                if self.curriculum is not None else -1)
       return {
          "mean_score":     float(np.mean(scores)),
-         "rank_corr":      float(np.mean(rank_corrs)),
          "solve_rate":     float(np.mean(solved)),
          "mean_ep_length": float(np.mean(ep_lengths)),
          "current_stage":  float(stage),
