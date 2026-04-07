@@ -669,7 +669,6 @@ if __name__ == "__main__":
          multi_task=args.multi_task,
          n_episodes=args.episodes,
          verbose=args.verbose,
-         saliency=args.saliency,
          task_filter=args.task,
       )
    else:
