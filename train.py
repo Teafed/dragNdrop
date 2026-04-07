@@ -189,7 +189,7 @@ def train(
    """
    from bc_train import BicameralPolicy, train_bc, build_ppo_from_bc
    from oracle import collect_demonstrations
-   from prompt_train import run_phase0
+   from prompt_train import train_prompt
 
 
    if use_curriculum:
@@ -204,7 +204,7 @@ def train(
    _save_env_config(save_path, curriculum)
 
    # --- phase 0: pretrain right stream on prompt classification ---
-   prompt_trained = run_phase0(save_path=os.path.join(save_path, "phase0"))
+   prompt_trained = train_prompt(save_path=os.path.join(save_path, "phase0"))
 
    # --- oracle BC warm-start ---
    bc_network = None
