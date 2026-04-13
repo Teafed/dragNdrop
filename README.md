@@ -171,7 +171,7 @@ overlap on [14-43] is intentional.
 [dx, dy, click]   all continuous in [-1, 1]
 
 dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (15px)
-click:     > CLICK_THRESHOLD (0.0) -> grab nearest shape within CLICK_RADIUS (20px)
+click:    > CLICK_THRESHOLD (0.0) -> grab nearest shape within CLICK_RADIUS (20px)
           <= CLICK_THRESHOLD      -> release held shape
 ```
 
