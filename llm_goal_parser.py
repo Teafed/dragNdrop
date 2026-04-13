@@ -80,7 +80,7 @@ def _stub_parse(prompt: str) -> dict:
    )):
       return _starter_goal("reach", tc, tt)
 
-   # touch: grip-activation prompts. "touch the" must come before the groups
+   # touch: click-activation prompts. "touch the" must come before the groups
    # check so "touch the triangle" doesn't fall through to arrange_in_sequence.
    if any(kw in prompt for kw in (
       "click on", "click the", "tap the", "tap on",

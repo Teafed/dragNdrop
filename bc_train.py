@@ -25,13 +25,13 @@ behavior cloning trainer for the shape manipulation agent.
 
    action head:
       movement head: (left + right) -> [dx, dy]  — MSE loss, Tanh output
-      grip head:     (left + right) -> grip logit — BCE loss, no Tanh.
-      at runtime the grip logit is thresholded at 0.0 to produce ±1.0.
+      click head:    (left + right) -> click logit — BCE loss, no Tanh.
+      at runtime the click logit is thresholded at 0.0 to produce ±1.0.
 
 --- BC training details ---
-   loss = MSE on all three action outputs (dx, dy, grip together).
-   grip is continuous during BC even though it becomes binary at runtime.
-   separate loss reporting for grip vs dx/dy for diagnostics.
+   loss = MSE on all three action outputs (dx, dy, click together).
+   click is continuous during BC even though it becomes binary at runtime.
+   separate loss reporting for click vs dx/dy for diagnostics.
    cosine annealing lr schedule, gradient clipping max_norm=1.0.
 
 --- weight transplant ---
@@ -45,7 +45,7 @@ behavior cloning trainer for the shape manipulation agent.
                  since the architectures match exactly.
 
    transplant 2: compose BC's split heads (move_head: hidden*2->hidden->2,
-                 grip_head: hidden*2->hidden//2->1) into SB3's single
+                 click_head: hidden*2->hidden//2->1) into SB3's single
                  action_net (hidden*2->3) by composing each head's linear
                  layers independently and stacking the results.
 """
@@ -119,9 +119,9 @@ class BicameralNetwork(nn.Module):
          nn.Tanh(),
       )
 
-      # grip head: combined features -> grip logit (unbounded, no Tanh).
+      # click head: combined features -> click logit (unbounded, no Tanh).
       # BCE loss during BC training; threshold at 0.0 at runtime.
-      self.grip_head = nn.Sequential(
+      self.click_head = nn.Sequential(
          nn.Linear(hidden * 2, hidden // 2),
          nn.Linear(hidden // 2, 1),
       )
@@ -129,9 +129,9 @@ class BicameralNetwork(nn.Module):
    def forward(self, obs: torch.Tensor) -> torch.Tensor:
       """
       obs: (batch, 428)
-      returns: (batch, 3) — [dx, dy] in [-1, 1], grip as raw logit.
-      during BC: grip column fed to BCE loss directly.
-      at runtime (PPO / inference): threshold grip logit at 0.0.
+      returns: (batch, 3) — [dx, dy] in [-1, 1], click as raw logit.
+      during BC: click column fed to BCE loss directly.
+      at runtime (PPO / inference): threshold click logit at 0.0.
       """
       left_in  = obs[:, _LEFT_SLICE]    # (batch, 44)
       right_in = obs[:, _RIGHT_SLICE]   # (batch, 414)
@@ -152,23 +152,23 @@ class BicameralNetwork(nn.Module):
 
       combined  = torch.cat([left_feat, right_out], dim=-1)
       move      = self.move_head(combined)             # (batch, 2)  in [-1, 1]
-      grip      = self.grip_head(combined)             # (batch, 1)  raw logit
-      return torch.cat([move, grip], dim=-1)           # (batch, 3)
+      click     = self.click_head(combined)             # (batch, 1)  raw logit
+      return torch.cat([move, click], dim=-1)           # (batch, 3)
 
    def features_dim(self) -> int:
       return self.hidden * 2
 
    def predict(self, obs: torch.Tensor) -> torch.Tensor:
       """
-      inference-mode forward: returns actions with grip thresholded to ±1.0.
+      inference-mode forward: returns actions with click thresholded to ±1.0.
       use this anywhere outside of BC training (demo, debug, manual eval).
       during BC training, use forward() directly so BCE gets the raw logit.
       """
-      out  = self.forward(obs)                          # (batch, 3)
-      grip = torch.where(out[:, 2:3] > 0.0,
+      out   = self.forward(obs)                          # (batch, 3)
+      click = torch.where(out[:, 2:3] > 0.0,
                          torch.ones_like(out[:, 2:3]),
                          -torch.ones_like(out[:, 2:3]))
-      return torch.cat([out[:, 0:2], grip], dim=-1)
+      return torch.cat([out[:, 0:2], click], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +253,13 @@ def train_bc(
 
    loss:
       move loss:  MSE on action[:, 0:2]  (dx, dy) — continuous movement
-      grip loss:  BCE on action[:, 2]    (grip)   — binary on/off signal
-      total     = move_loss + 0.5 * grip_loss
+      click loss: BCE on action[:, 2]    (click)  — binary on/off signal
+      total     = move_loss + 0.5 * click_loss
 
-   grip is treated as binary (oracle outputs ±1.0) so BCE is correct here.
-   MSE on grip would let the network hedge toward 0.0 and never commit —
+   click is treated as binary (oracle outputs ±1.0) so BCE is correct here.
+   MSE on click would let the network hedge toward 0.0 and never commit —
    BCE penalises confident wrong predictions exponentially, forcing the
-   network to actually learn grip timing.
+   network to actually learn click timing.
 
    returns:
       BicameralNetwork — on cpu, eval mode.
@@ -267,19 +267,19 @@ def train_bc(
    obs_t = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
    act_t = torch.tensor(dataset["actions"],      dtype=torch.float32).to(device)
 
-   # compute grip class weight from dataset balance.
-   # oracle spends most transitions navigating (grip off), so grip-on labels
+   # compute click class weight from dataset balance.
+   # oracle spends most transitions navigating (click off), so click-on labels
    # are a minority. without reweighting, BCE minimises loss by predicting
-   # "always off" — which produces catastrophically high loss on grip-on steps.
-   # pos_weight = n_off / n_on tells BCE to treat each grip-on sample as if
+   # "always off" — which produces catastrophically high loss on click-on steps.
+   # pos_weight = n_off / n_on tells BCE to treat each click-on sample as if
    # it were pos_weight samples, balancing the gradient contribution.
-   grip_labels = (act_t[:, 2] > 0.0)
-   n_on        = grip_labels.sum().item()
-   n_off       = (~grip_labels).sum().item()
-   pos_weight  = torch.tensor(
+   click_labels = (act_t[:, 2] > 0.0)
+   n_on         = click_labels.sum().item()
+   n_off        = (~click_labels).sum().item()
+   pos_weight   = torch.tensor(
       [n_off / max(n_on, 1)], dtype=torch.float32).to(device)
    if verbose:
-      print(f"\n  grip balance: {n_on:,} on / {n_off:,} off  "
+      print(f"\n  click balance: {n_on:,} on / {n_off:,} off  "
             f"(pos_weight={pos_weight.item():.2f})")
 
    network = BicameralNetwork().to(device)
@@ -301,57 +301,57 @@ def train_bc(
    if verbose:
       print(f"\n--- behavior cloning (bicameral network) ---")
       print(f"  obs dim     : {obs_t.shape[1]}  (left={LEFT_STREAM_DIM} right={RIGHT_STREAM_DIM})")
-      print(f"  action dim  : {act_t.shape[1]}  [dx, dy, grip]")
+      print(f"  action dim  : {act_t.shape[1]}  [dx, dy, click]")
       print(f"  samples     : {len(obs_t):,}")
       print(f"  epochs      : {epochs}")
       print(f"  batch size  : {batch_size}")
       print(f"  lr          : {lr} (cosine decay to 1e-5)")
-      print(f"  loss        : MSE(dx,dy) + 0.5 * BCE(grip, weighted)")
+      print(f"  loss        : MSE(dx,dy) + 0.5 * BCE(click, weighted)")
       print(f"  device      : {device}\n")
 
    for epoch in range(1, epochs + 1):
-      epoch_loss      = 0.0
-      epoch_loss_grip = 0.0
-      epoch_loss_dxy  = 0.0
-      n_batches       = 0
+      epoch_loss       = 0.0
+      epoch_loss_click = 0.0
+      epoch_loss_dxy   = 0.0
+      n_batches        = 0
 
       for obs_batch, act_batch in loader:
-         pred = network(obs_batch)   # (batch, 3): [dx, dy, grip_logit]
+         pred = network(obs_batch)   # (batch, 3): [dx, dy, click_logit]
 
          # movement loss — MSE on continuous dx, dy
          loss_dxy  = F.mse_loss(pred[:, 0:2], act_batch[:, 0:2])
 
-         # grip loss — weighted BCE on binary grip signal.
-         # oracle grip is ±1.0; convert to 0/1 labels for BCE.
-         # pos_weight corrects for class imbalance (grip-off majority).
-         grip_logit = pred[:, 2]
-         grip_tgt   = (act_batch[:, 2] > 0.0).float()
-         loss_grip  = F.binary_cross_entropy_with_logits(
-            grip_logit, grip_tgt, pos_weight=pos_weight)
+         # click loss — weighted BCE on binary click signal.
+         # oracle click is ±1.0; convert to 0/1 labels for BCE.
+         # pos_weight corrects for class imbalance (click-off majority).
+         click_logit = pred[:, 2]
+         click_tgt   = (act_batch[:, 2] > 0.0).float()
+         loss_click  = F.binary_cross_entropy_with_logits(
+            click_logit, click_tgt, pos_weight=pos_weight)
 
-         loss = loss_dxy + 0.5 * loss_grip
+         loss = loss_dxy + 0.5 * loss_click
 
          optimizer.zero_grad()
          loss.backward()
          torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
          optimizer.step()
 
-         epoch_loss      += loss.item()
-         epoch_loss_grip += loss_grip.item()
-         epoch_loss_dxy  += loss_dxy.item()
-         n_batches       += 1
+         epoch_loss       += loss.item()
+         epoch_loss_click += loss_click.item()
+         epoch_loss_dxy   += loss_dxy.item()
+         n_batches        += 1
 
       scheduler.step()
 
-      avg_loss      = epoch_loss      / max(n_batches, 1)
-      avg_grip_loss = epoch_loss_grip / max(n_batches, 1)
-      avg_dxy_loss  = epoch_loss_dxy  / max(n_batches, 1)
-      cur_lr        = scheduler.get_last_lr()[0]
+      avg_loss       = epoch_loss      / max(n_batches, 1)
+      avg_click_loss = epoch_loss_click / max(n_batches, 1)
+      avg_dxy_loss   = epoch_loss_dxy  / max(n_batches, 1)
+      cur_lr         = scheduler.get_last_lr()[0]
 
       if verbose and (epoch % max(epochs // 5, 1) == 0 or epoch == 1):
          print(f"  epoch {epoch:3d}/{epochs} | "
                f"loss: {avg_loss:.4f}  "
-               f"(grip: {avg_grip_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
+               f"(click: {avg_click_loss:.4f}  dx/dy: {avg_dxy_loss:.4f})  "
                f"lr: {cur_lr:.2e}")
 
    if save_path is not None:
@@ -383,8 +383,8 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
 
    transplant 2: action_net (hidden*2 -> 3) is initialized near zero with
                  orthogonal init (gain=0.01) rather than transplanting BC's
-                 action heads. this gives PPO unbiased grip exploration from
-                 the start — grip timing is shaped by reward, not BC init.
+                 action heads. this gives PPO unbiased click exploration from
+                 the start — click timing is shaped by reward, not BC init.
    """
    if goal is None:
       # this dict is only used when vec_env is None (rare / debug path).
@@ -429,17 +429,17 @@ def build_ppo_from_bc(bc_network: BicameralNetwork,
    # --- transplant 2: initialise action_net near zero ---
    # the lossless composition approach (composing BC's split heads into SB3's
    # single action_net linear layer) was attempted but produced a strongly
-   # negative grip bias due to numerical amplification through the composition.
+   # negative click bias due to numerical amplification through the composition.
    # near-zero orthogonal init is strictly better: it gives PPO equal probability
-   # of exploring grip-on and grip-off, letting reward shape grip timing cleanly.
-   # transplant 1 (navigation weights) is the valuable warm-start; grip timing
+   # of exploring click-on and click-off, letting reward shape click timing cleanly.
+   # transplant 1 (navigation weights) is the valuable warm-start; click timing
    # is best left for PPO to discover.
    try:
       with torch.no_grad():
          sb3_action_net = model.policy.action_net
          nn.init.orthogonal_(sb3_action_net.weight, gain=0.01)
          nn.init.constant_(sb3_action_net.bias, 0.0)
-      print("  [action_net] initialized near zero for unbiased grip exploration.")
+      print("  [action_net] initialized near zero for unbiased click exploration.")
    except Exception as e:
       print(f"  [action_net] init failed ({e}) — action_net starts from random init.")
 

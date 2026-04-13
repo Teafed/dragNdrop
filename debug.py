@@ -4,7 +4,7 @@ debug.py
 diagnostic script. run this before training or when something breaks.
 
 tests:
-   1. env steps move cursor and shapes respond to grip
+   1. env steps move cursor and shapes respond to click
    2. rewards vary across episodes; score functions respond to shape movement
    3. all tasks initialise and step without error (flat rewards expected)
    4. env loads bicameral network and obs vector correctly
@@ -86,7 +86,7 @@ def test_env_steps(n_shapes: int = 2) -> bool:
    check that:
    - obs shape is 428
    - cursor moves when dx/dy are non-zero
-   - grip attaches to a shape when cursor is close enough
+   - click attaches to a shape when cursor is close enough
    """
    print(f"=== test 1: cursor mechanics and obs shape (n_shapes={n_shapes}) ===")
    goal   = _default_goal("arrange_in_sequence")
@@ -105,19 +105,19 @@ def test_env_steps(n_shapes: int = 2) -> bool:
    print(f"  cursor moved right : {cursor_moved}  "
          f"({cx_before:.1f} -> {env.cx:.1f})")
 
-   # move cursor to first shape and grip
+   # move cursor to first shape and click
    s = env.shapes[0]
    env.cx = s.x
    env.cy = s.y
    _, _, _, _, _ = env.step(np.array([0.0, 0.0, 1.0], dtype=np.float32))
-   grip_ok = env.holding and env.grabbed_idx == 0
-   print(f"  grip when overlapping : {grip_ok}  "
+   click_ok = env.holding and env.grabbed_idx == 0
+   print(f"  click when overlapping : {click_ok}  "
          f"(holding={env.holding}  grabbed_idx={env.grabbed_idx})")
 
-   # release grip
+   # release click
    env.step(np.array([0.0, 0.0, -1.0], dtype=np.float32))
    release_ok = not env.holding and env.grabbed_idx == -1
-   print(f"  release grip          : {release_ok}  "
+   print(f"  release click          : {release_ok}  "
          f"(holding={env.holding}  grabbed_idx={env.grabbed_idx})")
 
    # no grab when cursor is far from shapes
@@ -128,7 +128,7 @@ def test_env_steps(n_shapes: int = 2) -> bool:
    print(f"  no grab when far      : {no_grab_ok}  "
          f"(grabbed_idx={env.grabbed_idx})")
 
-   ok = obs_ok and cursor_moved and grip_ok and release_ok and no_grab_ok
+   ok = obs_ok and cursor_moved and click_ok and release_ok and no_grab_ok
    print(f"  result: {'ok' if ok else '!! FAIL'}")
    print()
    env.close()
@@ -142,16 +142,16 @@ def test_env_steps(n_shapes: int = 2) -> bool:
 def test_random_rewards(n_shapes: int = 2) -> bool:
    """
    check that rewards vary meaningfully when shapes actually move.
-   wave 3 tasks require grip-and-drag to produce score changes — pure
-   random cursor movement never grips so reward stays flat at STEP_PENALTY.
-   this test moves cursor to a shape, grips, then drags randomly.
+   wave 3 tasks require click-and-drag to produce score changes — pure
+   random cursor movement never clicks so reward stays flat at STEP_PENALTY.
+   this test moves cursor to a shape, clicks, then drags randomly.
 
    reward ranges will differ across tasks — that's expected. what matters
    is that each range is clearly above zero, confirming the score function
    responds to shape movement. a flat range (~0.0) means the score function
    for that task is broken or unresponsive.
    """
-   print(f"=== test 2: reward variance (grip-and-drag actions) ===")
+   print(f"=== test 2: reward variance (click-and-drag actions) ===")
    all_ok = True
 
    test_cases = [
@@ -179,11 +179,11 @@ def test_random_rewards(n_shapes: int = 2) -> bool:
          env.cy = s.y
 
          for step in range(40):
-            # grip on for first 20 steps, random dx/dy; release after
-            grip  = 1.0 if step < 20 else -1.0
+            # click on for first 20 steps, random dx/dy; release after
+            click  = 1.0 if step < 20 else -1.0
             dx    = float(rng.uniform(-1.0, 1.0))
             dy    = float(rng.uniform(-1.0, 1.0))
-            action = np.array([dx, dy, grip], dtype=np.float32)
+            action = np.array([dx, dy, click], dtype=np.float32)
             obs, reward, terminated, truncated, _ = env.step(action)
             ep_reward += reward
             if terminated or truncated:
@@ -212,7 +212,7 @@ def test_all_tasks() -> bool:
    check that all tasks initialise and step without throwing an error.
    uses random actions — flat rewards of -0.020 (just the step penalty)
    are expected and correct for most tasks, since random actions rarely
-   grip and drag shapes. this test is only checking for crashes, not
+   click and drag shapes. this test is only checking for crashes, not
    that rewards are meaningful. "none" task excluded.
    """
    print("=== test 3: all tasks initialise and step without error ===")
@@ -487,7 +487,7 @@ def test_bc_loss(n_episodes: int = 80, epochs: int = 10) -> bool:
       print("  note: this is a quick diagnostic run (80 episodes, 10 epochs).")
       print("  loss will be higher than a full training run — that's expected.")
       print("  look for: loss decreasing steadily across epochs (not plateauing")
-      print("  after epoch 2), grip loss dropping below ~0.25, dxy below ~0.30.")
+      print("  after epoch 2), click loss dropping below ~0.25, dxy below ~0.30.")
       print("  a plateau at high loss usually means too little data or lr too high.")
       ok = True
 
@@ -580,37 +580,37 @@ def test_bc_loss_per_task(n_episodes: int = 80) -> bool:
             task_act  = act_t[idx]
             pred      = network(task_obs)
 
-            # match train_bc loss: MSE for dx/dy, BCE for grip.
-            # grip labels are ±1.0 from oracle; convert to 0/1 for BCE.
+            # match train_bc loss: MSE for dx/dy, BCE for click.
+            # click labels are ±1.0 from oracle; convert to 0/1 for BCE.
             # using MSE on raw logits vs ±1.0 produces nonsense values here.
-            loss_dxy  = F.mse_loss(pred[:, 0:2], task_act[:, 0:2]).item()
-            grip_tgt  = (task_act[:, 2] > 0.0).float()
-            loss_grip = F.binary_cross_entropy_with_logits(
-               pred[:, 2], grip_tgt).item()
-            loss      = loss_dxy + 0.5 * loss_grip
+            loss_dxy   = F.mse_loss(pred[:, 0:2], task_act[:, 0:2]).item()
+            click_tgt  = (task_act[:, 2] > 0.0).float()
+            loss_click = F.binary_cross_entropy_with_logits(
+               pred[:, 2], click_tgt).item()
+            loss      = loss_dxy + 0.5 * loss_click
 
             # flag tasks with suspiciously high loss.
             # these are in-sample losses after 10 diagnostic epochs, so they
             # will naturally be higher than a full training run. thresholds:
             #   dxy > 0.50 — network hasn't learned movement for this task
-            #   grip > 0.50 — network hasn't learned grip for this task
+            #   click > 0.50 — network hasn't learned click for this task
             #   combined > 0.70 — overall learning has stalled on this task
-            # grip BCE near ln(2)≈0.693 means predicting ~0.5 for all steps.
+            # click BCE near ln(2)≈0.693 means predicting ~0.5 for all steps.
             # dxy MSE near 0.5 means similar (no learning).
             warn_dxy  = loss_dxy  > 0.50
-            warn_grip = loss_grip > 0.50
+            warn_click = loss_click > 0.50
             warn_all  = loss      > 0.70
-            ok        = not (warn_dxy or warn_grip or warn_all)
+            ok        = not (warn_dxy or warn_click or warn_all)
             status    = "ok" if ok else "!! HIGH"
             if not ok:
                all_ok = False
 
             print(f"  {task:<25}  {len(mask):>6}  {loss:>8.4f}  {status}"
-                  f"  (dxy={loss_dxy:.4f}  grip={loss_grip:.4f})")
+                  f"  (dxy={loss_dxy:.4f}  click={loss_click:.4f})")
 
       print()
       if not all_ok:
-         print("  tasks marked HIGH have dxy>0.50, grip>0.50, or combined>0.70.")
+         print("  tasks marked HIGH have dxy>0.50, click>0.50, or combined>0.70.")
          print("  these are in-sample diagnostic losses — a full training run")
          print("  (more episodes, more epochs) should bring them down further.")
          print("  if a task is HIGH after a full run, check: data starvation")

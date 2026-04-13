@@ -4,24 +4,24 @@ oracle.py
 analytical oracle policy for collecting BC demonstrations via cursor control.
 
 --- action space ---
-   [dx, dy, grip] — cursor movement and grip, all in [-1, 1]
+   [dx, dy, click] — cursor movement and click, all in [-1, 1]
 
 --- explore / commit loop ---
    explore: select which shape to move next using weighted random selection.
 
-   commit:  navigate cursor to the selected shape, grip it, drag it to
+   commit:  navigate cursor to the selected shape, click it, drag it to
             the computed target, then release. returns to explore once
             the local condition is met.
 
    commit sub-phases (per committed shape):
-      NAVIGATE  cursor moves toward shape until within GRIP_RADIUS
-      GRIP_ON   grip activates (one step with grip=1)
-      DRAG      cursor + shape move toward target
-      GRIP_OFF  grip releases (one step with grip=-1), shape stays at target
+      NAVIGATE   cursor moves toward shape until within CLICK_RADIUS
+      CLICK_ON   click activates (one step with click=1)
+      DRAG       cursor + shape move toward target
+      CLICK_OFF  click releases (one step with click=-1), shape stays at target
 
 --- navigate-then-drag oracle ---
    all movement goes through cursor physics:
-   navigate to shape, grip, drag to target, release.
+   navigate to shape, click, drag to target, release.
 
 --- high-level annotations ---
    each transition also stores:
@@ -32,8 +32,8 @@ analytical oracle policy for collecting BC demonstrations via cursor control.
 
 --- starter tasks ---
    reach:  navigate cursor to the closest shape in env.target_indices
-   touch:  navigate to closest valid target then activate grip
-   drag:   navigate to closest valid target, grip, drag to target region
+   touch:  navigate to closest valid target then activate click
+   drag:   navigate to closest valid target, click, drag to target region
 
 --- arrangement tasks ---
    arrange_in_sequence / arrange_in_line:
@@ -56,7 +56,7 @@ from shape_env import (
    SCORE_SOLVE_THRESHOLD, REGION_INNER, LINE_SPREAD_THRESHOLD,
 )
 from config import (
-   MAX_SHAPES, CURSOR_SPEED, GRIP_RADIUS,
+   MAX_SHAPES, CURSOR_SPEED, CLICK_RADIUS,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,15 +68,15 @@ COMMIT_JITTER      = 30.0   # pixels: random offset from ideal target
 REGION_EXTRA_DEPTH = 60.0   # pixels: random extra depth into region
 NOISE_STD          = 0.06   # action noise std (0 for clean oracle demo)
 
-# cursor approach: how close before gripping (slightly larger than GRIP_RADIUS
-# so the oracle reliably lands inside the grip zone)
-APPROACH_DIST = GRIP_RADIUS * 0.8
+# cursor approach: how close before clicking (slightly larger than CLICK_RADIUS
+# so the oracle reliably lands inside the click zone)
+APPROACH_DIST = CLICK_RADIUS * 0.8
 
 # commit sub-phases
 _NAVIGATE  = "navigate"
-_GRIP_ON   = "grip_on"
+_CLICK_ON   = "click_on"
 _DRAG      = "drag"
-_GRIP_OFF  = "grip_off"
+_CLICK_OFF  = "click_off"
 _DONE      = "done"      # one-step terminal — forces re-exploration next act()
 
 
@@ -87,7 +87,7 @@ _DONE      = "done"      # one-step terminal — forces re-exploration next act(
 class OraclePolicy:
    """
    oracle policy for a single ShapeEnv instance.
-   call act(obs) each step to get an action [dx, dy, grip].
+   call act(obs) each step to get an action [dx, dy, click].
    maintains cursor sub-phase state across steps.
    """
 
@@ -110,7 +110,7 @@ class OraclePolicy:
 
    def act(self, obs=None) -> np.ndarray:
       """
-      return action [dx, dy, grip] in [-1, 1]^3.
+      return action [dx, dy, click] in [-1, 1]^3.
       obs is accepted but unused — oracle reads env state directly.
       """
       env  = self.env
@@ -120,7 +120,7 @@ class OraclePolicy:
          return np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
       # --- explore: pick next shape if needed ---
-      # re-explore when: no committed shape, phase is _DONE (grip just released),
+      # re-explore when: no committed shape, phase is _DONE (click just released),
       # or local condition confirms the shape landed correctly
       if (self.committed_shape is None
             or self.phase == _DONE
@@ -147,7 +147,7 @@ class OraclePolicy:
    def _execute_phase(self) -> np.ndarray:
       """
       execute the current sub-phase and advance phase when complete.
-      returns [dx, dy, grip].
+      returns [dx, dy, click].
       """
       env     = self.env
       idx     = self.committed_shape
@@ -158,24 +158,24 @@ class OraclePolicy:
       if self.phase == _NAVIGATE:
          task = env.goal.get("task", "arrange_in_sequence")
          if task == "reach":
-            # reach: navigate until cursor is within GRIP_RADIUS, no grip needed
+            # reach: navigate until cursor is within CLICK_RADIUS, no click needed
             dist_to_shape = np.sqrt((cx - s.x) ** 2 + (cy - s.y) ** 2)
-            if dist_to_shape <= GRIP_RADIUS:
+            if dist_to_shape <= CLICK_RADIUS:
                # stay put — score should now be 1.0, idle fires next act()
                return np.array([0.0, 0.0, -1.0], dtype=np.float32)
             dx, dy = self._direction_to(cx, cy, s.x, s.y)
             return np.array([dx, dy, -1.0], dtype=np.float32)
-         # all other tasks: navigate to shape then grip
+         # all other tasks: navigate to shape then click
          dist_to_shape = np.sqrt((cx - s.x) ** 2 + (cy - s.y) ** 2)
          if dist_to_shape <= APPROACH_DIST:
-            # arrived — advance to grip_on
-            self.phase = _GRIP_ON
+            # arrived — advance to click_on
+            self.phase = _CLICK_ON
             return np.array([0.0, 0.0, 1.0], dtype=np.float32)
          dx, dy = self._direction_to(cx, cy, s.x, s.y)
          return np.array([dx, dy, -1.0], dtype=np.float32)
 
-      elif self.phase == _GRIP_ON:
-         # activate grip for one step, then start dragging
+      elif self.phase == _CLICK_ON:
+         # activate click for one step, then start dragging
          self.phase = _DRAG
          return np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
@@ -184,12 +184,12 @@ class OraclePolicy:
          dist_to_target = np.sqrt((cx - tx) ** 2 + (cy - ty) ** 2)
          if dist_to_target < CURSOR_SPEED * 0.8:
             # close enough — release
-            self.phase = _GRIP_OFF
+            self.phase = _CLICK_OFF
             return np.array([0.0, 0.0, -1.0], dtype=np.float32)
          dx, dy = self._direction_to(cx, cy, tx, ty)
          return np.array([dx, dy, 1.0], dtype=np.float32)
 
-      elif self.phase == _GRIP_OFF:
+      elif self.phase == _CLICK_OFF:
          # one-step release — advance to _DONE so act() always re-explores
          # next call, whether or not the shape landed on target
          self.phase = _DONE
@@ -556,7 +556,7 @@ class OraclePolicy:
       """
       True when the committed shape has satisfied its local condition and
       the oracle should explore for the next shape to move.
-      conditions are checked only after grip has been released (_GRIP_OFF phase).
+      conditions are checked only after click has been released (_CLICK_OFF phase).
       """
       if self.committed_target is None:
          return True
@@ -564,16 +564,16 @@ class OraclePolicy:
       env  = self.env
       task = env.goal.get("task", "arrange_in_sequence")
 
-      # reach never grips so it stays in _NAVIGATE — check proximity directly
+      # reach never clicks so it stays in _NAVIGATE — check proximity directly
       if task == "reach":
          s    = env.shapes[shape_idx]
          dist = np.sqrt((env.cx - s.x) ** 2 + (env.cy - s.y) ** 2)
-         return dist <= GRIP_RADIUS
+         return dist <= CLICK_RADIUS
 
-      # don't interrupt mid-drag — only check once grip is fully released
-      if self.phase in (_NAVIGATE, _GRIP_ON, _DRAG):
+      # don't interrupt mid-drag — only check once click is fully released
+      if self.phase in (_NAVIGATE, _CLICK_ON, _DRAG):
          return False
-      # _GRIP_OFF: check whether the shape landed close enough to the target
+      # _CLICK_OFF: check whether the shape landed close enough to the target
       if self.committed_target is None:
          return True
 
@@ -582,7 +582,7 @@ class OraclePolicy:
       dist   = np.sqrt((s.x - tx) ** 2 + (s.y - ty) ** 2)
 
       if task == "touch":
-         # touch: complete after grip_off (grip activated over shape)
+         # touch: complete after click_off (click activated over shape)
          return True
 
       if task in ("arrange_in_sequence", "drag"):
@@ -640,7 +640,7 @@ def collect_demonstrations(
 
    dataset keys:
       "observations":  np.ndarray (N, obs_dim)
-      "actions":       np.ndarray (N, 3)   [dx, dy, grip]
+      "actions":       np.ndarray (N, 3)   [dx, dy, click]
       "tasks":         np.ndarray (N,)     task name per transition
       "hl_shape_idx":  np.ndarray (N,)     high-level: which shape was targeted
       "hl_target_x":   np.ndarray (N,)     high-level: target x in pixels

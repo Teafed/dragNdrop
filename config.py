@@ -98,9 +98,9 @@ N_ENVS             = 4     # parallel envs for PPO rollout collection
 # cursor physics
 # ---------------------------------------------------------------------------
 
-CURSOR_SPEED    = 15    # pixels per step — kept < GRIP_RADIUS (20) to prevent single-step overshoot
-GRIP_THRESHOLD  = 0.0   # action[2] > this -> holding = True
-GRIP_RADIUS     = 20    # pixels — cursor must be within this to attach to shape
+CURSOR_SPEED    = 15    # pixels per step — kept < CLICK_RADIUS (20) to prevent single-step overshoot
+CLICK_THRESHOLD = 0.0   # action[2] > this -> holding = True
+CLICK_RADIUS    = 20    # pixels — cursor must be within this to attach to shape
 
 # ---------------------------------------------------------------------------
 # obs and action size helpers
@@ -123,6 +123,6 @@ def get_obs_size() -> int:
 
 def get_action_size() -> int:
    """
-   cx + cy + grip = 3
+   cx + cy + click = 3
    """
    return 3

@@ -4,11 +4,11 @@ shape_env.py
 gymnasium environment for 2D shape manipulation via a cursor.
 
 --- action space ---
-   [dx, dy, grip]  all in [-1, 1]
+   [dx, dy, click]  all in [-1, 1]
    dx, dy:  cursor movement, scaled by CURSOR_SPEED pixels per step
-   grip:    > GRIP_THRESHOLD activates grip; cursor must be within
-            GRIP_RADIUS of a shape to actually grab it.
-            holding is True only when grip is active AND a shape is grabbed.
+   click:   > CLICK_THRESHOLD activates click; cursor must be within
+            CLICK_RADIUS of a shape to actually grab it.
+            holding is True only when click is active AND a shape is grabbed.
 
 --- observation space (428-dim) ---
    [0-3]    cursor state: cx_norm, cy_norm, holding, grabbed_idx_norm
@@ -22,9 +22,9 @@ gymnasium environment for 2D shape manipulation via a cursor.
 
 --- tasks ---
    starter:
-      reach        move cursor within GRIP_RADIUS of target shape
-      touch        activate grip while overlapping target shape
-      drag         grip shape and move into a target region
+      reach        move cursor within CLICK_RADIUS of target shape
+      touch        activate click while overlapping target shape
+      drag         click shape and move into a target region
 
    arrange:
       arrange_in_sequence  one target space, unbounded, ordered by attribute
@@ -42,7 +42,7 @@ gymnasium environment for 2D shape manipulation via a cursor.
    score_delta * REWARD_SCORE_SCALE     dense task progress signal
    wall_penalty                         cursor hit the canvas margin
    inactivity_penalty                   cursor barely moved
-   grip_bonus                           task-specific grip incentive
+   click_bonus                          task-specific click incentive
    STEP_PENALTY                         constant cost per step
    COMPLETION_BONUS (in step())         one-time terminal reward on solve
 """
@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from config import (
    MAX_SHAPES, OBS_VALUES_PER_SHAPE, get_obs_size, get_action_size,
    SHAPE_TYPES, N_SHAPE_TYPES, SHAPE_TYPE_IDX, CURSOR_SPEED,
-   GRIP_THRESHOLD, GRIP_RADIUS, EMBEDDING_DIM
+   CLICK_THRESHOLD, CLICK_RADIUS, EMBEDDING_DIM
 )
 
 # ---------------------------------------------------------------------------
@@ -118,8 +118,8 @@ class RewardConfig:
    wall              penalty when cursor tries to move but hits the margin
    step_penalty      constant cost per step (encourages efficiency)
    completion_bonus  one-time bonus added in step() when _is_solved() fires
-   grip_grab         bonus for gripping any valid target (touch/drag)
-   grip_on_target    additional bonus for gripping target within GRIP_RADIUS
+   click_grab        bonus for clicking any valid target (touch/drag)
+   click_on_target   additional bonus for clicking target within CLICK_RADIUS
                      (touch only — rewards the exact solved condition)
    """
    score_scale:      float = 10.0
@@ -127,8 +127,8 @@ class RewardConfig:
    wall:             float = -0.05
    step_penalty:     float = -0.02
    completion_bonus: float = 50.0
-   grip_grab:        float = 1.0
-   grip_on_target:   float = 2.0
+   click_grab:        float = 1.0
+   click_on_target:   float = 2.0
 
 
 
@@ -228,9 +228,9 @@ class ShapeEnv(gym.Env):
       # cursor state
       self.cx          = float(WINDOW_W / 2)
       self.cy          = float(WINDOW_H / 2)
-      self.grip        = False
-      self._prev_grip  = False
-      self.holding     = False  # True only when grip active AND shape grabbed
+      self.click       = False
+      self._prev_click = False
+      self.holding     = False  # True only when click active AND shape grabbed
       self.grabbed_idx = -1     # index into self.shapes, -1 = nothing grabbed
 
       # episode state
@@ -270,7 +270,7 @@ class ShapeEnv(gym.Env):
       self.steps    += 1
       prev_score     = self.prev_score
 
-      # TODO: rn only movement is factored into these, possibly include grip
+      # TODO: rn only movement is factored into these, possibly include click
       cursor_action, intended_action = self._apply_cursor_action(action)
 
       new_score  = self._compute_task_score()
@@ -295,7 +295,7 @@ class ShapeEnv(gym.Env):
       if self.render_mode == "human":
          self._render_frame()
 
-      self._prev_grip = self.grip
+      self._prev_click = self.click
       return obs, reward, terminated, truncated, info
 
    # TODO: in demo.py, can we use this instead of having the headless function?
@@ -315,15 +315,15 @@ class ShapeEnv(gym.Env):
 
    def _apply_cursor_action(self, action) -> tuple[float, float]:
       """
-      apply one action: move cursor, update grip/grab state, drag grabbed shape.
+      apply one action: move cursor, update click/grab state, drag grabbed shape.
       returns (cursor_action, intended_action) in pixels, used by reward.
 
-      holding is True only when grip action is active AND a shape is grabbed.
-      gripping air (grip active, no shape nearby) leaves holding=False.
+      holding is True only when click action is active AND a shape is grabbed.
+      clicking air (click active, no shape nearby) leaves holding=False.
       """
       dx_raw   = float(action[0])
       dy_raw   = float(action[1])
-      grip_raw = float(action[2])
+      click_raw = float(action[2])
 
       # move cursor
       new_cx = float(np.clip(
@@ -336,16 +336,16 @@ class ShapeEnv(gym.Env):
       self.cx = new_cx
       self.cy = new_cy
 
-      # grip logic
-      self.grip = grip_raw > GRIP_THRESHOLD
-      grip_edge = self.grip and not self._prev_grip   # True only on the frame grip activates
-      if grip_edge:
+      # click logic
+      self.click = click_raw > CLICK_THRESHOLD
+      click_edge = self.click and not self._prev_click   # True only on the frame click activates
+      if click_edge:
          self.grabbed_idx = self._try_grab()
-      elif not self.grip:
+      elif not self.click:
          self.grabbed_idx = -1
-         self.holding = self.grip and self.grabbed_idx >= 0
-         self._prev_grip = self.grip
-      self.holding = self.grip and self.grabbed_idx >= 0
+         self.holding = self.click and self.grabbed_idx >= 0
+         self._prev_click = self.click
+      self.holding = self.click and self.grabbed_idx >= 0
 
       # drag grabbed shape with cursor
       if self.holding:
@@ -357,7 +357,7 @@ class ShapeEnv(gym.Env):
 
    def _try_grab(self) -> int:
       """
-      attempt to grab the closest shape within GRIP_RADIUS of the cursor.
+      attempt to grab the closest shape within CLICK_RADIUS of the cursor.
       returns the shape index if found, else -1.
       if multiple shapes overlap, picks the closest (approximates topmost).
       """
@@ -365,7 +365,7 @@ class ShapeEnv(gym.Env):
       best_dist = float("inf")
       for i, s in enumerate(self.shapes):
          dist = np.sqrt((self.cx - s.x) ** 2 + (self.cy - s.y) ** 2)
-         if dist <= GRIP_RADIUS and dist < best_dist:
+         if dist <= CLICK_RADIUS and dist < best_dist:
             best_dist = dist
             best_idx  = i
       return best_idx
@@ -398,8 +398,8 @@ class ShapeEnv(gym.Env):
       score_reward = (new_score - prev_score) * self.rc.score_scale
       wall         = self._wall_penalty(cursor_action, intended_action)
       inactivity   = self.rc.inactivity if cursor_action < MOVEMENT_THRESHOLD else 0.0
-      grip         = self._grip_bonus(task)
-      return score_reward + wall + inactivity + grip + self.rc.step_penalty
+      click         = self._click_bonus(task)
+      return score_reward + wall + inactivity + click + self.rc.step_penalty
 
    def _wall_penalty(self, cursor_moved: float, intended_move: float) -> float:
       """penalise when the cursor tried to move but was stopped by the margin."""
@@ -407,27 +407,27 @@ class ShapeEnv(gym.Env):
          return self.rc.wall
       return 0.0
 
-   def _grip_bonus(self, task: str) -> float:
+   def _click_bonus(self, task: str) -> float:
       """
-      task-specific grip incentive.
+      task-specific click incentive.
 
-      touch / drag: reward gripping any valid target shape. for touch, add
-      an extra bonus when gripping while overlapping (the exact solved state),
+      touch / drag: reward clicking any valid target shape. for touch, add
+      an extra bonus when clicking while overlapping (the exact solved state),
       so the agent has a strong signal for the specific moment that matters.
 
-      arrangement tasks probably don't need grip bonuses, score delta already
+      arrangement tasks probably don't need click bonuses, score delta already
       captures shape movement progress continuously.
       """
       bonus = 0.0
       
-      # reward for attempting to grip
-      if not self._prev_grip and self.grip:
+      # reward for attempting to click
+      if not self._prev_click and self.click:
          # print("click!")
          s    = self.shapes[self._nearest_non_grabbed()]
          dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-         if dist > GRIP_RADIUS and dist < GRIP_RADIUS * 4:
+         if dist > CLICK_RADIUS and dist < CLICK_RADIUS * 4:
             bonus += 5.0
-         elif dist > GRIP_RADIUS * 4 and dist < GRIP_RADIUS * 8:
+         elif dist > CLICK_RADIUS * 4 and dist < CLICK_RADIUS * 8:
             bonus += 2.5
          else: bonus += 1.5
 
@@ -438,13 +438,13 @@ class ShapeEnv(gym.Env):
       if self.grabbed_idx not in self.target_indices:
          return bonus
       
-      bonus += self.rc.grip_grab
+      bonus += self.rc.click_grab
 
       if task == "touch":
          s    = self.shapes[self.grabbed_idx]
          dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-         if dist <= GRIP_RADIUS:
-            bonus += self.rc.grip_on_target
+         if dist <= CLICK_RADIUS:
+            bonus += self.rc.click_on_target
 
       return bonus
 
@@ -733,27 +733,27 @@ class ShapeEnv(gym.Env):
          return self._compute_task_score() >= SCORE_SOLVE_THRESHOLD
 
    def _solved_reach(self) -> bool:
-      """solved when cursor is within GRIP_RADIUS of any valid target."""
+      """solved when cursor is within CLICK_RADIUS of any valid target."""
       if not self.shapes:
          return False
       for idx in self.target_indices:
          s    = self.shapes[idx]
          dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-         if dist <= GRIP_RADIUS:
+         if dist <= CLICK_RADIUS:
             return True
       return False
 
    def _solved_touch(self) -> bool:
       # TODO: maybe make this solved once released after holding?
       # TODO: maybe consider time held? might be new task, where must be holding for some amount of time
-      """solved when gripping any valid target within GRIP_RADIUS."""
+      """solved when clicking any valid target within CLICK_RADIUS."""
       if not self.shapes or not self.holding:
          return False
       if self.grabbed_idx not in self.target_indices:
          return False
       s    = self.shapes[self.grabbed_idx]
       dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-      return dist <= GRIP_RADIUS
+      return dist <= CLICK_RADIUS
 
    def _solved_drag(self) -> bool:
       """solved when any valid target shape is inside the goal region."""
@@ -774,19 +774,19 @@ class ShapeEnv(gym.Env):
    def _score_reach(self) -> float:
       """
       two-zone proximity score toward the nearest valid target.
-      zone 1 (far):  0.0 -> 0.7  as dist shrinks from ref_dist to 2*GRIP_RADIUS
-      zone 2 (near): 0.7 -> 1.0  as dist shrinks from 2*GRIP_RADIUS to 0
+      zone 1 (far):  0.0 -> 0.7  as dist shrinks from ref_dist to 2*CLICK_RADIUS
+      zone 2 (near): 0.7 -> 1.0  as dist shrinks from 2*CLICK_RADIUS to 0
       returns max score across all valid targets.
       """
       if not self.shapes:
          return 0.0
       best = 0.0
       ref_dist    = WINDOW_W / 2.0
-      near_thresh = GRIP_RADIUS * 2.0
+      near_thresh = CLICK_RADIUS * 2.0
       for idx in self.target_indices:
          s    = self.shapes[idx]
          dist = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
-         if dist <= GRIP_RADIUS:
+         if dist <= CLICK_RADIUS:
             return 1.0
          if dist <= near_thresh:
             t    = (near_thresh - dist) / near_thresh
@@ -798,28 +798,28 @@ class ShapeEnv(gym.Env):
 
    def _score_touch(self) -> float:
       """
-      proximity score capped low (0.39) when not gripping, so hovering near
-      the shape is not a competitive strategy vs actually gripping.
-      returns 1.0 only when gripping a valid target within GRIP_RADIUS.
-      returns 0.1 when gripping something but not on a valid target.
+      proximity score capped low (0.39) when not clicking, so hovering near
+      the shape is not a competitive strategy vs actually clicking.
+      returns 1.0 only when clicking a valid target within CLICK_RADIUS.
+      returns 0.1 when clicking something but not on a valid target.
       evaluates against nearest valid target.
       """
       if not self.shapes:
          return 0.0
 
-      # gripping a valid target; check proximity
+      # clicking a valid target; check proximity
       # TODO: do we need to check proximity? should already be at cursor
       if self.holding and self.grabbed_idx in self.target_indices:
          return 1.0
 
-      # gripping something invalid
+      # clicking something invalid
       if self.holding:
          return 0.1
 
-      # not gripping; low-cap proximity toward nearest valid target
+      # not clicking; low-cap proximity toward nearest valid target
       # TODO: experiment with different scoring here or maybe even none
       ref_dist    = WINDOW_W / 2.0
-      near_thresh = GRIP_RADIUS * 2.0
+      near_thresh = CLICK_RADIUS * 2.0
       best        = 0.0
       for idx in self.target_indices:
          s    = self.shapes[idx]
@@ -837,7 +837,7 @@ class ShapeEnv(gym.Env):
       """
       two-phase score:
         phase 1 (not holding target): cursor proximity to nearest valid target,
-          capped at 0.49 so gripping always produces a positive delta.
+          capped at 0.49 so clicking always produces a positive delta.
         phase 2 (holding valid target): region progress score in [0.5, 1.0].
       """
       # TODO: experiment with different scoring here. maybe phase gap at 0.25?
@@ -855,7 +855,7 @@ class ShapeEnv(gym.Env):
 
       # phase 1: not holding; proximity toward nearest valid target
       ref_dist    = WINDOW_W / 2.0
-      near_thresh = GRIP_RADIUS * 2.0
+      near_thresh = CLICK_RADIUS * 2.0
       best        = 0.0
       for idx in self.target_indices:
          s    = self.shapes[idx]
@@ -1067,7 +1067,7 @@ class ShapeEnv(gym.Env):
       arm = _CURSOR_ARM
       col = _CURSOR_COLOR
 
-      if self.grip:
+      if self.click:
          pygame.draw.circle(self.window, col, (cx, cy), r)
       else:
          pygame.draw.circle(self.window, col, (cx, cy), r, 1)

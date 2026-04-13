@@ -411,7 +411,7 @@ def run_demo(model_path, prompt, use_random, multi_task,
       agent_label = "HUMAN"
       print("running in human control mode")
       print("  mouse:          move cursor toward pointer")
-      print("  left click:     grip / release")
+      print("  left click:     click / release")
       print("  Q / N / SPC / D work as normal")
    else:
       try:
@@ -452,7 +452,7 @@ def run_demo(model_path, prompt, use_random, multi_task,
 
    print(f"\nepisode {episode} — {cur_prompt}")
    if use_human:
-      print("mouse to move  left-click to grip  "
+      print("mouse to move  left-click to click  "
             "Q quit  N next  SPC pause  D dump  Shift+D summary\n")
    else:
       print("Q quit  N next  SPC pause  S step  D dump  Shift+D summary\n")
@@ -512,7 +512,7 @@ def run_demo(model_path, prompt, use_random, multi_task,
             # compute action from mouse position and left button state.
             # dx/dy: unit vector from cursor toward mouse, scaled to [-1,1].
             # dead zone prevents jitter when mouse is close to cursor.
-            # grip: left mouse button held down.
+            # click: left mouse button held down.
             mx, my    = pygame.mouse.get_pos()
             btn       = pygame.mouse.get_pressed()
             ddx       = mx - env.cx
@@ -524,8 +524,8 @@ def run_demo(model_path, prompt, use_random, multi_task,
             else:
                dx_act = 0.0
                dy_act = 0.0
-            grip_act = 1.0 if btn[0] else -1.0
-            action   = np.array([dx_act, dy_act, grip_act], dtype=np.float32)
+            click_act = 1.0 if btn[0] else -1.0
+            action   = np.array([dx_act, dy_act, click_act], dtype=np.float32)
          elif use_oracle:
             action = oracle.act(obs)
          elif model is not None:
@@ -615,7 +615,7 @@ if __name__ == "__main__":
    )
    parser.add_argument(
       "--human", action="store_true",
-      help="control the cursor yourself with mouse (left click = grip)",
+      help="control the cursor yourself with mouse (left click = click)",
    )
    parser.add_argument(
       "--random", action="store_true",

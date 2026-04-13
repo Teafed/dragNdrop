@@ -133,7 +133,7 @@ llm_goal_parser.parse_goal()
     v
 ShapeEnv (Gymnasium)
     |   observation : 428-dim (cursor state + shape features + goal embedding)
-    |   action      : [dx, dy, grip]  all in [-1, 1]
+    |   action      : [dx, dy, click]  all in [-1, 1]
     |   reward      : score delta + step penalty + completion bonus
     |
     v
@@ -141,7 +141,7 @@ BicameralPolicy (PPO)
     |-- left encoder   : obs[0:44]   -- cursor-local stream
     |-- right encoder  : obs[14:428] -- scene-global stream
     |-- cross-attention: right queries left (global reads cursor state)
-    +-- action head    : concat(left, right) -> [dx, dy, grip]
+    +-- action head    : concat(left, right) -> [dx, dy, click]
 ```
 
 ---
@@ -168,11 +168,11 @@ overlap on [14-43] is intentional.
 ## action space
 
 ```
-[dx, dy, grip]   all continuous in [-1, 1]
+[dx, dy, click]   all continuous in [-1, 1]
 
 dx, dy:   cursor displacement this step, scaled by CURSOR_SPEED (15px)
-grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
-          <= GRIP_THRESHOLD      -> release held shape
+click:     > CLICK_THRESHOLD (0.0) -> grab nearest shape within CLICK_RADIUS (20px)
+          <= CLICK_THRESHOLD      -> release held shape
 ```
 
 ---
@@ -181,9 +181,9 @@ grip:     > GRIP_THRESHOLD (0.0) -> grab nearest shape within GRIP_RADIUS (20px)
 
 | task   | description                             | example prompt                   |
 |--------|-----------------------------------------|----------------------------------|
-| reach  | move cursor within grip radius of shape | "move the cursor to the shape"   |
-| touch  | activate grip while overlapping shape   | "click on the shape"             |
-| drag   | grip and drag shape into a target region| "drag the shape to the left side"|
+| reach  | move cursor within click radius of shape | "move the cursor to the shape"   |
+| touch  | activate click while overlapping shape   | "click on the shape"             |
+| drag   | click and drag shape into a target region| "drag the shape to the left side"|
 
 ### disabled tasks (wave 3 — re-enable once starter tasks solve)
 
@@ -241,7 +241,7 @@ Training from scratch is slow because the agent must simultaneously discover
 cursor mechanics and task semantics. The oracle warm-start decouples these:
 
 1. **oracle** — scripted policy using navigate-then-drag sub-phases:
-   navigate → grip_on → drag → grip_off. solves all tasks analytically.
+   navigate → click_on → drag → click_off. solves all tasks analytically.
    demos saved to `logs/oracle_demos.npz` and reused across runs.
 
 2. **behavior cloning** — supervised imitation of oracle demos trains the
@@ -261,14 +261,14 @@ step reward  = score_delta x 10.0
              + STEP_PENALTY        (-0.02 per step)
              + inactivity_penalty  (-0.10 when cursor barely moves)
              + wall_penalty        (-0.05 when cursor hits margin)
-             + grip_bonus          (+0.10 when holding target, touch/drag only)
+             + click_bonus         (+0.10 when holding target, touch/drag only)
              + COMPLETION_BONUS    (+50.0 on solve)
 ```
 
 Score functions per task:
-- **reach**: two-zone proximity to target — continuous gradient from half-canvas distance all the way into GRIP_RADIUS.
+- **reach**: two-zone proximity to target — continuous gradient from half-canvas distance all the way into CLICK_RADIUS.
 - **touch**: same two-zone proximity as reach, jumps to 1.0 only when holding AND overlapping.
-- **drag**: phase 1 = cursor proximity to shape (guides navigation + grip); phase 2 = shape proximity to region boundary (guides dragging).
+- **drag**: phase 1 = cursor proximity to shape (guides navigation + click); phase 2 = shape proximity to region boundary (guides dragging).
 
 ---
 
@@ -276,11 +276,11 @@ Score functions per task:
 
 The oracle uses a navigate-then-drag loop per task:
 
-- **reach**: navigate cursor until within GRIP_RADIUS of target. No grip needed.
-- **touch**: navigate to target, activate grip (GRIP_ON phase), release.
-- **drag**: navigate to target, grip, drag to a point 30–120px past the region boundary, release.
+- **reach**: navigate cursor until within CLICK_RADIUS of target. No click needed.
+- **touch**: navigate to target, activate click (CLICK_ON phase), release.
+- **drag**: navigate to target, click, drag to a point 30–120px past the region boundary, release.
 
-Sub-phases per committed shape: `NAVIGATE → GRIP_ON → DRAG → GRIP_OFF → DONE`.
+Sub-phases per committed shape: `NAVIGATE → CLICK_ON → DRAG → CLICK_OFF → DONE`.
 
 ---
 
@@ -290,7 +290,7 @@ Sub-phases per committed shape: `NAVIGATE → GRIP_ON → DRAG → GRIP_OFF → 
 Two extra rings are drawn around the target:
 
 - **yellow ring** — visual highlight of the target shape
-- **blue ring** — exact `GRIP_RADIUS` boundary (cursor centre must enter this to score 1.0)
+- **blue ring** — exact `CLICK_RADIUS` boundary (cursor centre must enter this to score 1.0)
 
 The HUD shows `dist_px` (raw pixel distance), `score` (0–1), `holding`, and
 oracle `phase` every frame — the key signals for diagnosing whether the agent
