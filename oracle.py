@@ -671,7 +671,7 @@ def collect_demonstrations(
          lo, hi = n_shapes_range
          n_shp = int(rng.integers(lo, hi + 1))
       else:
-         n_shp = int(rng.integers(2, MAX_SHAPES + 1))
+         n_shp = 1;
 
       env    = ShapeEnv(n_shapes=n_shp, goal=goal)
       oracle = OraclePolicy(env, noise_std=noise_std, rng=rng)

@@ -1,0 +1,11 @@
+{
+   "move_cardinal": 1.0,
+   "move_diagonal": 1.0,
+   "approach": 1.0,
+   "click_at": 1.0,
+   "hold_at": 1.0,
+   "reach": 1.0,
+   "touch": 1.0,
+   "drag": 1.0,
+   "overall": 1.0
+}
