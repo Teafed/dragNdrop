@@ -311,6 +311,18 @@ class ShapeEnv(gym.Env):
       self.cy = new_cy
 
       self.grip      = grip_raw > GRIP_THRESHOLD
+
+      # grip assist: force grip on when cursor is within GRIP_RADIUS of the
+      # target shape for touch/drag tasks. this removes grip-timing as a
+      # failure mode while still training the agent to navigate correctly.
+      # only fires for real (non-phantom) shapes so click_at/hold_at are unaffected.
+      task = self.goal.get("task", "none")
+      if task in ("touch", "drag") and self.shapes and not self.shapes[0].phantom:
+         s    = self.shapes[0]
+         dist = np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2)
+         if dist <= GRIP_RADIUS:
+            self.grip = True
+
       grip_edge      = self.grip and not self._prev_grip
 
       if grip_edge:
@@ -383,7 +395,17 @@ class ShapeEnv(gym.Env):
                        cursor_action, intended_action, task) -> float:
       score_reward = (new_score - prev_score) * self.rc.score_scale
       wall         = self._wall_penalty(cursor_action, intended_action)
-      inactivity   = self.rc.inactivity if cursor_action < MOVEMENT_THRESHOLD else 0.0
+      # suppress inactivity penalty when cursor is already on top of the target
+      # — otherwise the agent jitters to avoid the penalty instead of gripping.
+      near_target = False
+      if task in ("touch", "drag", "reach") and self.shapes and not self.shapes[0].phantom:
+         s = self.shapes[0]
+         near_target = np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2) <= GRIP_RADIUS * 1.5
+      elif task in ("click_at", "hold_at"):
+         near_target = self._in_zone()
+      inactivity = (0.0 if near_target
+                    else self.rc.inactivity if cursor_action < MOVEMENT_THRESHOLD
+                    else 0.0)
       grip         = self._grip_bonus(task)
       return score_reward + wall + inactivity + grip + self.rc.step_penalty
 
@@ -440,6 +462,11 @@ class ShapeEnv(gym.Env):
       bonus += self.rc.grip_grab
       if task == "touch" and not self._prev_grip:
          bonus += self.rc.grip_on_target
+      # continuous per-step bonus while holding the target shape —
+      # gives the agent sustained signal to keep grip active rather than
+      # releasing immediately after the rising-edge bonus fires.
+      if task == "touch":
+         bonus += 0.5   # +0.5/step while gripping = 25x stronger than step penalty
 
       return bonus
 
@@ -747,11 +774,14 @@ class ShapeEnv(gym.Env):
       dist        = float(np.sqrt((self.cx - s.x)**2 + (self.cy - s.y)**2))
       ref_dist    = WINDOW_W / 2.0
       near_thresh = GRIP_RADIUS * 2.0
+      # proximity floor raised to 0.6 — same gradient as reach so the agent
+      # gets strong signal to navigate before worrying about grip timing.
+      # gripping (score=1.0) is always strictly better than hovering (max 0.69).
       if dist <= near_thresh:
          t = (near_thresh - dist) / near_thresh
-         return 0.3 + 0.09 * t
+         return 0.6 + 0.09 * t   # [0.60, 0.69] inside near zone
       t = 1.0 - min((dist - near_thresh) / (ref_dist - near_thresh), 1.0)
-      return float(0.3 * t)
+      return float(0.6 * t)      # [0.0, 0.60] outside near zone
 
    def _score_drag(self) -> float:
       if not self.shapes or self.shapes[0].phantom:
