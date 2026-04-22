@@ -1,6 +1,8 @@
 {
    "n_shapes": 1,
    "tasks": [
+      "reach",
+      "touch",
       "drag"
    ]
 }

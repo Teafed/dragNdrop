@@ -94,7 +94,7 @@ _CURSOR_GAP    = 4
 _CURSOR_ARM    = 8
 _CURSOR_COLOR  = (220, 220, 220)
 
-# phantom zone render colour (dim white ring)
+# phantom zone render color (dim white ring)
 _ZONE_COLOR    = (180, 180, 180)
 
 
@@ -236,9 +236,6 @@ class ShapeEnv(gym.Env):
       self.grip        = False
       self._hold_steps = 0
       self.steps       = 0
-
-      self.cx = float(WINDOW_W / 2)
-      self.cy = float(WINDOW_H / 2)
 
       self.shapes         = self._spawn_shapes()
       self.target_indices = [0]
@@ -803,19 +800,34 @@ class ShapeEnv(gym.Env):
       return float(0.4 * t)
 
    def _per_shape_region_score(self, s, region: str) -> float:
-      boundary = REGION_INNER[region]
+      """
+      returns [0, 1] score for how well shape s fits in the target region.
+      0.7 weight for being inside the boundary, 0.3 for distance progress.
+   
+      if self.goal contains 'drag_region_scale', the boundary is widened by
+      that factor (< 1.0 = easier, > 1.0 = harder). default 1.0.
+      """
+      scale = float(self.goal.get("drag_region_scale", 1.0))
+      base  = REGION_INNER[region]
+   
+      # widen toward the opposite edge: scale=0.7 moves left-boundary 30% toward right
       if region == "left":
+         boundary = base + (WINDOW_W - base) * (1.0 - scale)
          inside   = s.x <= boundary
          progress = 1.0 - max(s.x - boundary, 0) / max(WINDOW_W - boundary, 1)
       elif region == "right":
+         boundary = base - base * (1.0 - scale)
          inside   = s.x >= boundary
          progress = 1.0 - max(boundary - s.x, 0) / max(boundary, 1)
       elif region == "top":
+         boundary = base + (WINDOW_H - base) * (1.0 - scale)
          inside   = s.y <= boundary
          progress = 1.0 - max(s.y - boundary, 0) / max(WINDOW_H - boundary, 1)
-      else:
+      else:   # bottom
+         boundary = base - base * (1.0 - scale)
          inside   = s.y >= boundary
          progress = 1.0 - max(boundary - s.y, 0) / max(boundary, 1)
+   
       return 0.7 * float(inside) + 0.3 * float(np.clip(progress, 0.0, 1.0))
 
    # -------------------------------------------------------------------------

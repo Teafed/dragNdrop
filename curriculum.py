@@ -100,14 +100,14 @@ _STAGES = [
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "touch",
-      "gate_sr":      0.65,
+      "gate_sr":      0.97,
       "step_ceiling": 500_000,
    },
 
    # --- drag progression ---
    {
-      "name":         "shadow drag — large region",
-      "tasks":        ["drag"],
+      "name":         "shadow drag — multi-task",
+      "tasks":        ["reach", "touch", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "drag",

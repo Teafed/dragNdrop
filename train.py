@@ -26,6 +26,50 @@ from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCall
 from config import N_ENVS, SUPPORTED_TASKS
 from prompt_gen import PromptGenerator
 
+import json
+from stable_baselines3.common.callbacks import EvalCallback
+
+class PersistentEvalCallback(EvalCallback):
+   """
+   EvalCallback that persists best_mean_reward across resume runs.
+
+   on construction, reads the saved value from <save_path>/best_reward.json
+   if it exists. on every eval that finds a new best, writes the updated
+   value back to the same file.
+
+   without this, EvalCallback initializes best_mean_reward=-inf on every
+   fresh construction, so the first eval after resume always beats it and
+   overwrites best_model.zip — even if that eval's reward is worse than
+   what produced the previous best_model.
+   """
+
+   def __init__(self, *args, reward_save_path: str = None, **kwargs):
+      super().__init__(*args, **kwargs)
+      self._reward_file = (
+         os.path.join(reward_save_path, "best_reward.json")
+         if reward_save_path else None
+      )
+      if self._reward_file and os.path.exists(self._reward_file):
+         try:
+            with open(self._reward_file) as f:
+               data = json.load(f)
+            self.best_mean_reward = float(data["best_mean_reward"])
+            print(f"  [eval] loaded best_mean_reward={self.best_mean_reward:.2f} "
+                  f"from {self._reward_file}")
+         except Exception as e:
+            print(f"  [eval] could not load previous best_mean_reward: {e}")
+
+   def _on_step(self) -> bool:
+      prev_best = self.best_mean_reward
+      result    = super()._on_step()
+      # if parent updated the best, persist the new value
+      if self.best_mean_reward > prev_best and self._reward_file:
+         try:
+            with open(self._reward_file, "w") as f:
+               json.dump({"best_mean_reward": self.best_mean_reward}, f)
+         except Exception as e:
+            print(f"  [eval] could not save best_mean_reward: {e}")
+      return result
 
 # ---------------------------------------------------------------------------
 # env config
@@ -45,18 +89,62 @@ def _save_env_config(save_path: str, curriculum):
 # env factory
 # ---------------------------------------------------------------------------
 
+import gymnasium as gym
+
+class GoalResamplingWrapper(gym.Wrapper):
+   """
+   resample prompt, goal, and embedding on every reset().
+
+   without this wrapper, vec_env workers are constructed once (with one
+   prompt) and never see variation for the entire training run, which
+   prevents the goal-conditioning from being trained meaningfully.
+
+   also applies curriculum.drag_region_scale to widen the target region
+   for shadow-drag stages. the scale is stored on env.goal so
+   _per_shape_region_score can read it.
+   """
+
+   def __init__(self, env, curriculum=None, prompt_gen=None):
+      super().__init__(env)
+      self.curriculum = curriculum
+      self.prompt_gen = prompt_gen or PromptGenerator()
+
+   def reset(self, **kwargs):
+      if self.curriculum is not None:
+         prompt = self.curriculum.sample_prompt()
+         scale  = self.curriculum.drag_region_scale
+      else:
+         prompt = self.prompt_gen.sample()
+         scale  = 1.0
+      goal = parse_goal(prompt)
+      emb  = get_embedding(prompt)
+
+      # propagate drag_region_scale via the goal dict so the env can read it
+      goal["drag_region_scale"] = scale
+
+      self.env.goal = goal
+      self.env._goal_embedding = emb[:].astype("float32")
+      return self.env.reset(**kwargs)
+
+
 def make_goal_conditioned_env(curriculum=None):
+   """
+   factory builds one ShapeEnv per worker, wrapped with GoalResamplingWrapper
+   so each reset() draws a fresh prompt/goal/embedding. the inner ShapeEnv
+   is constructed with a placeholder prompt that gets immediately replaced
+   on the first reset() call.
+   """
    _gen = PromptGenerator()
 
    def _init():
-      if curriculum is not None:
-         prompt = curriculum.sample_prompt()
-      else:
-         prompt = _gen.sample()
+      # placeholder — wrapper replaces on first reset()
+      prompt = _gen.sample() if curriculum is None else curriculum.sample_prompt()
       goal    = parse_goal(prompt)
       raw_emb = get_embedding(prompt)
       env     = ShapeEnv(n_shapes=1, goal=goal, goal_embedding=raw_emb)
-      return Monitor(env)
+      wrapped = GoalResamplingWrapper(env, curriculum=curriculum,
+                                      prompt_gen=_gen)
+      return Monitor(wrapped)
 
    return _init
 
@@ -75,9 +163,10 @@ def build_callbacks(save_path: str, n_envs: int,
       raw_emb = get_embedding(prompt)
       return Monitor(ShapeEnv(n_shapes=1, goal=goal, goal_embedding=raw_emb))
 
-   eval_callback = EvalCallback(
+   eval_callback = PersistentEvalCallback(
       _make_static_eval_env(),
       best_model_save_path=save_path,
+      reward_save_path=save_path,   # new — where to persist best_mean_reward
       log_path="./logs/",
       eval_freq=max(5000 // n_envs, 1),
       n_eval_episodes=50,
@@ -188,6 +277,9 @@ def train(
    if resume_model is not None:
       print(f"\n--- resuming from checkpoint: {resume_model} ---")
       model = PPO.load(resume_model, env=vec_env)
+      model.learning_rate = 1e-5
+      model.clip_range    = lambda _: 0.1
+      print(f"  [resume] lr={model.learning_rate}  clip_range=0.1 (stable mode)")
    elif bc_network is not None:
       print("\n--- initialising PPO from BC weights ---")
       model = build_ppo_from_bc(
