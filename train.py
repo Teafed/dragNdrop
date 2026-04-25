@@ -19,10 +19,11 @@ from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv
+import gymnasium as gym
 
 from shape_env import ShapeEnv
 from llm_goal_parser import parse_goal, get_embedding
-from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCallback
+from callbacks import ShapeTaskCallback, CurriculumCallback, TrainingSummaryCallback, StopOnSignalCallback
 from config import N_ENVS, SUPPORTED_TASKS
 from prompt_gen import PromptGenerator
 
@@ -71,6 +72,61 @@ class PersistentEvalCallback(EvalCallback):
             print(f"  [eval] could not save best_mean_reward: {e}")
       return result
 
+def _reset_best_reward_file(save_path: str):
+   """
+   delete <save_path>/best_reward.json so PersistentEvalCallback starts
+   fresh. called when training is not resuming from a checkpoint.
+   """
+   reward_file = os.path.join(save_path, "best_reward.json")
+   if os.path.exists(reward_file):
+      try:
+         os.remove(reward_file)
+         print(f"[train] reset best_reward tracking (removed {reward_file})")
+      except Exception as e:
+         print(f"[train] could not remove {reward_file}: {e}")
+
+def _load_ppo_with_new_params(path: str, vec_env):
+   """
+   load a PPO model allowing extra parameters in the CURRENT policy
+   definition that weren't in the saved checkpoint. used when adding
+   new modules (like region_head) to an existing policy architecture.
+   """
+   from bc_train import BicameralPolicy
+   # PPO.load needs a model instance to inherit args from — build a
+   # fresh model with matching config, then selectively load old weights
+   print(f"  [load] loading {path} with new architecture (strict=False)")
+   model = PPO(
+      BicameralPolicy, vec_env,
+      learning_rate=1e-5,
+      n_steps=2048,
+      batch_size=512,
+      n_epochs=10,
+      gamma=0.99,
+      gae_lambda=0.95,
+      clip_range=0.1,
+      ent_coef=0.1,
+      verbose=0,
+      tensorboard_log="./logs/tensorboard/",
+   )
+
+   # load saved state dict with strict=False so missing region_head
+   # params keep their fresh init
+   import zipfile
+   import io
+   import torch
+   with zipfile.ZipFile(path + ".zip" if not path.endswith(".zip") else path) as z:
+      with z.open("policy.pth") as f:
+         saved_state = torch.load(io.BytesIO(f.read()), map_location="cpu",
+                                  weights_only=False)
+   missing, unexpected = model.policy.load_state_dict(saved_state, strict=False)
+   print(f"  [load] missing keys (fresh-init): {len(missing)}")
+   for k in missing:
+      print(f"           {k}")
+   if unexpected:
+      print(f"  [load] unexpected keys (ignored): {len(unexpected)}")
+   return model
+
+
 # ---------------------------------------------------------------------------
 # env config
 # ---------------------------------------------------------------------------
@@ -88,8 +144,6 @@ def _save_env_config(save_path: str, curriculum):
 # ---------------------------------------------------------------------------
 # env factory
 # ---------------------------------------------------------------------------
-
-import gymnasium as gym
 
 class GoalResamplingWrapper(gym.Wrapper):
    """
@@ -223,6 +277,8 @@ def train(
       print("\n[curriculum] disabled")
 
    _save_env_config(save_path, curriculum)
+   if resume_model is None:
+      _reset_best_reward_file(save_path)
 
    # --- phase 0: prompt pretraining ---
    # auto-retrains if N_TASKS changed (handled inside train_prompt)
@@ -240,7 +296,7 @@ def train(
          "approach":      1.0,
          "reach":         1.0,
          "touch":         2.0,
-         "drag":          1.5,
+         "drag":          2.5,
       }
 
       dataset = collect_demonstrations(
@@ -276,10 +332,21 @@ def train(
    # --- build PPO ---
    if resume_model is not None:
       print(f"\n--- resuming from checkpoint: {resume_model} ---")
-      model = PPO.load(resume_model, env=vec_env)
-      model.learning_rate = 1e-5
-      model.clip_range    = lambda _: 0.1
+      model = _load_ppo_with_new_params(resume_model, vec_env)
+
+      frozen_count = trainable_count = 0
+      for name, param in model.policy.named_parameters():
+         is_region_head = "region_head" in name
+         is_action_net  = name.startswith("action_net")
+         if is_region_head or is_action_net:
+            param.requires_grad = True
+            trainable_count += param.numel()
+         else:
+            param.requires_grad = False
+            frozen_count += param.numel()
       print(f"  [resume] lr={model.learning_rate}  clip_range=0.1 (stable mode)")
+      print(f"  [freeze] trainable params: {trainable_count:,}  "
+            f"frozen params: {frozen_count:,}")
    elif bc_network is not None:
       print("\n--- initialising PPO from BC weights ---")
       model = build_ppo_from_bc(
@@ -298,13 +365,24 @@ def train(
 
    callbacks = build_callbacks(save_path, n_envs, curriculum)
 
-   print(f"\n--- training PPO for {timesteps:,} timesteps ---\n")
-   model.learn(total_timesteps=timesteps, callback=callbacks)
+   if hasattr(callbacks, "callbacks"):
+      callbacks.callbacks.insert(0, StopOnSignalCallback(verbose=1))
+   else:
+      from stable_baselines3.common.callbacks import CallbackList
+      callbacks = CallbackList([StopOnSignalCallback(verbose=1), callbacks])
 
+   print(f"\n--- training PPO for {timesteps:,} timesteps ---\n")
    final_path = os.path.join(save_path, "final_model")
-   model.save(final_path)
-   _save_env_config(save_path, curriculum)
-   print(f"\n--- done. model saved to {final_path} ---")
+   try:
+      model.learn(total_timesteps=timesteps, callback=callbacks)
+      print(f"\n--- training complete ---")
+   except KeyboardInterrupt:
+      print(f"\n--- training interrupted (force-quit) ---")
+   finally:
+      model.save(final_path)
+      _save_env_config(save_path, curriculum)
+      print(f"--- final_model saved to {final_path} ---")
+
    return model
 
 

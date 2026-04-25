@@ -71,32 +71,35 @@ _STAGES = [
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "approach",
-      "gate_sr":      0.70,    # was 0.80 — one lucky eval was advancing too fast
+      "gate_sr":      0.70,
       "step_ceiling": 200_000,
    },
 
    # --- starter tasks ---
    {
-      "name":         "reach — 1 shape",
-      "tasks":        ["reach"],
+      "name":         "reach — 1 shape + drag exposure",
+      "tasks":        ["reach", "drag"],
+      "task_weights": {"reach": 0.8, "drag": 0.2},
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "reach",
       "gate_sr":      0.80,
-      "step_ceiling": 350_000,  # was 220k — needs much more room to recover
+      "step_ceiling": 350_000,
    },
    {
-      "name":         "touch — 1 shape",
-      "tasks":        ["touch"],
+      "name":         "touch — 1 shape + drag exposure",
+      "tasks":        ["touch", "drag"],
+      "task_weights": {"touch": 0.8, "drag": 0.2},
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "touch",
-      "gate_sr":      0.65,    # was 0.70 — slightly more permissive
+      "gate_sr":      0.80,
       "step_ceiling": 400_000,
    },
    {
-      "name":         "reach and touch — 1 shape",
-      "tasks":        ["reach", "touch"],
+      "name":         "reach and touch + drag exposure",
+      "tasks":        ["reach", "touch", "drag"],
+      "task_weights": {"reach": 0.4, "touch": 0.4, "drag": 0.2},
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "touch",
@@ -107,7 +110,7 @@ _STAGES = [
    # --- drag progression ---
    {
       "name":         "shadow drag — multi-task",
-      "tasks":        ["reach", "touch", "drag"],
+      "tasks":        ["touch", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "drag",
@@ -116,22 +119,13 @@ _STAGES = [
       "drag_region_scale": 0.70,   # target region covers 70% of canvas
    },
    {
-      "name":         "drag — 1 shape",
-      "tasks":        ["drag"],
+      "name":         "drag — multi-task",
+      "tasks":        ["reach", "touch", "drag"],
       "n_shapes_min": 1,
       "n_shapes_max": 1,
       "gate_task":    "drag",
-      "gate_sr":      0.60,
+      "gate_sr":      0.98,
       "step_ceiling": 570_000,
-   },
-   {
-      "name":         "reach and drag — 1 shape",
-      "tasks":        ["reach", "drag"],
-      "n_shapes_min": 1,
-      "n_shapes_max": 1,
-      "gate_task":    "drag",
-      "gate_sr":      0.60,
-      "step_ceiling": 660_000,
    },
    {
       "name":         "reach, touch and drag — 1 shape (final)",
@@ -187,7 +181,13 @@ class CurriculumManager:
 
    def sample_prompt(self) -> str:
       from prompt_gen import sample_prompt
-      task = random.choice(self.active_tasks)
+      weights = self.stage.get("task_weights")
+      if weights:
+         tasks  = list(weights.keys())
+         probs  = [weights[t] for t in tasks]
+         task   = random.choices(tasks, weights=probs, k=1)[0]
+      else:
+         task = random.choice(self.active_tasks)
       return sample_prompt(task)
 
    def sample_n_shapes(self, rng=None) -> int:

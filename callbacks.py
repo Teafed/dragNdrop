@@ -23,6 +23,7 @@ CurriculumCallback:
 
 import os
 import random
+import signal
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -329,3 +330,45 @@ class TrainingSummaryCallback(BaseCallback):
                f"avg_steps={steps:.0f}")
 
       print("=" * 60)
+
+class StopOnSignalCallback(BaseCallback):
+   """
+   stops model.learn() cleanly when SIGINT (ctrl-C) is received.
+
+   installs a signal handler on construction. the first ctrl-C flips
+   a flag that causes _on_step to return False on its next call,
+   which CallbackList propagates up to PPO.learn() and exits the
+   training loop normally. learn() then returns and the caller can
+   save the model.
+
+   a SECOND ctrl-C restores the default SIGINT handler so the user
+   can still force-quit if they change their mind or the flag doesn't
+   take effect quickly enough.
+   """
+
+   def __init__(self, verbose: int = 1):
+      super().__init__(verbose)
+      self._stop_requested = False
+      self._prev_handler   = None
+
+   def _on_training_start(self) -> None:
+      self._prev_handler = signal.signal(signal.SIGINT, self._handle_sigint)
+
+   def _on_training_end(self) -> None:
+      # restore the original SIGINT handler so later ctrl-C behaves normally
+      if self._prev_handler is not None:
+         signal.signal(signal.SIGINT, self._prev_handler)
+
+   def _handle_sigint(self, signum, frame):
+      if self._stop_requested:
+         # second ctrl-C — restore default and re-raise
+         signal.signal(signal.SIGINT, self._prev_handler or signal.SIG_DFL)
+         print("\n[stop-on-signal] second ctrl-C — force-quitting.")
+         raise KeyboardInterrupt
+      self._stop_requested = True
+      print(f"\n[stop-on-signal] ctrl-C received at step "
+            f"{self.num_timesteps:,}. stopping at next callback tick...")
+
+   def _on_step(self) -> bool:
+      # returning False here propagates through CallbackList and stops learn()
+      return not self._stop_requested

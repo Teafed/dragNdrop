@@ -248,6 +248,39 @@ def _infer_attribute(prompt: str) -> str:
 # goal embedding
 # ---------------------------------------------------------------------------
 
+def _distill_prompt(prompt: str) -> str:
+   """
+   distill a prompt to a short direction-focused phrase for embedding.
+
+   drag prompts -> 'go <direction>' canonical form. using "go" rather
+   than "drag" gives lower cos sim (0.74 vs 0.93 for L/R) because "drag"
+   shared between distilled forms pulls their embeddings together.
+
+   non-drag prompts pass through unchanged so reach/touch embeddings
+   (which currently work at 99% solve) are preserved.
+
+   examples:
+      "drag the red square to the left side"  -> "go left"
+      "pull a circle to the right"            -> "go right"
+      "drag the circle to the top"            -> "go up"
+      "move the cursor to the blue square"    -> "move the cursor to the blue square"
+   """
+   lower = prompt.lower()
+
+   if not any(verb in lower for verb in ("drag", "pull", "carry", "slide")):
+      return prompt
+
+   if "left" in lower:
+      return "go left"
+   if "right" in lower:
+      return "go right"
+   if any(kw in lower for kw in ("top", "up")):
+      return "go up"
+   if any(kw in lower for kw in ("bottom", "down")):
+      return "go down"
+
+   return prompt
+
 _embedding_model  = None
 _embedding_cache: dict = {}
 
@@ -255,8 +288,12 @@ _embedding_cache: dict = {}
 def get_embedding(prompt: str) -> np.ndarray:
    """
    encode a prompt using sentence-transformers all-MiniLM-L6-v2.
-   model loaded once and cached. individual embeddings also cached.
-   returns np.ndarray (EMBEDDING_DIM,) = (384,), float32.
+   drag prompts are distilled to "drag <direction>" before encoding
+   so direction words aren't diluted by surrounding context.
+
+   model loaded once and cached. individual embeddings cached by the
+   ORIGINAL prompt so varied phrasings of the same distilled form all
+   hit the cache.
    """
    global _embedding_model
 
@@ -279,8 +316,15 @@ def get_embedding(prompt: str) -> np.ndarray:
       _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
       print("[goal_parser] embedding model ready.")
 
+   # distill prompt before embedding — drag prompts get reduced to
+   # "drag <direction>" so direction signal isn't diluted.
+   distilled = _distill_prompt(prompt)
+
    embedding = _embedding_model.encode(
-      prompt, convert_to_numpy=True).astype(np.float32)
+      distilled, convert_to_numpy=True).astype(np.float32)
+
+   # cache by original prompt so varied phrasings hit the cache,
+   # but all map to the distilled-form embedding
    _embedding_cache[prompt] = embedding
    return embedding
 

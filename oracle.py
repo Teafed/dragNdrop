@@ -658,6 +658,7 @@ def collect_demonstrations(
    all_hl_shape    = []
    all_hl_target_x = []
    all_hl_target_y = []
+   all_regions     = []
    n_solved       = 0
 
    if verbose:
@@ -666,14 +667,15 @@ def collect_demonstrations(
 
    for ep in range(1, n_episodes + 1):
       prompt = _gen.sample(task=_sample_task(rng, task_weights))
+      raw_emb = get_embedding(prompt)
       goal   = parse_goal(prompt)
       if n_shapes_range is not None:
          lo, hi = n_shapes_range
          n_shp = int(rng.integers(lo, hi + 1))
       else:
-         n_shp = 1;
+         n_shp = 1
 
-      env    = ShapeEnv(n_shapes=n_shp, goal=goal)
+      env    = ShapeEnv(n_shapes=n_shp, goal=goal, goal_embedding=raw_emb)
       oracle = OraclePolicy(env, noise_std=noise_std, rng=rng)
       obs, _ = env.reset()
       oracle.reset()
@@ -711,6 +713,7 @@ def collect_demonstrations(
          all_hl_shape.extend(ep_hl_shape)
          all_hl_target_x.extend(ep_hl_tx)
          all_hl_target_y.extend(ep_hl_ty)
+         all_regions.extend([goal["region"]] * len(ep_obs))
 
       env.close()
 
@@ -725,6 +728,7 @@ def collect_demonstrations(
       "hl_shape_idx": np.array(all_hl_shape,      dtype=np.int32),
       "hl_target_x":  np.array(all_hl_target_x,   dtype=np.float32),
       "hl_target_y":  np.array(all_hl_target_y,   dtype=np.float32),
+      "regions":      np.array(all_regions,       dtype=object),
    }
 
    if verbose:

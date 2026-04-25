@@ -99,6 +99,8 @@ _TEMPLATES: dict[str, list[str]] = {
       "drag {target} to the bottom",
       "pull {target} to the left side",
       "pull {target} to the right side",
+      "pull {target} to the top",
+      "pull {target} to the bottom",
    ],
    "none": [
       "do nothing", "no task", "wait", "hang tight",
