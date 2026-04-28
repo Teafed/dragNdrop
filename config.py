@@ -64,7 +64,7 @@ OBS_REGIONS = [
 # shape types and colors
 # ---------------------------------------------------------------------------
 
-SHAPE_TYPES    = ["circle", "square"]
+SHAPE_TYPES    = ["circle", "square", "triangle"]
 N_SHAPE_TYPES  = len(SHAPE_TYPES)
 SHAPE_TYPE_IDX = {s: i for i, s in enumerate(SHAPE_TYPES)}
 SHAPE_COLORS   = ["red", "green", "teal", "yellow", "purple"]
