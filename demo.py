@@ -56,81 +56,195 @@ def load_model_config(model_path: str) -> dict:
 # rendering
 # ---------------------------------------------------------------------------
 
-LEGEND_LINES = [
-   "Q      quit",
-   "SPC    pause / unpause",
-   "N      next episode",
-   "S      step",
-   "D      dump state",
-   "SHFT+D episode summary",
-]
+# overlay timing (in frames at FPS) — shared by SOLVED and "Timed out..."
+OVERLAY_FULL_FRAMES = 6    # fully visible at 255 alpha
+OVERLAY_FADE_FRAMES = 6    # then fade out over this many frames
+
+SOLVED_COLOR  = (140, 230, 170)
+TIMEOUT_COLOR = (220, 90, 80)
+
+def _draw_drag_zone(surface, env):
+   """faint shaded rectangle covering the drag target region."""
+   from shape_env import REGION_INNER
+
+   if env.goal.get("task") != "drag":
+      return
+   region = env.goal.get("region", "none")
+   if region not in REGION_INNER:
+      return
+
+   scale_factor = float(env.goal.get("drag_region_scale", 1.0))
+   base = REGION_INNER[region]
+
+   if region == "left":
+      boundary = base + (WINDOW_W - base) * (1.0 - scale_factor)
+      rect     = pygame.Rect(0, 0, int(boundary), WINDOW_H)
+   elif region == "right":
+      boundary = base - base * (1.0 - scale_factor)
+      rect     = pygame.Rect(int(boundary), 0,
+                              WINDOW_W - int(boundary), WINDOW_H)
+   elif region == "top":
+      boundary = base + (WINDOW_H - base) * (1.0 - scale_factor)
+      rect     = pygame.Rect(0, 0, WINDOW_W, int(boundary))
+   else:   # bottom
+      boundary = base - base * (1.0 - scale_factor)
+      rect     = pygame.Rect(0, int(boundary),
+                              WINDOW_W, WINDOW_H - int(boundary))
+
+   overlay = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+   overlay.fill((90, 130, 170, 20))
+   surface.blit(overlay, rect.topleft)
 
 
-def draw_scene(surface, env, font, episode, steps, prompt,
-               agent_label, paused, phase=None):
+def _format_prompt(prompt: str) -> str:
+   """capitalize first letter, lowercase the rest. preserves the prompt structure."""
+   if not prompt:
+      return prompt
+   p = prompt.strip()
+   return p[0].upper() + p[1:].lower()
+
+
+def _render_definition_list(surface, fonts, x, y, items, label_w, value_w,
+                              line_h=18, label_color=(140, 145, 150),
+                              value_color=(200, 210, 215)):
    """
-   draw full frame — shared by all agent types.
+   render rows of (label, value) pairs.
+   labels left-aligned at x, values right-aligned at x + label_w + value_w.
+   used for both bottom status and the H help legend.
+   """
+   for i, (label, value) in enumerate(items):
+      ly = y + i * line_h
+      # label, left-aligned
+      surface.blit(
+         fonts["status"].render(label, True, label_color),
+         (x, ly))
+      # value, right-aligned within its column
+      val_surf = fonts["status"].render(value, True, value_color)
+      val_x    = x + label_w + value_w - val_surf.get_width()
+      surface.blit(val_surf, (val_x, ly))
 
+
+def _render_fade_overlay(surface, font, text, color,
+                         frames_remaining, fade_frames):
+   """
+   render `text` centered horizontally near the bottom, fading out over the
+   last `fade_frames` of the visible window. no-op when frames_remaining <= 0.
+   """
+   if frames_remaining <= 0:
+      return
+   if frames_remaining > fade_frames:
+      alpha = 255
+   else:
+      # fade_progress goes 1.0 -> 0.0 across the fade window
+      alpha = int(255 * (frames_remaining / fade_frames))
+   text_surf  = font.render(text, True, color)
+   text_alpha = pygame.Surface(text_surf.get_size(), pygame.SRCALPHA)
+   text_alpha.blit(text_surf, (0, 0))
+   text_alpha.set_alpha(alpha)
+   tx = (WINDOW_W - text_alpha.get_width()) // 2
+   ty = WINDOW_H - text_alpha.get_height() - 80
+   surface.blit(text_alpha, (tx, ty))
+
+
+def draw_scene(surface, env, fonts, episode, steps, prompt,
+               agent_label, paused, phase=None, show_help=False,
+               solved_fade_remaining=0, timeout_fade_remaining=0):
+   """
    layout:
-      top row:    task / progress / rank / prompt
-      top-right:  key legend
-      bottom bar: agent label, episode, step, phase, solved/pause indicator
+      top-left:    prompt (large) + " (NN%)" inline
+      top-right:   "press H for help" hint, expands to definition list
+      bottom-left: definition-list status (User/Episode/Score)
+      center:      drag zone overlay (drag tasks only), shapes, cursor
+      center-low:  large PAUSED overlay if paused
    """
    surface.fill(BG_COLOR)
 
+   # --- center: drag zone, shapes, cursor ---
+   _draw_drag_zone(surface, env)
+
    for shape in env.shapes:
-      shape.draw(surface, font)
+      shape.draw(surface, fonts["status"])
 
-   # highlight the target shape for reach/touch/drag tasks so the viewer
-   # can tell which shape the agent is supposed to interact with
-   task = env.goal.get("task", "")
-   tc   = env.goal.get("target_color", "none")
-   tt   = env.goal.get("target_type",  "none")
-   if task in ("reach", "touch", "drag") and env.shapes:
-      has_any_spec = (tc not in ("none", "any")) or (tt not in ("none", "any"))
-      matching     = env._matching_shape_indices()
-      if has_any_spec:
-         for i in matching:
-            t = env.shapes[i]
-            pygame.draw.circle(surface, (255, 220, 60),
-                               (int(t.x), int(t.y)), int(t.radius) + 6, 2)
-      else:
-         # all shapes valid — show dim ring on all
-         for t in env.shapes:
-            pygame.draw.circle(surface, (120, 120, 80),
-                               (int(t.x), int(t.y)), int(t.radius) + 6, 1)
-
-   # draw cursor via env's own method
    _prev      = env.window
    env.window = surface
    env._draw_cursor()
    env.window = _prev
 
-   # top-left HUD: task info
-   score   = env._compute_score()
-   hud_str = f"task: {task}   progress: {score:.2%}"
-   surface.blit(font.render(hud_str, True, (200, 200, 200)), (10, 10))
+   # --- top-left: prompt with inline progress ---
+   score = env._compute_score()
+   task  = env.goal.get("task", "")
 
-   # prompt on second line — truncate if very long
-   prompt_display = prompt if len(prompt) <= 80 else prompt[:77] + "..."
+   formatted = _format_prompt(prompt)
+   if len(formatted) > 70:
+      formatted = formatted[:67] + "..."
+   prompt_str = f"{formatted} ({int(score * 100)}%)"
+
    surface.blit(
-      font.render(f"prompt: {prompt_display}", True, (160, 200, 160)),
-      (10, 26))
+      fonts["prompt"].render(prompt_str, True, (220, 230, 220)),
+      (16, 14))
 
-   # top-right legend
-   for i, line in enumerate(LEGEND_LINES):
-      surface.blit(
-         font.render(line, True, (140, 140, 140)),
-         (WINDOW_W - 200, 28 + i * 14))
+   # --- top-right: help hint or expanded legend (definition list style) ---
+   
+   if show_help:
+      help_items = [
+         ("Quit",            "Q"),
+         ("Pause / resume",  "SPACE"),
+         ("Next episode",    "N"),
+         ("Step once",       "S"),
+         ("Dump state",      "D"),
+         ("Episode summary", "SHFT+D"),
+         ("Toggle help",     "H"),
+      ]
+      line_h    = 18
+      help_x    = WINDOW_W - 230
+      block_h   = line_h * len(help_items)
+      help_y    = WINDOW_H - block_h - 16
+      _render_definition_list(
+         surface, fonts, help_x, help_y, help_items,
+         label_w=150, value_w=64, line_h=line_h,
+         label_color=(120, 125, 130),
+         value_color=(170, 180, 190))
+   else:
+      hint = "Press H for help"
+      hint_surf = fonts["hint"].render(hint, True, (95, 95, 100))
+      hint_x = WINDOW_W - hint_surf.get_width() - 16
+      hint_y = WINDOW_H - hint_surf.get_height() - 16
+      surface.blit(hint_surf, (hint_x, hint_y))
 
-   # bottom bar
-   solved_str = "  SOLVED!" if env._is_solved() else ""
-   pause_str  = "  [PAUSED]" if paused else ""
-   phase_str  = f"  phase={phase}" if phase is not None else ""
-   bottom     = (f"{agent_label}  ep {episode}  step {steps}  "
-                 f"score {score:.3f}{phase_str}{solved_str}{pause_str}")
-   color      = (255, 220, 80) if paused else (100, 220, 180)
-   surface.blit(font.render(bottom, True, color), (10, WINDOW_H - 24))
+   # --- bottom-left: status as definition list ---
+   ep_label  = f"{episode} ({task})" if task else f"{episode}"
+   status_items = [
+      ("Agent",   agent_label),
+      ("Episode", ep_label),
+      ("Score",   f"{score:.3f}"),
+      ("Steps",   f"{steps}"),
+   ]
+   line_h    = 20
+   block_h   = line_h * len(status_items)
+   status_y  = WINDOW_H - block_h - 16
+   _render_definition_list(
+      surface, fonts, 16, status_y, status_items,
+      label_w=80, value_w=60, line_h=line_h,
+      label_color=(135, 140, 145),
+      value_color=(200, 210, 215))
+
+   # --- centered PAUSED overlay ---
+   if paused:
+      paused_surf = fonts["prompt"].render("PAUSED", True, (240, 210, 100))
+      px = (WINDOW_W - paused_surf.get_width()) // 2
+      py = WINDOW_H - paused_surf.get_height() - 80
+      surface.blit(paused_surf, (px, py))
+
+   # --- centered fade overlays (tick independently of pause) ---
+   # solved wins on tie: timeout overlay is suppressed if both fire
+   if solved_fade_remaining > 0:
+      _render_fade_overlay(surface, fonts["prompt"], "SOLVED!",
+                           SOLVED_COLOR, solved_fade_remaining,
+                           OVERLAY_FADE_FRAMES)
+   elif timeout_fade_remaining > 0:
+      _render_fade_overlay(surface, fonts["prompt"], "Timed out...",
+                           TIMEOUT_COLOR, timeout_fade_remaining,
+                           OVERLAY_FADE_FRAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -271,11 +385,8 @@ def compute_saliency(model, obs_np: np.ndarray) -> dict:
    return result
 
 
-def print_saliency(saliency: dict, prompt: str, detail: bool = False):
-   """
-   print saliency table with a bar chart normalised to the max region.
-   detail is unused for now.
-   """
+def print_saliency(saliency: dict, prompt: str):
+   """print saliency table with a bar chart normalised to the max region."""
    max_grad = max(v["mean_grad"] for v in saliency.values()) + 1e-8
    print(f"\n  saliency — {prompt}")
    print(f"  {'region':<16} {'mean |grad|':>11}  bar")
@@ -395,7 +506,19 @@ def run_demo(model_path, prompt, use_random, multi_task,
    window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
    pygame.display.set_caption("dragNdrop demo")
    clock  = pygame.time.Clock()
-   font   = pygame.font.SysFont("monospace", 12)
+
+   # font sizes for different UI roles. match_font picks the first
+   # available family from the comma-separated list.
+   _font_name = pygame.font.match_font(
+      "helveticaneue,helvetica,arial,liberationsans,dejavusans,sans") or None
+   fonts = {
+      "prompt":   pygame.font.Font(_font_name, 22),
+      "metadata": pygame.font.Font(_font_name, 13),
+      "status":   pygame.font.Font(_font_name, 14),
+      "legend":   pygame.font.Font(_font_name, 11),
+      "hint":     pygame.font.Font(_font_name, 12),
+   }
+
 
    # --- load agent ---
    if use_oracle:
@@ -445,10 +568,15 @@ def run_demo(model_path, prompt, use_random, multi_task,
    steps        = 0
    total_reward = 0.0
    paused       = False
-   step_once    = False   # set by S key — advance exactly one step
-   ep_terminated  = False   # true once env.terminated — persists until reset
-   ep_truncated   = False   # true once env.truncated — persists until reset
-   history      = []      # completed episode records for Shift+D
+   step_once    = False    # set by S key — advance exactly one step
+   ep_terminated = False   # true once env.terminated — persists until reset
+   ep_truncated  = False   # true once env.truncated — persists until reset
+   history      = []       # completed episode records for Shift+D
+   show_help = False       # toggled by H key
+   solved_fade_remaining  = 0      # frames left to display SOLVED overlay; 0 = hidden
+   timeout_fade_remaining = 0      # frames left to display "Timed out..." overlay
+   was_solved             = False  # tracks _is_solved() to detect rising edge
+   was_truncated          = False  # tracks env.steps >= MAX_STEPS to detect rising edge
 
    print(f"\nepisode {episode} — {cur_prompt}")
    if use_human:
@@ -497,6 +625,9 @@ def run_demo(model_path, prompt, use_random, multi_task,
                   if _saliency:
                      sal = compute_saliency(model, obs)
                      print_saliency(sal, cur_prompt)
+            elif event.key == pygame.K_h:
+               show_help = not show_help
+
 
       if not running:
          break
@@ -546,15 +677,41 @@ def run_demo(model_path, prompt, use_random, multi_task,
 
       step_once = False   # always clear after this frame
       phase = oracle.phase if oracle is not None else None
-      draw_scene(window, env, font,
-                 episode, steps, cur_prompt,
-                 agent_label, paused, phase)
+
+      # overlay rising-edge detection. solved wins on tie: if both fire on
+      # the same frame, we trigger SOLVED and skip TIMEOUT.
+      is_solved_now    = env._is_solved()
+      is_truncated_now = ep_truncated
+      if is_solved_now and not was_solved:
+         solved_fade_remaining = OVERLAY_FULL_FRAMES + OVERLAY_FADE_FRAMES
+      elif is_truncated_now and not was_truncated and not is_solved_now:
+         timeout_fade_remaining = OVERLAY_FULL_FRAMES + OVERLAY_FADE_FRAMES
+      was_solved    = is_solved_now
+      was_truncated = is_truncated_now
+
+      # tick down every frame regardless of pause / episode reset
+      if solved_fade_remaining > 0:
+         solved_fade_remaining -= 1
+      if timeout_fade_remaining > 0:
+         timeout_fade_remaining -= 1
+
+      draw_scene(window, env, fonts,
+                 episode=episode, steps=steps,
+                 prompt=cur_prompt, agent_label=agent_label,
+                 paused=paused, phase=phase,
+                 show_help=show_help,
+                 solved_fade_remaining=solved_fade_remaining,
+                 timeout_fade_remaining=timeout_fade_remaining)
       pygame.display.flip()
       clock.tick(FPS)
 
+      # advance to next episode if: an unpaused step ended the episode,
+      # the user pressed N (skip), or the episode is already finished
+      # (e.g. solved on a paused S-step — advance anyway so the SOLVED
+      # overlay can play out over the new episode's scene)
       episode_done = ((not paused and (terminated or truncated))
                       or skip
-                      or (ep_terminated or ep_truncated))
+                      or ep_terminated or ep_truncated)
       if episode_done:
          status = "SOLVED" if terminated else ("skipped" if skip else "timed out")
          final_score = env._compute_score()
@@ -589,6 +746,8 @@ def run_demo(model_path, prompt, use_random, multi_task,
          ep_terminated  = False
          ep_truncated   = False
          paused         = stay_paused
+         was_solved     = False  # new episode starts unsolved; let next solve re-trigger
+         was_truncated  = False  # new episode starts un-truncated; let next timeout re-trigger
          print(f"episode {episode} — {cur_prompt}")
 
    pygame.mouse.set_visible(True)

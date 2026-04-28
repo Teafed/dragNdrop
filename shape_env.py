@@ -59,7 +59,7 @@ WINDOW_W     = 800
 WINDOW_H     = 600
 SHAPE_RADIUS = 20
 FPS          = 60
-MAX_STEPS    = 500
+MAX_STEPS    = 150
 MARGIN       = SHAPE_RADIUS * 2
 
 SCORE_SOLVE_THRESHOLD = 0.85
@@ -73,7 +73,7 @@ COLORS = {
    "purple": (155,  90, 195),
 }
 COLOR_NAMES = list(COLORS.keys())
-BG_COLOR    = (30, 30, 30)
+BG_COLOR    = (5, 5, 5)
 
 # target zone radius for empty-canvas tasks (pixels)
 ZONE_RADIUS = 30
@@ -131,21 +131,59 @@ class Shape:
       self.phantom    = phantom   # if True: not rendered, not grippable
 
    def draw(self, surface, font):
+      """
+      draw shape with a sharp dark outline rendered at display resolution
+      (so it doesn't get blurred by smoothscale) and antialiased fill via
+      2x supersampling for the inner shape only.
+      """
       if self.phantom:
-         return   # phantom zones rendered separately by env
-      cx = int(self.x)
-      cy = int(self.y)
-      r  = self.radius
+         return
+
+      cx, cy = int(self.x), int(self.y)
+      r      = self.radius
+      outline_color = (30, 30, 30)
+      ow            = 3   # outline width in px
+
       if self.shape_type == "circle":
-         pygame.draw.circle(surface, self.color_rgb, (cx, cy), r)
+         # supersampled fill
+         scale = 2
+         pad   = 2
+         ssize = (r + pad) * 2 * scale
+         ssurf = pygame.Surface((ssize, ssize), pygame.SRCALPHA)
+         pygame.draw.circle(ssurf, self.color_rgb, (ssize // 2, ssize // 2),
+                            r * scale)
+         final = pygame.transform.smoothscale(ssurf, (ssize // scale, ssize // scale))
+         surface.blit(final, (cx - ssize // (scale * 2), cy - ssize // (scale * 2)))
+         # sharp outline at display res — pygame.draw.circle with `width` draws
+         # a ring at the boundary; aacircle would give AA but only 1px wide
+         pygame.draw.circle(surface, outline_color, (cx, cy), r, ow)
+
       elif self.shape_type == "square":
-         rect = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
-         pygame.draw.rect(surface, self.color_rgb, rect)
+         # squares are pixel-aligned — no AA needed for fill, just draw clean
+         inner = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+         pygame.draw.rect(surface, self.color_rgb, inner)
+         # outer outline — pygame.draw.rect with `width` draws a ring
+         pygame.draw.rect(surface, outline_color, inner, ow)
+
       elif self.shape_type == "triangle":
+         # supersample the filled triangle, then draw AA outline at display res
+         scale = 2
+         pad   = 2
+         ssize = (r + pad) * 2 * scale
+         ssurf = pygame.Surface((ssize, ssize), pygame.SRCALPHA)
+         sc    = ssize // 2
+         pts_ss = [(sc, sc - r * scale),
+                   (sc - r * scale, sc + r * scale),
+                   (sc + r * scale, sc + r * scale)]
+         pygame.draw.polygon(ssurf, self.color_rgb, pts_ss)
+         final = pygame.transform.smoothscale(ssurf, (ssize // scale, ssize // scale))
+         surface.blit(final, (cx - ssize // (scale * 2), cy - ssize // (scale * 2)))
+
+         # outline at display resolution. pygame's polygon-with-width is bad,
+         # so we draw three thick lines manually — they read as outline.
          pts = [(cx, cy - r), (cx - r, cy + r), (cx + r, cy + r)]
-         pygame.draw.polygon(surface, self.color_rgb, pts)
-      label = font.render(f"{self.size:.1f}", True, (255, 255, 255))
-      surface.blit(label, (cx - 10, cy - 8))
+         for a, b in [(pts[0], pts[1]), (pts[1], pts[2]), (pts[2], pts[0])]:
+            pygame.draw.line(surface, outline_color, a, b, ow)
 
    def as_obs(self) -> np.ndarray:
       return np.array([
@@ -929,17 +967,32 @@ class ShapeEnv(gym.Env):
       return None
 
    def _draw_cursor(self):
-      cx  = int(self.cx)
-      cy  = int(self.cy)
+      cx, cy = int(self.cx), int(self.cy)
       r   = _CURSOR_RADIUS
       gap = _CURSOR_GAP
       arm = _CURSOR_ARM
       col = _CURSOR_COLOR
+
+      # center: filled when gripping, hollow ring otherwise
       if self.grip:
-         pygame.draw.circle(self.window, col, (cx, cy), r)
+         # supersampled filled dot for AA
+         pad   = 2
+         scale = 2
+         ssize = (r + pad) * 2 * scale
+         ssurf = pygame.Surface((ssize, ssize), pygame.SRCALPHA)
+         pygame.draw.circle(ssurf, col, (ssize // 2, ssize // 2), r * scale)
+         final = pygame.transform.smoothscale(ssurf, (ssize // scale, ssize // scale))
+         self.window.blit(final, (cx - ssize // (scale * 2), cy - ssize // (scale * 2)))
       else:
-         pygame.draw.circle(self.window, col, (cx, cy), r, 1)
-      pygame.draw.line(self.window, col, (cx, cy - r - gap), (cx, cy - r - gap - arm))
-      pygame.draw.line(self.window, col, (cx, cy + r + gap), (cx, cy + r + gap + arm))
-      pygame.draw.line(self.window, col, (cx - r - gap, cy), (cx - r - gap - arm, cy))
-      pygame.draw.line(self.window, col, (cx + r + gap, cy), (cx + r + gap + arm, cy))
+         # AA hollow ring — pygame's gfxdraw.aacircle if available, else 1px circle
+         try:
+            import pygame.gfxdraw as gfx
+            gfx.aacircle(self.window, cx, cy, r, col)
+         except (ImportError, AttributeError):
+            pygame.draw.circle(self.window, col, (cx, cy), r, 1)
+
+      # arms — aaline gives clean diagonal-feeling edges even on horizontals
+      pygame.draw.aaline(self.window, col, (cx, cy - r - gap), (cx, cy - r - gap - arm))
+      pygame.draw.aaline(self.window, col, (cx, cy + r + gap), (cx, cy + r + gap + arm))
+      pygame.draw.aaline(self.window, col, (cx - r - gap, cy), (cx - r - gap - arm, cy))
+      pygame.draw.aaline(self.window, col, (cx + r + gap, cy), (cx + r + gap + arm, cy))
