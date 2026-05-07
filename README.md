@@ -39,8 +39,8 @@ python demo.py --oracle                     # demo oracle
 
 **Evaluation:**
 ```bash
-python demo.py --headless --episodes 200
-python demo.py --task reach --headless --episodes 500
+python demo.py --headless --episodes 2000
+python demo.py --task reach --headless --episodes 1000
 ```
 
 **Training:**
@@ -52,6 +52,11 @@ python train.py --timesteps 800000 --bc-episodes 600 --bc-epochs 30
 python train.py --resume ./models/shape_agent/stage_04_checkpoint --start-stage 5 --no-oracle
 # specify save directory
 python train.py --save ./different/path
+```
+
+**Tensorboard:**
+```bash
+tensorboard --logdir logs/tensorboard
 ```
 
 ## System overview
@@ -80,9 +85,10 @@ The architecture is a two-stream network with cross-attention:
   384-dim sentence embedding of the prompt).
 - A **cross-attention** block lets the right (global) stream attend to
   the left (cursor-local) stream when forming a decision.
-- Three output heads produce movement, grip, and a direction-bias for
-  drag tasks. The drag-direction head is gated by the holding bit so
-  it contributes nothing during reach and touch.
+
+Three output heads produce movement, grip, and a direction-bias for drag
+tasks. The drag-direction head is gated by the holding bit so it
+contributes nothing during reach and touch.
 
 ### Training
 
